@@ -41,6 +41,33 @@ class TestTranslateOneServer:
         assert "enabled" not in cfg  # codex defaults to true
 
 
+    def test_tool_filters_translate_to_codex_allow_and_deny_lists(self):
+        cfg, skipped = _translate_one_server("fleet", {
+            "command": "node",
+            "tools": {
+                "include": ["verify_target", "panache_services_status"],
+                "exclude": ["deploy_target"],
+            },
+        })
+
+        assert cfg["enabled_tools"] == [
+            "verify_target",
+            "panache_services_status",
+        ]
+        assert cfg["disabled_tools"] == ["deploy_target"]
+        assert skipped == []
+
+
+    def test_invalid_tool_filter_is_skipped_with_warning(self):
+        cfg, skipped = _translate_one_server("fleet", {
+            "command": "node",
+            "tools": {"include": "verify_target"},
+        })
+
+        assert "enabled_tools" not in cfg
+        assert "tools.include (expected string list)" in skipped
+
+
     def test_unknown_keys_warned(self):
         cfg, skipped = _translate_one_server("x", {
             "command": "y",

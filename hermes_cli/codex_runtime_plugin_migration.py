@@ -23,6 +23,8 @@ What translates (MCP servers):
   Hermes mcp_servers.<n>.url/headers       → codex streamable_http transport
   Hermes mcp_servers.<n>.timeout           → codex tool_timeout_sec
   Hermes mcp_servers.<n>.connect_timeout   → codex startup_timeout_sec
+  Hermes mcp_servers.<n>.tools.include     → codex enabled_tools
+  Hermes mcp_servers.<n>.tools.exclude     → codex disabled_tools
 
 What does NOT translate (warned + skipped):
   Hermes-specific keys (sampling, etc.) — codex's MCP client has no
@@ -114,7 +116,7 @@ _KNOWN_HERMES_KEYS = {
     # timeouts
     "timeout", "connect_timeout",
     # general
-    "enabled", "description",
+    "enabled", "description", "tools",
 }
 
 # Subset that have a direct codex equivalent.
@@ -185,6 +187,28 @@ def _translate_one_server(
     # Enabled flag (codex defaults to true so we only emit when explicitly false)
     if hermes_cfg.get("enabled") is False:
         out["enabled"] = False
+
+    # Preserve Hermes' per-server tool boundary. Without this translation,
+    # codex_app_server sees every tool advertised by the MCP server even when
+    # the Hermes profile configured a narrow allowlist.
+    tools_cfg = hermes_cfg.get("tools")
+    if tools_cfg is not None:
+        if not isinstance(tools_cfg, dict):
+            skipped.append("tools (expected mapping)")
+        else:
+            for hermes_key, codex_key in (
+                ("include", "enabled_tools"),
+                ("exclude", "disabled_tools"),
+            ):
+                values = tools_cfg.get(hermes_key)
+                if values is None:
+                    continue
+                if not isinstance(values, list) or not all(
+                    isinstance(value, str) and value.strip() for value in values
+                ):
+                    skipped.append(f"tools.{hermes_key} (expected string list)")
+                    continue
+                out[codex_key] = [value.strip() for value in values]
 
     # Detect keys we explicitly drop with warning
     for key in hermes_cfg:
