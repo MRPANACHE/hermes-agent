@@ -1935,6 +1935,30 @@ def resolve_runtime_provider(
     )
     model_cfg = _get_model_config()
 
+    # The Codex app-server subprocess owns its authentication and inherits the
+    # already-authenticated Codex CLI environment. Do not require a duplicate
+    # Hermes openai-codex credential store when this runtime is explicitly on.
+    if (
+        provider == "openai-codex"
+        and _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode="codex_responses",
+            model_cfg=model_cfg,
+        )
+        == "codex_app_server"
+    ):
+        return {
+            "provider": provider,
+            "api_mode": "codex_app_server",
+            "base_url": (explicit_base_url or DEFAULT_CODEX_BASE_URL).rstrip("/"),
+            # AIAgent still constructs its unused OpenAI client before handing
+            # the turn to Codex. Keep that constructor happy without copying or
+            # resolving any credential; the app-server subprocess owns auth.
+            "api_key": "no-key-required",
+            "source": "codex-cli",
+            "requested_provider": requested_provider,
+        }
+
     # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
     # "Ox Alpha"): served ANONYMOUSLY on the Zen relay ONLY. Any bearer the
     # relay doesn't recognize is a 401 — and the Go relay doesn't serve the

@@ -86,6 +86,71 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_codex_app_server_runtime_uses_codex_cli_auth_without_hermes_credentials(
+    monkeypatch,
+):
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    def _unexpected_codex_auth_call(*args, **kwargs):
+        raise AssertionError("codex_app_server must not resolve Hermes Codex credentials")
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-luna",
+            "openai_runtime": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _NoPool())
+    monkeypatch.setattr(
+        rp,
+        "_resolve_named_custom_runtime",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _unexpected_codex_auth_call)
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["api_key"] == "no-key-required"
+
+
+def test_codex_responses_runtime_still_requires_hermes_credentials(monkeypatch):
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    def _hermes_auth_required(*args, **kwargs):
+        raise rp.AuthError("Hermes Codex credentials required")
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-luna",
+            "openai_runtime": "auto",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _NoPool())
+    monkeypatch.setattr(
+        rp,
+        "_resolve_named_custom_runtime",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _hermes_auth_required)
+
+    with pytest.raises(rp.AuthError, match="Hermes Codex credentials required"):
+        rp.resolve_runtime_provider()
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth
