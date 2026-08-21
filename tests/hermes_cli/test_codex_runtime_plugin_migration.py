@@ -12,6 +12,7 @@ from hermes_cli.codex_runtime_plugin_migration import (
     _format_toml_value,
     _looks_like_test_tempdir,
     _strip_existing_managed_block,
+    _strip_unmanaged_owned_mcp_tables,
     _strip_unmanaged_plugin_tables,
     _translate_one_server,
     migrate,
@@ -188,6 +189,53 @@ class TestStripExistingManagedBlock:
 # ---- end-to-end migrate(, expose_hermes_tools=False) ----
 
 class TestMigrate:
+
+    def test_existing_root_permissions_are_preserved_without_duplicate(self, tmp_path):
+        target = tmp_path / "config.toml"
+        target.write_text(
+            'default_permissions = ":danger-full-access"\n\n'
+            "[features]\nmemories = true\n"
+        )
+
+        migrate(
+            {"mcp_servers": {"fleet": {"command": "node"}}},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        text = target.read_text()
+        assert text.count("default_permissions =") == 1
+        assert 'default_permissions = ":danger-full-access"' in text
+        import tomllib
+        tomllib.loads(text)
+
+    def test_exact_unmanaged_mcp_collision_is_replaced(self, tmp_path):
+        target = tmp_path / "config.toml"
+        target.write_text(
+            "[mcp_servers.fleet]\ncommand = \"old\"\n\n"
+            "[mcp_servers.fleet.env]\nOLD = \"1\"\n\n"
+            "[mcp_servers.user-server]\ncommand = \"keep\"\n"
+        )
+
+        migrate(
+            {"mcp_servers": {"fleet": {
+                "command": "node",
+                "tools": {"include": ["verify_target"]},
+            }}},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+            default_permission_profile=None,
+        )
+
+        text = target.read_text()
+        assert text.count("[mcp_servers.fleet]") == 1
+        assert "OLD" not in text
+        assert 'enabled_tools = ["verify_target"]' in text
+        assert "[mcp_servers.user-server]" in text
+        import tomllib
+        tomllib.loads(text)
 
 
 

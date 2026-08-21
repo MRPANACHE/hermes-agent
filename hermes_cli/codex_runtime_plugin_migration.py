@@ -405,6 +405,57 @@ def _strip_unmanaged_plugin_tables(toml_text: str) -> str:
     return "".join(out)
 
 
+def _strip_unmanaged_owned_mcp_tables(
+    toml_text: str,
+    server_names: set[str],
+) -> str:
+    """Remove pre-existing MCP tables that Hermes is about to manage.
+
+    User-owned MCP servers with different names remain untouched.  Exact name
+    collisions must be removed, including child tables such as
+    ``[mcp_servers.fleet.env]``, or the managed replacement would leave Codex
+    with duplicate TOML table headers.
+    """
+    if not server_names:
+        return toml_text
+
+    def is_owned_header(stripped: str) -> bool:
+        header = stripped.split("#", 1)[0].strip()
+        for name in server_names:
+            rendered_names = {_quote_key(name), f'"{name}"'}
+            for rendered in rendered_names:
+                root = f"[mcp_servers.{rendered}]"
+                child = f"[mcp_servers.{rendered}."
+                if header == root or header.startswith(child):
+                    return True
+        return False
+
+    lines = toml_text.splitlines(keepends=True)
+    out: list[str] = []
+    in_owned_table = False
+    for line in lines:
+        stripped = line.lstrip()
+        if _looks_like_table_header(stripped):
+            in_owned_table = is_owned_header(stripped)
+            if in_owned_table:
+                continue
+        if in_owned_table:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _has_top_level_key(toml_text: str, key: str) -> bool:
+    """Return whether ``key`` is already defined before the first table."""
+    for line in toml_text.splitlines():
+        stripped = line.lstrip()
+        if _looks_like_table_header(stripped):
+            return False
+        if stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="):
+            return True
+    return False
+
+
 def _looks_like_table_header(stripped_line: str) -> bool:
     """Return True if ``stripped_line`` is a TOML table header.
 
@@ -706,11 +757,6 @@ def migrate(
         for p in plugins:
             report.migrated_plugins.append(f"{p['name']}@{p['marketplace']}")
 
-    # Track whether we wrote a default permission profile so the report
-    # surfaces it to the user.
-    if default_permission_profile:
-        report.wrote_permissions_default = default_permission_profile
-
     # Inject Hermes' own tool surface as an MCP server so the spawned
     # codex subprocess can call back into Hermes for the tools codex
     # doesn't ship with — web_search, browser_*, delegate_task, vision,
@@ -722,14 +768,9 @@ def migrate(
         if "hermes-tools" not in report.migrated:
             report.migrated.append("hermes-tools")
 
-    # Build the new managed block
-    managed_block = render_codex_toml_section(
-        translated, plugins=plugins,
-        default_permission_profile=default_permission_profile,
-    )
-
     # Read existing codex config if any, strip the prior managed block,
-    # append the new one.
+    # then remove exact collisions before inserting the replacement.
+    effective_permission_profile = default_permission_profile
     if target.exists():
         try:
             existing = target.read_text(encoding="utf-8")
@@ -737,6 +778,13 @@ def migrate(
             report.errors.append(f"could not read {target}: {exc}")
             return report
         without_managed = _strip_existing_managed_block(existing)
+        without_managed = _strip_unmanaged_owned_mcp_tables(
+            without_managed, set(translated)
+        )
+        # An explicit user/root setting wins. Re-emitting another root key in
+        # the managed block would make the entire Codex config invalid.
+        if _has_top_level_key(without_managed, "default_permissions"):
+            effective_permission_profile = None
         # Bug B: when plugin/list ran authoritatively, codex's own
         # [plugins."<name>@<marketplace>"] tables outside our managed block
         # would survive _strip_existing_managed_block and then collide with
@@ -745,9 +793,17 @@ def migrate(
         # those pre-existing tables since plugin/list is the source of truth.
         if plugin_query_succeeded:
             without_managed = _strip_unmanaged_plugin_tables(without_managed)
-        new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
     else:
-        new_text = managed_block
+        without_managed = ""
+
+    managed_block = render_codex_toml_section(
+        translated,
+        plugins=plugins,
+        default_permission_profile=effective_permission_profile,
+    )
+    if effective_permission_profile:
+        report.wrote_permissions_default = effective_permission_profile
+    new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
 
     if dry_run:
         return report
