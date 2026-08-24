@@ -1027,6 +1027,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
+    # One-time migration for prompts persisted before Hermes stopped importing
+    # the Codex/Claude-only subscription worker policy from shared AGENTS.md /
+    # CLAUDE.md files. Fresh Hermes prompts strip this marked section in
+    # prompt_builder; rejecting the legacy snapshot here lets long-lived Buzz
+    # sessions adopt that fix on their next turn without a manual /new.
+    from agent.prompt_builder import _CODEX_LUNA_SECTION_BEGIN
+
+    if _CODEX_LUNA_SECTION_BEGIN in prompt:
+        return False
+
     def line_value(label: str) -> str:
         """Last matching line wins.
 
