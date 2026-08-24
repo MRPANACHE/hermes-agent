@@ -450,6 +450,49 @@ class TestBuildContextFilesPrompt:
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
+    def test_agents_md_strips_codex_only_delegation_block(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text(
+            "Shared rule before.\n\n"
+            "<!-- BEGIN CODEX LUNA SUBSCRIPTION DELEGATION -->\n"
+            "All token-heavy repo work uses codex-sub luna.\n"
+            "<!-- END CODEX LUNA SUBSCRIPTION DELEGATION -->\n\n"
+            "Shared rule after."
+        )
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Shared rule before." in result
+        assert "Shared rule after." in result
+        assert "codex-sub luna" not in result
+        assert "BEGIN CODEX LUNA" not in result
+
+    def test_claude_md_strips_codex_only_delegation_block(self, tmp_path):
+        (tmp_path / "CLAUDE.md").write_text(
+            "Shared Claude rule.\n\n"
+            "<!-- BEGIN CODEX LUNA SUBSCRIPTION DELEGATION -->\n"
+            "Use /home/david/bin/codex-sub luna.\n"
+            "<!-- END CODEX LUNA SUBSCRIPTION DELEGATION -->"
+        )
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Shared Claude rule." in result
+        assert "codex-sub luna" not in result
+
+    def test_unclosed_codex_only_block_is_removed_fail_closed(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text(
+            "Shared rule.\n\n"
+            "<!-- BEGIN CODEX LUNA SUBSCRIPTION DELEGATION -->\n"
+            "Use codex-sub luna.\n"
+            "This tail must not leak into Hermes."
+        )
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Shared rule." in result
+        assert "codex-sub luna" not in result
+        assert "This tail must not leak into Hermes." not in result
+
     # --- AGENTS.md directory chain (port of grok-cli instructions.ts) ---
 
     def test_agents_md_chain_merges_root_to_cwd(self, tmp_path):
@@ -1056,5 +1099,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

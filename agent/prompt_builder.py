@@ -2276,6 +2276,37 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
+_CODEX_LUNA_SECTION_BEGIN = "<!-- BEGIN CODEX LUNA SUBSCRIPTION DELEGATION -->"
+_CODEX_LUNA_SECTION_END = "<!-- END CODEX LUNA SUBSCRIPTION DELEGATION -->"
+
+
+def _strip_codex_only_delegation_sections(content: str, filename: str) -> str:
+    """Remove Codex/Claude-only delegation policy from Hermes context.
+
+    Shared ``AGENTS.md`` and ``CLAUDE.md`` files are also consumed directly by
+    Codex and Claude, so their subscription-delegation policy must remain on
+    disk. Hermes has native ``delegate_task`` children and must never receive
+    that foreign runtime policy in its effective prompt. An unclosed marker is
+    removed through EOF so a malformed edit fails closed instead of leaking
+    the conflicting rule back into Hermes.
+    """
+    while _CODEX_LUNA_SECTION_BEGIN in content:
+        start = content.index(_CODEX_LUNA_SECTION_BEGIN)
+        end = content.find(_CODEX_LUNA_SECTION_END, start)
+        if end < 0:
+            logger.warning(
+                "Unclosed Codex-only delegation section in %s; stripping through EOF",
+                filename,
+            )
+            content = content[:start]
+            break
+        end += len(_CODEX_LUNA_SECTION_END)
+        before = content[:start].rstrip()
+        after = content[end:].lstrip()
+        content = "\n\n".join(part for part in (before, after) if part)
+    return content.strip()
+
+
 def _truncate_content(
     content: str,
     filename: str,
@@ -2437,6 +2468,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             except Exception as e:
                 logger.debug("Could not read %s: %s", candidate, e)
                 continue
+            content = _strip_codex_only_delegation_sections(content, str(candidate))
             if not content:
                 continue
             if content in seen_content:
@@ -2475,6 +2507,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         if candidate.exists():
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
+                content = _strip_codex_only_delegation_sections(content, str(candidate))
                 if content:
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
