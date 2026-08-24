@@ -392,6 +392,21 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # Keep shared channels mention-gated while allowing explicitly named
+        # conversational channels to accept natural follow-up messages.
+        _free_raw = extra.get("free_response_channels", [])
+        if isinstance(_free_raw, str):
+            _free_candidates = _free_raw.split(",")
+        elif isinstance(_free_raw, (list, tuple, set)):
+            _free_candidates = _free_raw
+        elif _free_raw is None:
+            _free_candidates = []
+        else:
+            _free_candidates = [_free_raw]
+        self.free_response_channels = {
+            str(channel).strip() for channel in _free_candidates if str(channel).strip()
+        }
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -1030,10 +1045,19 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
-        # In shared channels, respond only when addressed — unless
-        # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        # In shared channels, respond only when addressed — unless mention
+        # gating is disabled globally or explicitly for this channel. DMs
+        # always dispatch.
+        free_response = (
+            channel_id in self.free_response_channels
+            or "*" in self.free_response_channels
+        )
+        if (
+            not is_dm
+            and self.require_mention
+            and not free_response
+            and not self._is_mentioned(content)
+        ):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /

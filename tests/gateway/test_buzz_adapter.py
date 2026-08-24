@@ -142,6 +142,17 @@ class TestBuzzAdapterInit:
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ([CHANNEL, "other"], {CHANNEL, "other"}),
+            (f"{CHANNEL}, other", {CHANNEL, "other"}),
+        ],
+    )
+    def test_free_response_channels_accept_list_or_csv(self, configured, expected):
+        adapter = _make_adapter({"free_response_channels": configured})
+        assert adapter.free_response_channels == expected
+
 
 # ── CLI error contract ────────────────────────────────────────────────────
 
@@ -242,6 +253,25 @@ class TestMentionGating:
     async def test_name_mention_dispatched(self, adapter):
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_unaddressed_message_dispatched_in_free_response_channel(self):
+        adapter = _make_adapter({"free_response_channels": [CHANNEL]})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        await self._poll_with(
+            adapter,
+            _event("e1", content="natural follow-up without a mention", created_at=10),
+        )
+
+        assert [message["message_id"] for message in adapter._dispatched] == ["e1"]
 
 
     @pytest.mark.asyncio
@@ -536,5 +566,4 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
 
