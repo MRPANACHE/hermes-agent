@@ -465,10 +465,62 @@ class CuaTypedBrowserRoute:
         exact_window = _positive_int(window_id)
         if exact_window is not None:
             args["window_id"] = exact_window
+        missing = self._require_tool("list_windows")
+        if missing is not None:
+            return missing
         # Preparation/reconnect may have side effects even if its transport
         # fails. Invalidate old capabilities before crossing that boundary.
         self.state.clear()
-        return self._call("browser_prepare", args)
+        preparation = self._call("browser_prepare", args)
+        if (
+            preparation.get("status") != "ok"
+            or preparation.get("isError") is True
+            or _refusal_code(preparation) is not None
+        ):
+            return preparation
+
+        unproven = _refusal(
+            "browser_prepared_window_unproven",
+            "Browser preparation may already have launched a browser, but its "
+            "exact on-screen window could not be established. Do not repeat "
+            "preparation blindly.",
+            preparation=preparation,
+        )
+        prepared_pid = preparation.get("prepared_pid")
+        if (
+            preparation.get("prepared") is not True
+            or type(prepared_pid) is not int
+            or prepared_pid <= 0
+        ):
+            return unproven
+        try:
+            discovery = self._call(
+                "list_windows", {"pid": prepared_pid, "on_screen_only": True}
+            )
+        except Exception:
+            return unproven
+        windows = discovery.get("windows")
+        if (
+            discovery.get("status") not in (None, "ok")
+            or discovery.get("isError") is True
+            or _refusal_code(discovery) is not None
+            or not isinstance(windows, list)
+            or len(windows) != 1
+            or not isinstance(windows[0], dict)
+        ):
+            return unproven
+        window = windows[0]
+        if (
+            type(window.get("pid")) is not int
+            or window["pid"] != prepared_pid
+            or type(window.get("window_id")) is not int
+            or window["window_id"] <= 0
+            or window.get("is_on_screen") is not True
+        ):
+            return unproven
+        # Discovery supplies identity, never a bound mutation capability.
+        # The caller still uses ordinary exact observe + fresh page state.
+        return {**preparation, "prepared_window_id": window["window_id"]}
 
     def _require_mutation(
         self,

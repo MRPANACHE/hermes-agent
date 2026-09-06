@@ -33,6 +33,10 @@ class _PrepareDriver:
 
     def call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         self.calls.append((name, dict(args)))
+        if name == "browser_prepare" and "profile" in args:
+            return _driver_result({"status": "ok", "prepared": True, "prepared_pid": 301})
+        if name == "list_windows":
+            return _driver_result({"windows": [{"pid": 301, "window_id": 401, "is_on_screen": True}]})
         return _driver_result({"status": "ok"})
 
 
@@ -132,7 +136,8 @@ def test_isolated_prepare_unaffected_by_the_grant():
     )
 
     assert result["status"] == "ok"
-    assert [name for name, _ in driver.calls] == ["browser_prepare"]
+    assert result["prepared_window_id"] == 401
+    assert [name for name, _ in driver.calls] == ["browser_prepare", "list_windows"]
 
 
 def test_backend_resolves_authorization_and_ignores_model_supplied_values(monkeypatch):
