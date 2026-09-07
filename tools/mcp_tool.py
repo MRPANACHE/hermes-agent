@@ -117,6 +117,7 @@ from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
+from tools.mcp_observation import McpObservationError, snapshot_mcp_observation
 from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
@@ -5787,6 +5788,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
     """
 
     def _handler(args: dict, **kwargs) -> Any:
+        try:
+            observation = snapshot_mcp_observation(server_name, tool_name, args)
+        except McpObservationError as exc:
+            return json.dumps(exc.result())
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -5865,9 +5870,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await server.session.call_tool(
+                        tool_name, arguments=observation.arguments() if observation else args,
+                    )
                 finally:
                     server._pending_call_context = None
+            if observation:
+                await observation.record(result)
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
@@ -6041,9 +6050,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
             return result
+        except McpObservationError as exc:
+            return json.dumps(exc.result())
         except InterruptedError:
+            if observation and observation.returned.is_set():
+                return json.dumps(McpObservationError(observation.invocation_id, execution_returned=True).result())
             return _interrupted_call_result()
         except Exception as exc:
+            if observation and observation.returned.is_set():
+                return json.dumps(McpObservationError(observation.invocation_id, execution_returned=True).result())
             # Auth-specific recovery path: consult the manager, signal
             # reconnect if viable, retry once. Returns None to fall
             # through for non-auth exceptions.
