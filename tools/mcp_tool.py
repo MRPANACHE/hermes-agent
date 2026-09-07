@@ -5743,14 +5743,50 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+_MCP_MULTIMODAL_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+_MCP_MULTIMODAL_TOTAL_BYTES = 8 * 1024 * 1024
+_MCP_MULTIMODAL_IMAGE_COUNT = 4
+_MCP_IMAGE_TEXT_FALLBACK = (
+    "Image content is unavailable to text-only consumers; "
+    "image content has not been inspected."
+)
+
+
+def _mcp_multimodal_image(block):
+    """Validate an inline PNG/JPEG without materializing a filesystem path."""
+    import base64
+    import binascii
+
+    mime = mcp_field(block, "mime_type", "mimeType")
+    data = mcp_field(block, "data", "data")
+    if (
+        mime not in ("image/png", "image/jpeg")
+        or not isinstance(data, str)
+        or len(data) > 4 * ((_MCP_MULTIMODAL_IMAGE_MAX_BYTES + 2) // 3)
+    ):
+        raise ValueError("mcp_image_content_invalid")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error):
+        raise ValueError("mcp_image_content_invalid") from None
+    if (
+        not raw or len(raw) > _MCP_MULTIMODAL_IMAGE_MAX_BYTES
+        or base64.b64encode(raw).decode("ascii") != data
+        or (mime == "image/png" and not raw.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (mime == "image/jpeg" and not raw.startswith(b"\xff\xd8\xff"))
+    ):
+        raise ValueError("mcp_image_content_invalid")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}, len(raw)
+
+
+def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *, image_content_mode: str = "media"):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
-    ``handler(args_dict, **kwargs) -> str``
+    ``handler(args_dict, **kwargs) -> str | multimodal envelope``
     """
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _handler(args: dict, **kwargs) -> Any:
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -5758,6 +5794,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
             return gate_error
+        if image_content_mode not in ("media", "multimodal"):
+            return tool_error("mcp_image_content_mode_invalid")
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -5868,7 +5906,35 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # Hermes' MEDIA tag + cache_image_from_bytes) was the cleaner of
             # the two — plugs into existing infrastructure.
             parts: List[str] = []
+            image_parts = []
+            image_bytes = 0
+
+            def with_images(serialized_text):
+                if not image_parts:
+                    return serialized_text
+                return {
+                    "_multimodal": True,
+                    "content": [{"type": "text", "text": serialized_text}, *image_parts],
+                    "text_summary": serialized_text + "\n" + _MCP_IMAGE_TEXT_FALLBACK,
+                }
+
             for block in (result.content or []):
+                block_mime = mcp_field(block, "mime_type", "mimeType")
+                is_image = mcp_field(block, "type", "type") == "image" or (
+                    isinstance(block_mime, str) and block_mime.startswith("image/")
+                )
+                if image_content_mode == "multimodal" and is_image:
+                    try:
+                        if len(image_parts) >= _MCP_MULTIMODAL_IMAGE_COUNT:
+                            raise ValueError("mcp_image_content_invalid")
+                        image_part, size = _mcp_multimodal_image(block)
+                        image_bytes += size
+                        if image_bytes > _MCP_MULTIMODAL_TOTAL_BYTES:
+                            raise ValueError("mcp_image_content_invalid")
+                    except ValueError:
+                        return tool_error("mcp_image_content_invalid")
+                    image_parts.append(image_part)
+                    continue
                 if hasattr(block, "text") and block.text:
                     parts.append(strip_unicode_tags(block.text))
                     continue
@@ -5953,12 +6019,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if "result" not in payload:
                     payload["result"] = text_result
                 try:
-                    return json.dumps(payload, ensure_ascii=False)
+                    return with_images(json.dumps(payload, ensure_ascii=False))
                 except (TypeError, ValueError):
                     # Non-serializable metadata: drop the extras rather than
                     # failing the whole tool call.
-                    return json.dumps({"result": text_result}, ensure_ascii=False)
-            return json.dumps({"result": text_result}, ensure_ascii=False)
+                    return with_images(json.dumps({"result": text_result}, ensure_ascii=False))
+            return with_images(json.dumps({"result": text_result}, ensure_ascii=False))
 
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
@@ -6818,7 +6884,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name, mcp_tool.name, server.tool_timeout,
+                    image_content_mode=config.get("image_content_mode", "media"),
                 ),
                 "check_fn": check_fn,
             }
@@ -7100,7 +7167,8 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(name, raw_name, tool_timeout,
+                                       image_content_mode=config.get("image_content_mode", "media")),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],

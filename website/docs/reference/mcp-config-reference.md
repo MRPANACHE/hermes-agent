@@ -58,6 +58,7 @@ mcp_servers:
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `protocol` | string | both | Protocol-era negotiation: `auto` (default — legacy `initialize` handshake first, falling back to the 2026-07-28 `server/discover` stateless probe when the server rejects the handshake as modern-only), `stateless` (probe `server/discover` first; one legacy retry), or `legacy` (handshake only, no fallback) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `image_content_mode` | string | both | `media` (default) keeps image results as gateway media tags. `multimodal` passes inline PNG/JPEG images to the existing model tool-result image route; unsupported or invalid images fail the result. |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `transport` | string | HTTP | Set to `sse` to use the SSE transport instead of Streamable HTTP |
 | `keepalive_interval` | number | both | Liveness ping cadence in seconds (default: `180`, floored at 5s). Set below the server's session TTL for servers that GC idle sessions quickly |
@@ -68,6 +69,22 @@ mcp_servers:
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
+
+### Inline tool-result images
+
+Set `image_content_mode: multimodal` on a server when its image results should
+reach the model as image input. Both live discovery and cached tool registration
+capture this setting. Text, structured content and metadata remain beside the
+images. This mode accepts canonical base64 PNG/JPEG with matching file
+signatures, up to four images per result, 4 MiB per image and 8 MiB total. Invalid,
+unsupported or oversized images fail the whole result rather than silently
+dropping image content. Images stay in memory; no local image path is opened.
+
+The active model/provider must also support image tool messages. Text-only
+fallbacks explicitly report that the image content is unavailable and has not
+been inspected. Successful image delivery does not establish visual
+understanding. Omitting the setting preserves the existing `MEDIA:` gateway
+behavior; it does not opt a server into model image input.
 
 ## Environment variable references
 
