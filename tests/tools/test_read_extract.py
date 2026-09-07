@@ -135,6 +135,72 @@ class TestAnydocExtraction(unittest.TestCase):
         self.assertEqual(text, "hello\n")
 
 
+class TestInstalledOnlyBytes(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        from tools import read_extract
+
+        self.rex = read_extract
+        state = mock.patch.multiple(read_extract, _anydoc_module=read_extract._ANYDOC_UNSET, _anydoc_failed_at=None)
+        state.start()
+        self.addCleanup(state.stop)
+
+    def test_installed_module_never_calls_installer_even_with_durable_target(self):
+        import sys
+        import types
+        from unittest import mock
+
+        module = types.ModuleType("anydoc")
+        module.to_markdown_bytes = mock.Mock(return_value="converted")
+        with mock.patch.dict(sys.modules, {"anydoc": module}), \
+             mock.patch.dict(os.environ, {"HERMES_LAZY_INSTALL_TARGET": "/synthetic/durable"}), \
+             mock.patch("tools.lazy_deps.ensure", side_effect=AssertionError("installer forbidden")) as ensure:
+            self.assertEqual(self.rex.extract_document_bytes(b"source", "source.rtf", allow_install=False), "converted\n")
+        ensure.assert_not_called()
+        module.to_markdown_bytes.assert_called_once_with(b"source")
+        self.assertIs(self.rex._anydoc_module, module)
+
+    def test_missing_installed_module_does_not_poison_normal_retry(self):
+        import types
+        from unittest import mock
+
+        module = types.SimpleNamespace(to_markdown_bytes=lambda data: "later")
+        with mock.patch("tools.lazy_deps.ensure") as ensure, \
+             mock.patch.object(self.rex.importlib, "import_module", side_effect=ModuleNotFoundError):
+            with self.assertRaises(self.rex.ExtractionError):
+                self.rex.extract_document_bytes(b"source", "source.pdf", allow_install=False)
+            ensure.assert_not_called()
+            self.assertIs(self.rex._anydoc_module, self.rex._ANYDOC_UNSET)
+            self.assertIsNone(self.rex._anydoc_failed_at)
+        with mock.patch("tools.lazy_deps.ensure") as ensure, \
+             mock.patch.object(self.rex.importlib, "import_module", return_value=module):
+            self.assertEqual(self.rex.extract_document_bytes(b"source", "source.rtf"), "later\n")
+            ensure.assert_called_once_with("tool.doc_extract", prompt=False)
+
+    def test_installed_only_can_import_during_normal_install_cooldown(self):
+        import types
+        from unittest import mock
+
+        module = types.SimpleNamespace(to_markdown_bytes=lambda data: "present")
+        self.rex._anydoc_failed_at = self.rex.time.monotonic()
+        with mock.patch("tools.lazy_deps.ensure", side_effect=AssertionError("installer forbidden")), \
+             mock.patch.object(self.rex.importlib, "import_module", return_value=module):
+            self.assertEqual(self.rex.extract_document_bytes(b"source", "source.rtf", allow_install=False), "present\n")
+
+    def test_installed_only_failure_preserves_existing_cooldown(self):
+        from unittest import mock
+
+        failed_at = self.rex.time.monotonic()
+        self.rex._anydoc_failed_at = failed_at
+        with mock.patch("tools.lazy_deps.ensure") as ensure, \
+             mock.patch.object(self.rex.importlib, "import_module", side_effect=ImportError):
+            with self.assertRaises(self.rex.ExtractionError):
+                self.rex.extract_document_bytes(b"source", "source.pdf", allow_install=False)
+            ensure.assert_not_called()
+        self.assertEqual(self.rex._anydoc_failed_at, failed_at)
+        self.assertIs(self.rex._anydoc_module, self.rex._ANYDOC_UNSET)
+
+
 class TestAnydocSizeCap(unittest.TestCase):
     """Oversized inputs must be rejected before anydoc converts them.
     Uses a fake binding so it runs regardless of local install state."""
@@ -568,6 +634,20 @@ class TestXlsxExtraction(unittest.TestCase):
         self.assertIn("Data", text)        # sheet label
         self.assertIn("Name\tScore", text)  # shared-string header row
         self.assertIn("Alice\t95", text)    # string + numeric cells
+
+    def test_installed_only_bytes_reuse_the_same_xlsx_renderer(self):
+        from tools.read_extract import extract_document_bytes
+
+        path = os.path.join(self.tmp, "source.xlsx")
+        self._build(path)
+        with open(path, "rb") as source:
+            data = source.read()
+        with mock.patch("tools.lazy_deps.ensure", side_effect=AssertionError("installer forbidden")) as ensure:
+            text = extract_document_bytes(data, "source.xlsx", allow_install=False)
+        self.assertEqual(text, extract_document_text(path))
+        self.assertIn("Alice\t95", text)
+        self.assertNotIn("SECRETDATA", text)
+        ensure.assert_not_called()
 
 
     def test_not_a_zip_raises(self):

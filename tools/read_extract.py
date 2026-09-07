@@ -63,11 +63,11 @@ class ExtractionError(Exception):
     """Raised when a supported-looking document cannot be rendered as text."""
 
 
-def _extension(path: str) -> str:
+def _extension(path: str, *, allow_install: bool = True) -> str:
     ext = Path(path).suffix.lower()
     if ext in EXTRACTABLE_EXTENSIONS:
         return ext
-    if ext in ANYDOC_EXTENSIONS and _anydoc() is not None:
+    if ext in ANYDOC_EXTENSIONS and _anydoc(allow_install=allow_install) is not None:
         return ext
     return ""
 
@@ -82,12 +82,14 @@ ANYDOC_RETRY_SECONDS = 300.0
 _anydoc_failed_at: Optional[float] = None
 
 
-def _anydoc() -> Optional[Any]:
+def _anydoc(*, allow_install: bool = True) -> Optional[Any]:
     """Lazily import the optional anydoc converter; None when unavailable.
 
     A failed load is retried after :data:`ANYDOC_RETRY_SECONDS` rather than
     disabling extraction for the rest of the process, so one transient
     failure (network blip, pip race) does not stick in long-lived workers.
+    Installed-only calls neither invoke the installer nor update failure
+    cooldowns; a successfully imported module can be shared with normal calls.
     """
     global _anydoc_module, _anydoc_failed_at
     if _anydoc_module is not _ANYDOC_UNSET:
@@ -95,23 +97,25 @@ def _anydoc() -> Optional[Any]:
     with _anydoc_lock:
         if _anydoc_module is not _ANYDOC_UNSET:
             return _anydoc_module
-        if (
+        if allow_install and (
             _anydoc_failed_at is not None
             and time.monotonic() - _anydoc_failed_at < ANYDOC_RETRY_SECONDS
         ):
             return None
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
+        if allow_install:
+            try:
+                from tools.lazy_deps import ensure as _lazy_ensure
 
-            # prompt=False: read_file must never block on an install prompt.
-            _lazy_ensure("tool.doc_extract", prompt=False)
-        except Exception:
-            _anydoc_failed_at = time.monotonic()
-            return None
+                # prompt=False: read_file must never block on an install prompt.
+                _lazy_ensure("tool.doc_extract", prompt=False)
+            except Exception:
+                _anydoc_failed_at = time.monotonic()
+                return None
         try:
             _anydoc_module = importlib.import_module("anydoc")
         except Exception:  # ImportError or a broken native binding
-            _anydoc_failed_at = time.monotonic()
+            if allow_install:
+                _anydoc_failed_at = time.monotonic()
             return None
         _anydoc_failed_at = None
     return _anydoc_module  # type: ignore[return-value]
@@ -134,15 +138,15 @@ def extract_document_text(path: str) -> str:
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 
-def extract_document_bytes(data: bytes, path: str) -> str:
-    """Extract a document already fetched across a file backend boundary."""
+def extract_document_bytes(data: bytes, path: str, *, allow_install: bool = True) -> str:
+    """Extract backend bytes; allow_install=False uses only installed converters."""
     if len(data) > MAX_DOCUMENT_BYTES:
         raise ExtractionError(
             f"Document too large to convert ({len(data):,} bytes, limit is {MAX_DOCUMENT_BYTES:,})"
         )
-    ext = _extension(path)
+    ext = _extension(path, allow_install=allow_install)
     if ext in ANYDOC_EXTENSIONS:
-        return _extract_anydoc_bytes(data, path)
+        return _extract_anydoc_bytes(data, path, allow_install=allow_install)
     if ext not in EXTRACTABLE_EXTENSIONS:
         raise ExtractionError(f"Unsupported document type: {path!r}")
 
@@ -332,8 +336,8 @@ def _pdf_coverage_note(path: str, display_path: Optional[str] = None) -> str:
     )
 
 
-def _extract_anydoc_bytes(data: bytes, path: str) -> str:
-    mod = _anydoc()
+def _extract_anydoc_bytes(data: bytes, path: str, *, allow_install: bool = True) -> str:
+    mod = _anydoc(allow_install=allow_install)
     if mod is None:
         raise ExtractionError(f"Unsupported document type: {path!r}")
     if len(data) > MAX_ANYDOC_BYTES:
