@@ -1380,7 +1380,10 @@ class APIServerAdapter(BasePlatformAdapter):
     # should complete the interrupted work rather than acknowledge (#57056).
     interactive_resume: bool = False
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, *, native_observation_scope_factory=None):
+        if native_observation_scope_factory is not None and not callable(native_observation_scope_factory):
+            raise ValueError("native_observation_scope_factory_invalid")
+        self._native_observation_scope_factory = native_observation_scope_factory
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
@@ -2974,6 +2977,8 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        if self._native_observation_scope_factory is not None:
+            agent_kwargs["native_observation_scope_factory"] = self._native_observation_scope_factory
 
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {

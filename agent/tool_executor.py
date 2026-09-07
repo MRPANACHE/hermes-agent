@@ -709,7 +709,13 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            from tools.mcp_observation_runtime import native_observation_dispatch
+
+            with native_observation_dispatch(
+                agent, tool_name=function_name, task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+            ):
+                return execute(final_args)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)

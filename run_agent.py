@@ -513,8 +513,12 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        native_observation_scope_factory=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        if native_observation_scope_factory is not None and not callable(native_observation_scope_factory):
+            raise TypeError("native_observation_scope_factory_invalid")
+        self._native_observation_scope_factory = native_observation_scope_factory
         if tool_delay is not None:
             warnings.warn(
                 "tool_delay is deprecated and ignored; sequential tool calls "
@@ -8842,12 +8846,13 @@ class AIAgent:
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
+            from tools.mcp_observation_runtime import native_observation_execution
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            with bind_subagent_parent(self), scoped_runtime_main({}), native_observation_execution(self):
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
