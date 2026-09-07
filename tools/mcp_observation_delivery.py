@@ -173,6 +173,35 @@ class NativeObservationDelivery:
             row = self._load(db, agent_run_id, invocation_id)
         return await self._deliver(row)
 
+    def pending(self, after=None, limit=100):
+        """Discover original bindings without delivering; rescan to see earlier inserts."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise _error("input_invalid")
+        cursor = ("", "")
+        if after is not None:
+            if type(after) is not dict or set(after) != {"agent_run_id", "invocation_id"}:
+                raise _error("input_invalid")
+            cursor = (after["agent_run_id"], after["invocation_id"])
+            _validate_ids(*cursor)
+        observations = []
+        with self._connection() as db:
+            db.execute("BEGIN")
+            selected = db.execute("""SELECT agent_run_id, invocation_id FROM native_observations
+                WHERE destination=? AND receipt IS NULL AND (agent_run_id, invocation_id) > (?, ?)
+                ORDER BY agent_run_id, invocation_id LIMIT ?""",
+                (self._endpoint, *cursor, limit + 1)).fetchall()
+            for identity in selected[:limit]:
+                row = self._load(db, identity["agent_run_id"], identity["invocation_id"])
+                value = json.loads(row["body"])
+                item = {key: value[key] for key in _KEYS - {"arguments", "result"}}
+                item["request_sha256"] = row["body_sha256"]
+                observations.append(item)
+            db.commit()
+        next_after = None
+        if len(selected) > limit:
+            next_after = {key: observations[-1][key] for key in ("agent_run_id", "invocation_id")}
+        return {"observations": observations, "next_after": next_after}
+
     async def _deliver(self, row):
         if row["receipt"] is not None:
             return json.loads(row["receipt"])

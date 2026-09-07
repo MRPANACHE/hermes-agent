@@ -286,3 +286,87 @@ def test_endpoint_is_trusted_explicit_https_or_literal_loopback(tmp_path, url):
     from tools.mcp_observation_delivery import NativeObservationDelivery
     with pytest.raises(Exception, match="native_observation_delivery_config_invalid"):
         NativeObservationDelivery(endpoint=url, token_provider=lambda: "secret", state_dir=tmp_path / "delivery")
+
+
+def stage_pending(endpoint_url, state, values):
+    from tools.mcp_observation_delivery import NativeObservationDelivery, NativeObservationDeliveryError
+
+    def unavailable():
+        raise RuntimeError("synthetic credential unavailable")
+
+    client = NativeObservationDelivery(endpoint=endpoint_url, token_provider=unavailable, state_dir=state)
+
+    async def stage():
+        for value in values:
+            with pytest.raises(NativeObservationDeliveryError, match="delivery_unconfirmed"):
+                await client(value)
+
+    asyncio.run(stage())
+    return client
+
+
+def test_pending_restart_discovers_original_binding_for_existing_replay(endpoint, tmp_path):
+    from tools.mcp_observation_delivery import NativeObservationDelivery
+    state = tmp_path / "delivery"
+    stage_pending(endpoint.url, state, [observation()])
+    tokens = []
+    restarted = NativeObservationDelivery(endpoint=endpoint.url,
+        token_provider=lambda: tokens.append(True) or "synthetic-private-credential", state_dir=state)
+    before = stored(state)
+    page = restarted.pending()
+    expected = {key: value for key, value in observation().items() if key not in ("arguments", "result")}
+    expected["request_sha256"] = before["body_sha256"]
+    assert page == {"observations": [expected], "next_after": None}
+    assert stored(state) == before
+    assert tokens == [] and endpoint.calls == []
+    found = page["observations"][0]
+    asyncio.run(restarted.replay(found["agent_run_id"], found["invocation_id"]))
+    assert endpoint.calls == [before["body"]]
+    assert restarted.pending() == {"observations": [], "next_after": None}
+    assert tokens == [True]
+
+
+def test_pending_lexical_pagination_max_boundary_endpoint_isolation_and_sentinel(endpoint, tmp_path):
+    state = tmp_path / "delivery"
+    values = [{**observation(), "agent_run_id": f"run-{index // 51}", "invocation_id": f"invoke-{index:03}"}
+              for index in range(101)]
+    client = stage_pending(endpoint.url, state, list(reversed(values)))
+    stage_pending("https://other.example/internal/hermes/native-observations", state,
+                  [{**observation(), "agent_run_id": "aaa-other-endpoint"}])
+    first = client.pending()
+    assert len(first["observations"]) == 100
+    assert first["next_after"] == {"agent_run_id": values[99]["agent_run_id"], "invocation_id": values[99]["invocation_id"]}
+    second = client.pending(after=first["next_after"], limit=1)
+    assert second["next_after"] is None
+    all_items = first["observations"] + second["observations"]
+    assert [(item["agent_run_id"], item["invocation_id"]) for item in all_items] == [
+        (value["agent_run_id"], value["invocation_id"]) for value in values]
+    assert client.pending(after={"agent_run_id": "zzz", "invocation_id": "zzz"}) == {
+        "observations": [], "next_after": None}
+    # Only returned rows are loaded; an unreturned sentinel must not decode its body.
+    with sqlite3.connect(state / "native-observations.sqlite3") as db:
+        db.execute("UPDATE native_observations SET body=? WHERE agent_run_id=? AND invocation_id=?",
+                   (b"{}", values[-1]["agent_run_id"], values[-1]["invocation_id"]))
+    assert len(client.pending()["observations"]) == 100
+    with pytest.raises(Exception, match="native_observation_delivery_storage_invalid"):
+        client.pending(after=first["next_after"])
+    assert endpoint.calls == []
+
+
+@pytest.mark.parametrize("options", [
+    {"limit": True}, {"limit": 0}, {"limit": 101}, {"limit": 1.0}, {"limit": "1"},
+    {"after": []}, {"after": {}}, {"after": {"agent_run_id": "run-1"}},
+    {"after": {"agent_run_id": "run-1", "invocation_id": "invoke-1", "extra": "x"}},
+    {"after": {"agent_run_id": "bad\n", "invocation_id": "invoke-1"}},
+    {"after": {"agent_run_id": True, "invocation_id": "invoke-1"}},
+])
+def test_pending_invalid_selectors_refuse_before_storage(endpoint, tmp_path, monkeypatch, options):
+    client = delivery(endpoint, tmp_path / "delivery")
+
+    def forbidden():
+        pytest.fail("invalid selector opened storage")
+
+    monkeypatch.setattr(client, "_connection", forbidden)
+    with pytest.raises(Exception, match="native_observation_delivery_input_invalid"):
+        client.pending(**options)
+    assert endpoint.calls == []
