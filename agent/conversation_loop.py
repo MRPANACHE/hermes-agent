@@ -6783,13 +6783,48 @@ def run_conversation(
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
 
+                # Preserve the provider's own incomplete classification in
+                # the ordinary runtime log.  The normalized finish reason is
+                # necessarily coarser, and previously left no way to tell a
+                # provider-side output limit from a completed reasoning-only
+                # response after the turn failed its continuation budget.
+                logging.info(
+                    "%sCodex response incomplete "
+                    "(response.status=%s, incomplete_details.reason=%s, "
+                    "continuation=%d/3)",
+                    agent.log_prefix,
+                    status or "unknown",
+                    incomplete_reason or "unspecified",
+                    agent._codex_incomplete_retries,
+                )
+
+                last_msg = messages[-1] if messages else None
+                current_opaque_reasoning_only = (
+                    interim_has_codex_reasoning
+                    and not interim_has_content
+                    and not interim_has_reasoning
+                    and not interim_has_codex_message_items
+                )
+                previous_opaque_reasoning_only = (
+                    isinstance(last_msg, dict)
+                    and last_msg.get("role") == "assistant"
+                    and last_msg.get("finish_reason") == "incomplete"
+                    and bool(last_msg.get("codex_reasoning_items"))
+                    and not bool((last_msg.get("content") or "").strip())
+                    and not bool((last_msg.get("reasoning") or "").strip())
+                    and not bool(last_msg.get("codex_message_items"))
+                )
+                consecutive_opaque_reasoning_only = (
+                    current_opaque_reasoning_only
+                    and previous_opaque_reasoning_only
+                )
+
                 if (
                     interim_has_content
                     or interim_has_reasoning
                     or interim_has_codex_reasoning
                     or interim_has_codex_message_items
                 ):
-                    last_msg = messages[-1] if messages else None
                     # Duplicate detection: compare only visible content
                     # (content + reasoning).  Opaque provider state
                     # (encrypted reasoning items, message item ids/phases)
@@ -6864,7 +6899,12 @@ def run_conversation(
                         or interim_has_codex_reasoning
                         or interim_has_codex_message_items
                     )
-                    if not interim_replayable:
+                    # Encrypted reasoning is normally useful continuation
+                    # state, so replay it once without interference. If the
+                    # next response is still opaque reasoning only, the state
+                    # is no longer evidence of progress: add the existing
+                    # nudge before spending the final existing attempt.
+                    if not interim_replayable or consecutive_opaque_reasoning_only:
                         _last_msg = messages[-1] if messages else None
                         _already_nudged = (
                             isinstance(_last_msg, dict)
