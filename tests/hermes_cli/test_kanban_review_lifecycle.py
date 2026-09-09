@@ -414,6 +414,25 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         assert tid in [s[0] for s in res_on.spawned]
 
 
+def test_explicit_unblock_after_pr_comment_resumes_recovery(kanban_home, monkeypatch):
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    # The monitor appends evidence and unblocks within the same second.
+    monkeypatch.setattr(kb.time, "time", lambda: 1788951000)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Verify deployed import", assignee="pippa")
+        kb.add_comment(conn, tid, author="pippa", body="Released https://github.com/example/repo/pull/1")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        kb.block_task(conn, tid, reason="Waiting for scheduled readback")
+        kb.unblock_task(conn, tid)
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert tid in [s[0] for s in kb.dispatch_once(conn, dry_run=True).spawned]
+        # A new PR after that explicit wake still protects against duplicates.
+        kb.add_comment(conn, tid, author="pippa", body="Opened https://github.com/example/repo/pull/2")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
