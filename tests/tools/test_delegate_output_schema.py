@@ -194,6 +194,37 @@ def _run(child):
 
 
 class TestRunSingleChildSchemaValidation:
+    def test_schema_retry_cannot_complete_parent_kanban_task(self, monkeypatch):
+        from agent.delegation_context import delegated_child_subprocess_env
+        from tools import kanban_tools
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-recovery-task")
+        monkeypatch.setattr(
+            kanban_tools, "_connect",
+            lambda **kw: (_ for _ in ()).throw(AssertionError("child reached board")),
+        )
+        child = _StubChild(["not JSON", '{"city": "Oslo"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        original = child.run_conversation
+        observations = []
+
+        def attempt_completion(*args, **kwargs):
+            observations.append((
+                kanban_tools._handle_complete({"summary": "coding finished"}),
+                delegated_child_subprocess_env({"HERMES_KANBAN_TASK": "parent-recovery-task"}),
+            ))
+            return original(*args, **kwargs)
+
+        child.run_conversation = attempt_completion
+        entry = _run(child)
+        assert entry["schema_valid"] is True
+        assert len(observations) == 2
+        for rejection, child_env in observations:
+            assert "child agents are not Kanban run owners" in rejection
+            assert "HERMES_KANBAN_TASK" not in child_env
+            assert child_env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        assert delegated_child_subprocess_env() is None
+
     def test_valid_first_try_no_retry(self):
         child = _StubChild(['{"city": "Berlin"}'])
         child._delegate_output_schema = ADDRESS_SCHEMA
