@@ -9438,6 +9438,8 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        An explicit unblock after the latest comment resumes deliberate
+        follow-up work, including scheduled production verification.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9532,6 +9534,23 @@ def check_respawn_guard(
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # A monitor/operator explicitly waking the card after recording
+            # evidence is not duplicate PR work. Use event order, not seconds:
+            # comment + unblock commonly happen in the same second. A newer
+            # comment restores the conservative PR guard until another wake.
+            last_comment = conn.execute(
+                "SELECT MAX(id) AS id FROM task_events "
+                "WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()
+            if last_comment and last_comment["id"] is not None:
+                explicit_wake = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? "
+                    "AND kind = 'unblocked' AND id > ? LIMIT 1",
+                    (task_id, last_comment["id"]),
+                ).fetchone()
+                if explicit_wake:
+                    return None
             return "active_pr"
 
     return None
