@@ -1692,10 +1692,15 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Global emergency stop (`hermes pause`): skip auto-decompose
-                # and dispatch entirely — no new workers while paused. Running
-                # workers finish naturally; zombie reaping above still runs.
-                if not _kanban_dispatch_allowed():
+                # Global emergency stop (`hermes pause`) and gateway lifecycle
+                # drain both skip auto-decompose and dispatch entirely — no NEW
+                # workers while paused or while a SIGUSR1/restart drain is in
+                # progress. Running workers finish naturally; zombie reaping
+                # above still runs.
+                if getattr(self, "_draining", False):
+                    ready_pending = False
+                    bad_ticks = 0
+                elif not _kanban_dispatch_allowed():
                     ready_pending = False
                     bad_ticks = 0
                 else:
@@ -1703,9 +1708,27 @@ class GatewayKanbanWatchersMixin:
                     # flipping kanban.auto_decompose=false to STOP runaway fan-out
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                    if _ad_enabled:
-                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
-                    results = await asyncio.to_thread(_tick_once)
+                    try:
+                        self._kanban_dispatch_active_count = (
+                            int(getattr(self, "_kanban_dispatch_active_count", 0) or 0) + 1
+                        )
+                    except Exception:
+                        self._kanban_dispatch_active_count = 1
+                    try:
+                        if _ad_enabled:
+                            await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                        if getattr(self, "_draining", False):
+                            results = []
+                        else:
+                            results = await asyncio.to_thread(_tick_once)
+                    finally:
+                        try:
+                            self._kanban_dispatch_active_count = max(
+                                0,
+                                int(getattr(self, "_kanban_dispatch_active_count", 0) or 0) - 1,
+                            )
+                        except Exception:
+                            self._kanban_dispatch_active_count = 0
                     any_spawned = False
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
