@@ -468,3 +468,115 @@ def test_wedged_agent_count_ignores_sentinels_and_bad_summaries(monkeypatch):
         }
     )
     assert runner._wedged_agent_count() == 1
+
+
+
+def test_active_work_count_includes_kanban_dispatch_and_workers():
+    runner, _adapter = make_restart_runner()
+    runner._kanban_dispatch_active_count = 2
+    runner._active_kanban_worker_count = MagicMock(return_value=3)
+
+    assert runner._active_kanban_work_count() == 5
+    assert runner._active_work_count() == 5
+
+
+@pytest.mark.asyncio
+async def test_request_restart_waits_for_active_kanban_dispatch():
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 300.0
+    runner._kanban_dispatch_active_count = 1
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await asyncio.sleep(0.25)
+    runner.stop.assert_not_awaited()
+
+    runner._kanban_dispatch_active_count = 0
+    await asyncio.wait_for(runner._restart_task, timeout=5.0)
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_active_agents_waits_for_kanban_workers():
+    runner, _adapter = make_restart_runner()
+    running = True
+
+    def active_workers():
+        return 1 if running else 0
+
+    runner._active_kanban_worker_count = MagicMock(side_effect=active_workers)
+
+    async def finish_worker():
+        nonlocal running
+        await asyncio.sleep(0.12)
+        running = False
+
+    task = asyncio.create_task(finish_worker())
+    _snapshot, timed_out = await runner._drain_active_agents(2.0)
+    await task
+
+    assert timed_out is False
+    assert runner._active_kanban_worker_count.call_count >= 1
+
+
+
+def test_active_kanban_worker_count_reads_existing_boards_read_only(monkeypatch, tmp_path):
+    import sqlite3
+
+    from hermes_cli import kanban_db as kb
+
+    runner, _adapter = make_restart_runner()
+    runner._active_kanban_worker_count = gateway_run.GatewayRunner._active_kanban_worker_count.__get__(
+        runner, gateway_run.GatewayRunner
+    )
+    paths = {
+        "alpha": tmp_path / "alpha.sqlite3",
+        "beta": tmp_path / "beta.sqlite3",
+        "alias": tmp_path / "alpha.sqlite3",
+    }
+    for slug, count in (("alpha", 2), ("beta", 3)):
+        conn = sqlite3.connect(paths[slug])
+        conn.execute("CREATE TABLE tasks (status TEXT NOT NULL)")
+        conn.executemany(
+            "INSERT INTO tasks(status) VALUES (?)",
+            [("running",)] * count + [("ready",)],
+        )
+        conn.commit()
+        conn.close()
+
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda include_archived=False: [
+            {"slug": "alpha"},
+            {"slug": "beta"},
+            {"slug": "alias"},
+            {"slug": "missing"},
+        ],
+    )
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: paths.get(board, tmp_path / "missing.sqlite3"))
+    monkeypatch.setattr(
+        kb,
+        "connect",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not initialise board DB")),
+    )
+
+    assert runner._active_kanban_worker_count() == 5
+
+
+def test_active_kanban_worker_count_fails_closed_on_unknown_board(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    runner, _adapter = make_restart_runner()
+    runner._active_kanban_worker_count = gateway_run.GatewayRunner._active_kanban_worker_count.__get__(
+        runner, gateway_run.GatewayRunner
+    )
+    broken = tmp_path / "broken.sqlite3"
+    broken.write_text("not sqlite", encoding="utf-8")
+
+    monkeypatch.setattr(kb, "list_boards", lambda include_archived=False: [{"slug": "broken"}])
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: broken)
+
+    assert runner._active_kanban_worker_count() == 1

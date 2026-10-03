@@ -36,6 +36,7 @@ import queue
 import re
 import shlex
 import site
+import sqlite3
 import sys
 import signal
 import threading
@@ -8458,7 +8459,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_kanban_work_count()
         )
+
+    def _active_kanban_work_count(self) -> int:
+        """Count kanban dispatch/worker work that a gateway restart must drain.
+
+        Kanban workers are spawned by the embedded dispatcher, outside
+        ``self._running_agents``. A service-managed gateway restart can still
+        tear down its child cgroup, so lifecycle drains must see active kanban
+        work before they stop the process. Best-effort and read-only: an
+        unknown or unreadable board returns one synthetic work unit so a
+        lifecycle preflight fails closed instead of claiming the gateway is idle.
+        """
+        return self._active_kanban_dispatch_count() + self._active_kanban_worker_count()
+
+    def _active_kanban_dispatch_count(self) -> int:
+        try:
+            return max(0, int(getattr(self, "_kanban_dispatch_active_count", 0) or 0))
+        except Exception:
+            return 0
+
+    def _active_kanban_worker_count(self) -> int:
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            # Unknown kanban state during a lifecycle preflight is not proof of
+            # idleness. Return one synthetic unit so graceful restart waits (or
+            # the caller can deny a reload preflight) instead of claiming idle.
+            return 1
+        total = 0
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [{"slug": getattr(_kb, "DEFAULT_BOARD", "default")}]
+        seen_paths: set[str] = set()
+        for board in boards:
+            slug = (board or {}).get("slug") or getattr(_kb, "DEFAULT_BOARD", "default")
+            try:
+                db_path = _kb.kanban_db_path(board=slug).expanduser().resolve()
+            except Exception:
+                return 1
+            if not db_path.is_file():
+                continue
+            db_key = str(db_path)
+            if db_key in seen_paths:
+                continue
+            seen_paths.add(db_key)
+            conn = None
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                total += int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                    ).fetchone()[0]
+                )
+            except Exception:
+                return 1
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return max(0, total)
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
@@ -10485,25 +10549,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_kanban_count = self._active_kanban_work_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count, last_kanban_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            kanban_count = self._active_kanban_work_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or kanban_count != last_kanban_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_kanban_count = kanban_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -10512,7 +10580,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        # Kanban dispatcher/worker runs are also outside _running_agents.
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_kanban_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -10533,7 +10607,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_api_run_count()
+                or self._active_kanban_work_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -10549,6 +10625,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_kanban_work_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out

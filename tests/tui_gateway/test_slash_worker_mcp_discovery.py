@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import yaml
@@ -51,6 +52,12 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # CI runs this integration probe inside a heavily parallel
+                # slice. Give the local stdio MCP server enough bounded
+                # startup time so the first /tools response proves profile
+                # discovery instead of racing the default 1.5s interactive
+                # startup budget.
+                "mcp_discovery_timeout": 60.0,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
@@ -92,19 +99,35 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert proc.stdin is not None
         assert proc.stdout is not None
         stdout = proc.stdout
-        threading.Thread(
-            target=lambda: output.put(stdout.readline()),
-            daemon=True,
-        ).start()
-        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
-        proc.stdin.flush()
-        try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
-        response = json.loads(line)
-        assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        def _read_stdout() -> None:
+            for line in stdout:
+                output.put(line)
+
+        threading.Thread(target=_read_stdout, daemon=True).start()
+
+        expected_tool = "mcp__profileprobe__hermes_61922_profile_probe"
+        deadline = time.monotonic() + 120.0
+        last_output = ""
+        request_id = 0
+        while time.monotonic() < deadline:
+            request_id += 1
+            proc.stdin.write(json.dumps({"id": request_id, "command": "/tools"}) + "\n")
+            proc.stdin.flush()
+            remaining = max(0.1, min(30.0, deadline - time.monotonic()))
+            try:
+                line = output.get(timeout=remaining)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    pytest.fail(f"slash worker exited before /tools response: {proc.returncode}")
+                continue
+            response = json.loads(line)
+            assert response["ok"] is True
+            last_output = response["output"]
+            if expected_tool in last_output:
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail(f"profile-local MCP tool was not visible in /tools output: {last_output}")
     finally:
         proc.terminate()
         try:

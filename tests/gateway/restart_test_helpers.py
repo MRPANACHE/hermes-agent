@@ -74,6 +74,7 @@ def make_restart_runner(
     runner._restart_task_started = False
     runner._restart_detached = False
     runner._restart_via_service = False
+    runner._kanban_dispatch_active_count = 0
     runner._detached_restart_helper_started = False
     runner._restart_command_source = None
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -125,6 +126,15 @@ def make_restart_runner(
         runner, GatewayRunner
     )
     runner._active_api_run_count = GatewayRunner._active_api_run_count.__get__(
+        runner, GatewayRunner
+    )
+    runner._active_kanban_dispatch_count = GatewayRunner._active_kanban_dispatch_count.__get__(
+        runner, GatewayRunner
+    )
+    # Default restart tests must not read the developer's real kanban DB.
+    # Tests that exercise kanban workers install their own explicit count.
+    runner._active_kanban_worker_count = MagicMock(return_value=0)
+    runner._active_kanban_work_count = GatewayRunner._active_kanban_work_count.__get__(
         runner, GatewayRunner
     )
     runner._active_work_count = GatewayRunner._active_work_count.__get__(
