@@ -8468,9 +8468,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Kanban workers are spawned by the embedded dispatcher, outside
         ``self._running_agents``. A service-managed gateway restart can still
         tear down its child cgroup, so lifecycle drains must see active kanban
-        work before they stop the process. Best-effort and read-only: DB read
-        failures return 0 so a broken board cannot brick normal gateway
-        shutdown.
+        work before they stop the process. Best-effort and read-only: an
+        unknown or unreadable board returns one synthetic work unit so a
+        lifecycle preflight fails closed instead of claiming the gateway is idle.
         """
         return self._active_kanban_dispatch_count() + self._active_kanban_worker_count()
 
