@@ -229,6 +229,69 @@ def _resolve_skill_commands_home() -> str:
     return str(get_hermes_home())
 
 
+_REQUIRED_BUNDLED_PRELOADS = {
+    "sdlc-review": Path("devops/sdlc-review"),
+    "devops/sdlc-review": Path("devops/sdlc-review"),
+}
+
+
+def _load_bundled_skill_payload(
+    normalized: str,
+    disabled_names: set[str] | None = None,
+) -> tuple[dict[str, Any], Path, str] | None:
+    """Load the mandatory bundled Kanban review skill when a profile is unseeded.
+
+    Profile skills remain the first lookup tier via ``skill_view``. This fallback
+    is intentionally limited to the built-in ``sdlc-review`` skill required by
+    Kanban review dispatch. It is read-only: it does not install or enable skills
+    in the active profile.
+    """
+    rel_dir = _REQUIRED_BUNDLED_PRELOADS.get(normalized)
+    if rel_dir is None:
+        return None
+
+    try:
+        from tools.skills_tool import (
+            _parse_frontmatter,
+            skill_matches_platform,
+        )
+    except Exception:
+        return None
+
+    bundled_root = Path(__file__).resolve().parents[1] / "skills"
+    skill_dir = bundled_root / rel_dir
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.is_file():
+        return None
+
+    try:
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
+        frontmatter, _body = _parse_frontmatter(content)
+    except Exception:
+        return None
+
+    if not skill_matches_platform(frontmatter):
+        return None
+
+    skill_name = str(frontmatter.get("name") or skill_dir.name)
+    disabled = disabled_names or set()
+    if normalized in disabled or skill_name in disabled or str(rel_dir) in disabled:
+        return None
+
+    rel_path = str(skill_md.relative_to(bundled_root))
+    loaded_skill = {
+        "success": True,
+        "name": skill_name,
+        "description": frontmatter.get("description", ""),
+        "content": content,
+        "raw_content": content,
+        "path": rel_path,
+        "skill_dir": str(skill_dir),
+        "source": "bundled",
+    }
+    return loaded_skill, skill_dir, skill_name
+
+
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -237,9 +300,13 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
-        from agent.skill_utils import normalize_skill_lookup_name
+        from agent.skill_utils import (
+            get_disabled_skill_names,
+            normalize_skill_lookup_name,
+        )
 
         normalized = normalize_skill_lookup_name(raw_identifier)
+        disabled_names = get_disabled_skill_names()
 
         loaded_skill = json.loads(
             skill_view(normalized, task_id=task_id, preprocess=False)
@@ -248,6 +315,9 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     if not loaded_skill.get("success"):
+        bundled = _load_bundled_skill_payload(normalized, disabled_names)
+        if bundled is not None:
+            return bundled
         return None
 
     skill_name = str(loaded_skill.get("name") or normalized)

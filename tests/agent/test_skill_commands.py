@@ -562,6 +562,56 @@ class TestBuildPreloadedSkillsPrompt:
         assert "SECRET DISABLED CONTENT." not in prompt
         assert "enabled-skill" in prompt
 
+    def test_loads_bundled_review_skill_when_profile_skills_are_unseeded(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            prompt, loaded, missing = build_preloaded_skills_prompt(["sdlc-review"])
+
+        assert missing == []
+        assert loaded == ["sdlc-review"]
+        assert "SDLC Review Skill" in prompt
+        assert "review lane" in prompt
+
+    def test_loads_categorized_bundled_review_skill_alias(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            prompt, loaded, missing = build_preloaded_skills_prompt(["devops/sdlc-review"])
+
+        assert missing == []
+        assert loaded == ["sdlc-review"]
+        assert "SDLC Review Skill" in prompt
+
+    def test_bundled_review_fallback_honors_disabled_skill(self, tmp_path, monkeypatch):
+        import agent.skill_utils as su_module
+
+        monkeypatch.setattr(
+            su_module,
+            "get_disabled_skill_names",
+            lambda platform=None: {"sdlc-review"},
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            prompt, loaded, missing = build_preloaded_skills_prompt(["sdlc-review"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["sdlc-review"]
+
+    def test_profile_skill_takes_precedence_over_bundled_review_fallback(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "sdlc-review", body="Profile review content.")
+            prompt, loaded, missing = build_preloaded_skills_prompt(["sdlc-review"])
+
+        assert missing == []
+        assert loaded == ["sdlc-review"]
+        assert "Profile review content." in prompt
+        assert "SDLC Review Skill" not in prompt
+
+    def test_unknown_skill_does_not_load_other_bundled_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            prompt, loaded, missing = build_preloaded_skills_prompt(["hermes-agent-dev"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["hermes-agent-dev"]
+
 
 
 class TestBuildSkillInvocationMessage:
