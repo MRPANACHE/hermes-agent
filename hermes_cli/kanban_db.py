@@ -9587,6 +9587,24 @@ def check_respawn_guard(
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # A canonical reviewer return authorizes correction on this task,
+            # not another PR. Never carry that permission past a newer run or
+            # owner change; auth, cooldown and recent-success guards stay above.
+            rework = conn.execute(
+                "SELECT 1 FROM task_runs r JOIN task_events e "
+                "ON e.task_id = r.task_id AND e.run_id = r.id "
+                "JOIN tasks t ON t.id = r.task_id "
+                "WHERE r.task_id = ? AND r.id = "
+                "(SELECT MAX(id) FROM task_runs WHERE task_id = ?) "
+                "AND r.outcome = 'changes_requested' "
+                "AND e.kind = 'changes_requested' AND json_valid(e.payload) "
+                "AND json_extract(e.payload, '$.status') IN ('ready', 'todo') "
+                "AND json_extract(e.payload, '$.implementer') = t.assignee "
+                "AND t.status = 'ready' AND t.current_run_id IS NULL LIMIT 1",
+                (task_id, task_id),
+            ).fetchone()
+            if rework:
+                return None
             # A monitor/operator explicitly waking the card after recording
             # evidence is not duplicate PR work. Use event order, not seconds:
             # comment + unblock commonly happen in the same second. A newer
