@@ -119,16 +119,19 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
-# ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
-# unblocking them only to have the worker re-block for the same reason.
+# ``BLOCK_RECURRENCE_LIMIT``) records repeated blocking without making them
+# runnable or eligible for automatic triage/decomposition.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+INPUT_BLOCK_KINDS = {"needs_input", "capability"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
-# to ``blocked`` — breaking the infinite unblock↔re-block loop and forcing a
-# human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
+# to ``blocked`` for generic/transient blocks. Input/capability blocks stay
+# blocked: decomposition cannot resolve a missing decision or access. The
+# recurrence event preserves evidence for human review. Mirrors the dispatcher's
+# ``DEFAULT_FAILURE_LIMIT``
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
@@ -1418,8 +1421,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
+    -- BLOCK_RECURRENCE_LIMIT generic/transient blocks route to ``triage``;
+    -- input/capability blocks stay ``blocked``. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
@@ -6267,9 +6270,10 @@ def block_task(
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
       unblock-loop counter (``block_recurrences``) increments. When it reaches
-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
-      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
+      :data:`BLOCK_RECURRENCE_LIMIT`, a loop event is recorded. ``needs_input``
+      and ``capability`` remain ``blocked``; another execution or decomposition
+      cannot resolve missing input/access. Legacy un-typed blocks route to
+      ``triage``.
 
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
@@ -6363,12 +6367,13 @@ def block_task(
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
+            # Triage is scanned for automatic decomposition. Missing input or
+            # capability must not turn a limited resume into new runnable work.
+            target_status = "blocked" if kind in INPUT_BLOCK_KINDS else "triage"
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'triage',
+                   SET status        = ?,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -6377,8 +6382,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (target_status, kind, recurrences, task_id) if expected_run_id is None
+                else (target_status, kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6399,9 +6404,25 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    "target_status": target_status,
                 },
                 run_id=run_id,
             )
+            if target_status == "blocked":
+                # Consumers identify the current blocker by its ordinary blocked
+                # event. Keep that identity fresh without starting another run.
+                _append_event(
+                    conn, task_id, "blocked",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "loop_detected": True,
+                        "source_status": source_status,
+                    },
+                    run_id=run_id,
+                )
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -6935,9 +6956,9 @@ def unblock_task(
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
         # unbounded (Dale's report). The counter survives the unblock so that a
-        # subsequent same-cause ``block_task`` can detect the loop and route to
-        # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
-        # successful completion (see ``complete_task``). ``consecutive_failures``
+        # subsequent same-cause ``block_task`` can detect the loop. Input/access
+        # blocks stay blocked; generic/transient blocks route to triage. Reset
+        # only on successful completion (see ``complete_task``). ``consecutive_failures``
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
         # still reset here, which is correct: a deliberate unblock is a fresh
         # start for the dispatcher's retry budget.
@@ -7213,6 +7234,8 @@ def specify_triage_task(
     and transitions ``status: triage -> todo`` in a single write txn. Returns
     False when the task is missing or not in the ``triage`` column — callers
     should surface that as "nothing to specify" rather than an error.
+    Historical triage cards blocked on input/capability also return False;
+    specification does not authorize resuming past missing access or input.
 
     ``todo`` (not ``ready``) is the correct landing column: ``recompute_ready``
     promotes parent-free / parent-done todos to ``ready`` on the next
@@ -7228,10 +7251,13 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, block_kind FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # Old loop escalation cards are still access/input blocks, not new work.
+        if existing["block_kind"] in INPUT_BLOCK_KINDS:
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -7318,6 +7344,7 @@ def decompose_triage_task(
     success. Returns ``None`` when:
       - The root task does not exist
       - The root task is not in ``triage``
+      - The root has an input/capability block (including old loop escalations)
       - A cycle would result (caller built a bad graph)
 
     Validation of titles/assignees happens inside the same write_txn as
@@ -7382,13 +7409,15 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, block_kind "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        if root_row["block_kind"] in INPUT_BLOCK_KINDS:
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out

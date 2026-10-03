@@ -160,6 +160,10 @@ def specify_task(
         return SpecifyOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if task.block_kind in kb.INPUT_BLOCK_KINDS:
+        return SpecifyOutcome(
+            task_id, False, "task requires input or capability; specification is not a resume"
+        )
 
     try:
         from agent.auxiliary_client import call_llm
@@ -250,7 +254,7 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column.
+    """Return triage ids eligible for specification, excluding input/access blocks.
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
@@ -261,4 +265,4 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             include_archived=False,
         )
-    return [t.id for t in tasks]
+    return [t.id for t in tasks if t.block_kind not in kb.INPUT_BLOCK_KINDS]
