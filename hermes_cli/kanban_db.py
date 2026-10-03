@@ -6981,7 +6981,12 @@ def unblock_task(
         return True
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def reopen_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_nested: bool = False,
+) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
     The "changes requested" counterpart of :func:`request_review`: sends the
@@ -6994,9 +6999,16 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     not a block, so there is no loop counter to reset. (A stale counter from a
     genuine block *before* review is left intact — only :func:`complete_task`
     clears it.) Returns False when the task is missing or not in ``review``.
+
+    ``allow_nested`` is deliberately false by default, preserving the
+    write_txn nesting guard for ordinary callers. Adapter code that must
+    atomically compose an existing idempotency receipt/comment with the
+    native review reopen can opt in and inherit savepoint semantics from
+    :func:`write_txn`; the inner release is not durable until the outer
+    transaction commits.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
