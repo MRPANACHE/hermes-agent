@@ -9587,6 +9587,40 @@ def check_respawn_guard(
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # Dependency completion continues the original task, not a new PR.
+            # Bind the promotion to its latest ended worker and dependency wait;
+            # a claimed/newer run or changed owner cannot reuse that continuation.
+            continuation = conn.execute(
+                "SELECT 1 FROM tasks t JOIN task_runs r ON r.task_id = t.id "
+                "JOIN task_events w ON w.task_id = t.id AND w.run_id = r.id "
+                "JOIN task_events p ON p.task_id = t.id AND p.id > w.id "
+                "WHERE t.id = ? AND t.status = 'ready' "
+                "AND t.block_kind = 'dependency' AND t.current_run_id IS NULL "
+                "AND t.claim_lock IS NULL AND t.worker_pid IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM task_runs active "
+                "WHERE active.task_id = t.id AND active.ended_at IS NULL) "
+                "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id) "
+                "AND r.profile = t.assignee AND r.outcome = 'blocked' "
+                "AND r.ended_at IS NOT NULL AND w.kind = 'dependency_wait' "
+                "AND json_valid(w.payload) "
+                "AND json_extract(w.payload, '$.kind') = 'dependency' "
+                "AND json_extract(w.payload, '$.source_status') = 'ready' "
+                "AND p.kind = 'promoted' "
+                "AND w.id > COALESCE((SELECT MAX(id) FROM task_events "
+                "WHERE task_id = t.id AND kind = 'commented'), 0) "
+                "AND p.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id "
+                "AND kind IN ('promoted', 'dependency_wait', 'claimed', 'status', "
+                "'unblocked', 'reclaimed', 'blocked', 'changes_requested')) "
+                "AND EXISTS (SELECT 1 FROM task_links WHERE child_id = t.id) "
+                "AND NOT EXISTS (SELECT 1 FROM task_links l "
+                "LEFT JOIN tasks parent ON parent.id = l.parent_id "
+                "WHERE l.child_id = t.id "
+                "AND (parent.id IS NULL OR parent.status NOT IN ('done', 'archived'))) "
+                "LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if continuation:
+                return None
             # A canonical reviewer return authorizes correction on this task,
             # not another PR. Never carry that permission past a newer run or
             # owner change; auth, cooldown and recent-success guards stay above.

@@ -1146,6 +1146,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    exact_goal: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1213,7 +1214,7 @@ def judge_goal(
             )
             contract_block = f"{contract_block}\n{extra}"
         prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
+            goal=goal if exact_goal else _truncate(goal, 2000),
             contract_block=_truncate(contract_block, 2500),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
@@ -1224,7 +1225,7 @@ def judge_goal(
             f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
         )
         prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
+            goal=goal if exact_goal else _truncate(goal, 2000),
             subgoals_block=_truncate(subgoals_block, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
@@ -1232,7 +1233,7 @@ def judge_goal(
         )
     else:
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
+            goal=goal if exact_goal else _truncate(goal, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
             current_time=current_time,
