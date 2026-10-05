@@ -259,12 +259,12 @@ def _goal_handoff_context(kb, conn, task) -> str:
     """
     if not task or not task.goal_mode:
         return ""
-    comments = kb.list_comments(conn, task.id)
+    comments = sorted(kb.list_comments(conn, task.id), key=lambda c: (c.created_at, c.id))
     sources = {comment.id: comment for comment in comments}
     transitions = []
     rows = conn.execute(
         "SELECT id,kind,payload FROM task_events WHERE task_id=? "
-        "AND kind IN ('mrpanache_resumed','mrpanache_recovered','mrpanache_reworked') "
+        "AND kind IN ('mrpanache_resumed','mrpanache_recovered','mrpanache_reworked','mrpanache_clarified') "
         "ORDER BY id ASC", (task.id,),
     ).fetchall()
     try:
@@ -275,6 +275,8 @@ def _goal_handoff_context(kb, conn, task) -> str:
     effective = original.get("delivery_goal", "draft_pr") if ingress else None
     if ingress and effective not in ("draft_pr", "verified_live"):
         raise ValueError("missing mandate context: invalid original delivery goal")
+    amendments = []
+    verified_comment_ids = set()
     for row in rows:
         try:
             payload = json.loads(row["payload"] or "{}")
@@ -282,6 +284,21 @@ def _goal_handoff_context(kb, conn, task) -> str:
             raise ValueError(f"missing mandate context: invalid event {row['id']} payload") from None
         if not isinstance(payload, dict):
             raise ValueError(f"missing mandate context: invalid event {row['id']} payload")
+        comment_id = payload.get("comment_id")
+        request_id = payload.get("request_id")
+        fingerprint = payload.get("fingerprint")
+        if (type(comment_id) is not int or comment_id not in sources
+                or sources[comment_id].author != "mrpanache-mcp"
+                or not isinstance(request_id, str) or not request_id.strip()
+                or not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or any(ch not in "0123456789abcdef" for ch in fingerprint)):
+            raise ValueError(f"missing mandate context: event {row['id']} requester provenance unavailable")
+        verified_comment_ids.add(comment_id)
+        amendments.append({
+            "event_id": row["id"], "kind": row["kind"], "payload": payload,
+            "comment_id": comment_id, "author": sources[comment_id].author,
+            "body": sources[comment_id].body,
+        })
         if payload.get("delivery_goal") is None:
             continue
         goal = payload["delivery_goal"]
@@ -289,11 +306,43 @@ def _goal_handoff_context(kb, conn, task) -> str:
             raise ValueError(f"missing mandate context: invalid delivery event {row['id']}")
         if goal == "verified_live" and (original.get("agent") != "otto" or original.get("kind") != "codework"):
             raise ValueError(f"missing mandate context: unsupported delivery event {row['id']}")
-        comment_id = payload.get("comment_id")
-        if comment_id is None or comment_id not in sources:
-            raise ValueError(f"missing mandate context: event {row['id']} comment {comment_id} unavailable")
+
         effective = goal
         transitions.append({"event_id": row["id"], "kind": row["kind"], "payload": payload})
+    # Requester constraints are never summarized or dropped. Author alone is
+    # not provenance: every requester amendment needs its native ingress event.
+    if any(c.author == "mrpanache-mcp" and c.id not in verified_comment_ids for c in comments):
+        raise ValueError("missing mandate context: requester comment has no native event reference")
+    runs = sorted(kb.list_runs(conn, task.id), key=lambda run: (run.started_at, run.id))
+    latest = max(runs, key=lambda run: (run.started_at, run.id), default=None)
+    active_comments = []
+    historical_refs = []
+    import hashlib
+
+    for comment in comments:
+        if comment.id in verified_comment_ids:
+            continue
+        # Keep current worker evidence and ALL non-worker constraints exact.
+        # Only old self-authored logs can move to verifiable storage refs.
+        if (comment.author != task.assignee or latest is None
+                or comment.created_at >= latest.started_at):
+            active_comments.append({"comment_id": comment.id, "author": comment.author, "body": comment.body})
+        else:
+            historical_refs.append({
+                "ref": f"kanban:task/{task.id}/comment/{comment.id}",
+                "author": comment.author,
+                "sha256": hashlib.sha256(comment.body.encode("utf-8")).hexdigest(),
+                "chars": len(comment.body),
+            })
+    run_refs = []
+    for run in runs:
+        stored = {"summary": run.summary, "error": run.error, "metadata": run.metadata}
+        encoded = json.dumps(stored, ensure_ascii=False, sort_keys=True)
+        run_refs.append({
+            "ref": f"kanban:task/{task.id}/run/{run.id}",
+            "status": run.status, "outcome": run.outcome,
+            "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        })
     exact = {
         "task_id": task.id,
         "original_title": task.title,
@@ -301,10 +350,14 @@ def _goal_handoff_context(kb, conn, task) -> str:
         "effective_delivery_goal": effective,
         "delivery_source": "native_transition" if transitions else "original_request" if ingress else "task_body",
         "native_delivery_transitions": transitions,
-        "same_task_comments_untruncated": [
-            {"comment_id": comment.id, "author": comment.author, "body": comment.body}
-            for comment in comments
-        ],
+        "verified_requester_amendments": amendments,
+        "active_comments_untruncated": active_comments,
+        "historical_worker_comment_refs": historical_refs,
+        "stored_run_refs": run_refs,
+        "latest_run_evidence": {
+            "run_id": latest.id, "summary": latest.summary,
+            "error": latest.error, "metadata": latest.metadata,
+        } if latest else None,
     }
     context = (
         "Canonical same-task mandate sources (not bounded worker history). "
@@ -313,10 +366,10 @@ def _goal_handoff_context(kb, conn, task) -> str:
         "Assess requester amendments with their author and native event provenance; "
         "never infer authority from another task.\n"
         + json.dumps(exact, ensure_ascii=False)
-        + "\n\nBounded general history (may omit comments; exact sources above take precedence):\n"
-        + kb.build_worker_context(conn, task.id)
+
     )
-    if len(context) > 100000:
+    # Reserve room for phase instructions in _goal_mode_handoff_rejection.
+    if len(context) > 98000:
         raise ValueError("missing mandate context: exact same-task sources exceed judge input budget; owner must resolve history before handoff")
     return context
 
