@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -118,6 +120,34 @@ class ReadyAdmission(unittest.TestCase):
             self.conn.execute('UPDATE task_events SET payload=? WHERE id=?', (payload, row['id']))
             self.conn.commit()
             self.assertFalse(kb.ready_resume_admitted(self.conn, self.tid))
+
+    def test_platform_safe_probe_never_signals_and_unknown_denies(self):
+        import psutil
+        with patch.object(sys, 'platform', 'win32'), patch.object(kb.os, 'kill') as signal:
+            with patch('psutil.pid_exists', return_value=False):
+                self.assertEqual(kb.ready_resume_binding(self.conn, self.tid)['expected_run_id'], self.run)
+            for result in (True, PermissionError(), OSError(), psutil.AccessDenied(999999991)):
+                with self.subTest(result=type(result).__name__):
+                    opts = {'side_effect': result} if isinstance(result, Exception) else {'return_value': result}
+                    with patch('psutil.pid_exists', **opts):
+                        with self.assertRaisesRegex(ValueError, 'worker_exit_not_confirmed'):
+                            kb.ready_resume_binding(self.conn, self.tid)
+            signal.assert_not_called()
+
+    def test_real_historical_live_and_exited_process(self):
+        spawned = self.conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind='spawned'",
+                                    (self.tid,)).fetchone()[0]
+        self.conn.execute('UPDATE task_events SET payload=? WHERE id=?',
+                          (json.dumps({'pid': os.getpid()}), spawned))
+        self.conn.commit()
+        with self.assertRaisesRegex(ValueError, 'worker_exit_not_confirmed'):
+            kb.ready_resume_binding(self.conn, self.tid)
+        child = subprocess.Popen([sys.executable, '-c', 'pass'])
+        child.wait(timeout=10)
+        self.conn.execute('UPDATE task_events SET payload=? WHERE id=?',
+                          (json.dumps({'pid': child.pid}), spawned))
+        self.conn.commit()
+        self.assertEqual(kb.ready_resume_binding(self.conn, self.tid)['expected_run_id'], self.run)
 
 
 if __name__ == '__main__':
