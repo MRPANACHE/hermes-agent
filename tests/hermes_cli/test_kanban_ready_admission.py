@@ -72,7 +72,7 @@ class ReadyAdmission(unittest.TestCase):
         self.conn.commit()
         self.assertFalse(kb.ready_resume_admitted(self.conn, self.tid))
         self.assertIsNone(kb.claim_task(self.conn, self.tid))
-        with patch.object(kb.os, 'kill', side_effect=PermissionError):
+        with patch('psutil.pid_exists', side_effect=PermissionError):
             with self.assertRaisesRegex(ValueError, 'worker_exit_not_confirmed'):
                 kb.ready_resume_binding(self.conn, self.tid)
 

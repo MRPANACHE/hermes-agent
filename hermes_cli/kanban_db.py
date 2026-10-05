@@ -9524,16 +9524,16 @@ def ready_resume_binding(conn, task_id, *, before_event=None, before_comment=Non
     if not any(e["run_id"] == last.id for e in spawns):
         deny("worker_exit_not_confirmed")
     pids.extend(payload(e).get("pid") for e in spawns)
+    import psutil
     for pid in pids:
         if type(pid) is not int or pid <= 0:
             deny("worker_exit_not_confirmed")
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        except OSError:
+            exists = psutil.pid_exists(pid)
+        except (OSError, psutil.Error):
             deny("worker_exit_not_confirmed")
-        deny("worker_exit_not_confirmed")
+        if exists:
+            deny("worker_exit_not_confirmed")
     state = {name: getattr(task, name) for name in (
         "id", "body", "assignee", "status", "block_kind", "workspace_kind", "workspace_path",
         "branch_name", "current_run_id", "claim_lock", "worker_pid", "max_runtime_seconds",
