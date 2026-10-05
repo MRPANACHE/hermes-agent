@@ -16,6 +16,8 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     _run_single_child,
@@ -305,6 +307,67 @@ def _make_mock_parent():
 
 
 class TestDelegateTaskDispatch:
+    @pytest.mark.parametrize("depth", [0, 1])
+    @pytest.mark.parametrize(
+        "retry_response, schema_valid",
+        [('{"city": "Oslo"}', True), ("still not JSON", False)],
+    )
+    def test_agent_dispatcher_enforces_top_level_schema(
+        self, depth, retry_response, schema_valid
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from run_agent import AIAgent
+
+        parent = _make_mock_parent()
+        parent._delegate_depth = depth
+        child = _StubChild(["not JSON", retry_response])
+        # A finite parent returns the result in the same turn, as native
+        # Kanban/cron workers do; no background notification is dispatched.
+        tokens = set_session_vars(source="cron", async_delivery=False)
+        try:
+            with (
+                patch(
+                    "tools.delegate_tool._load_config",
+                    return_value={"max_spawn_depth": 2},
+                ),
+                patch(
+                    "tools.delegate_tool._resolve_delegation_credentials",
+                    return_value={
+                        "provider": None,
+                        "model": None,
+                        "base_url": None,
+                        "api_key": None,
+                        "api_mode": None,
+                    },
+                ),
+                patch(
+                    "tools.delegate_tool._build_child_preserving_parent_tools",
+                    return_value=child,
+                ) as build_child,
+            ):
+                payload = json.loads(AIAgent._dispatch_delegate_task(
+                    parent,
+                    {
+                        "goal": "produce the address",
+                        "context": "base context",
+                        "output_schema": ADDRESS_SCHEMA,
+                    },
+                ))
+        finally:
+            clear_session_vars(tokens)
+
+        assert "error" not in payload
+        assert child._delegate_output_schema == ADDRESS_SCHEMA
+        assert "OUTPUT CONTRACT" in build_child.call_args.kwargs["context"]
+        entry = payload["results"][0]
+        assert entry["schema_valid"] is schema_valid
+        assert entry["schema_retries"] == 1
+        assert len(child.calls) == 2
+        assert "JSON" in child.calls[1]
+        assert entry["summary"] == retry_response
+        if not schema_valid:
+            assert entry["schema_errors"]
+
     def test_non_dict_output_schema_rejected(self):
         with (
             patch("tools.delegate_tool._load_config", return_value={}),
