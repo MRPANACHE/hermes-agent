@@ -4633,6 +4633,22 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Dispatcher read and claim may race a new operator control. Revalidate
+        # this typed admission under the ordinary claim lock, before any repair.
+        admission = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                                 "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1",
+                                 (task_id,)).fetchone()
+        if admission:
+            try:
+                typed = json.loads(admission["payload"] or "{}")
+            except (TypeError, ValueError):
+                typed = {}
+            if isinstance(typed, dict) and "ready_admission" in typed:
+                consumed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                        "AND kind='claimed' AND id>? LIMIT 1",
+                                        (task_id, admission["id"])).fetchone()
+                if not consumed and (not ready_resume_admitted(conn, task_id) or check_respawn_guard(conn, task_id)):
+                    return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -9439,6 +9455,132 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def ready_resume_binding(conn, task_id, *, before_event=None, before_comment=None):
+    """Read-only, fail-closed binding for an explicit same-task ready decision.
+
+    The authenticated ingress records this snapshot in its existing resumed
+    receipt. No prose is classified and no task state is repaired here.
+    Optional cutoffs let the guard compare the pre-decision history exactly.
+    """
+    def deny(reason):
+        raise ValueError(reason)
+
+    task = get_task(conn, task_id)
+    if not task or task.status != "ready" or task.block_kind != "needs_input":
+        deny("ready_not_resumable")
+    if task.current_run_id is not None or task.claim_lock or task.worker_pid is not None:
+        deny("worker_exit_not_confirmed")
+    runs = list_runs(conn, task_id)
+    if not runs or any(r.ended_at is None for r in runs):
+        deny("worker_exit_not_confirmed")
+    last = runs[-1]
+    if last.profile != task.assignee or last.outcome != "blocked" or task.consecutive_failures:
+        deny("ready_run_changed")
+    if conn.execute("SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id=l.parent_id "
+                    "WHERE l.child_id=? AND (p.id IS NULL OR p.status NOT IN ('done','archived')) LIMIT 1",
+                    (task_id,)).fetchone():
+        deny("parents_not_complete")
+    events = [dict(r) for r in conn.execute(
+        "SELECT id,kind,run_id,payload FROM task_events WHERE task_id=? ORDER BY id", (task_id,))
+        if r["kind"] != "respawn_guarded" and (before_event is None or r["id"] < before_event)]
+    comments = [dict(r) for r in conn.execute(
+        "SELECT id,author,body FROM task_comments WHERE task_id=? ORDER BY id", (task_id,))
+        if before_comment is None or r["id"] < before_comment]
+    def payload(e):
+        try:
+            p = json.loads(e["payload"] or "{}")
+        except (TypeError, ValueError):
+            deny("ready_lineage_invalid")
+        if not isinstance(p, dict):
+            deny("ready_lineage_invalid")
+        return p
+    block = next((e for e in reversed(events) if e["kind"] in ("blocked", "block_loop_detected")), None)
+    resume = next((e for e in reversed(events) if e["kind"] == "mrpanache_resumed"
+                   and "ready_admission" not in payload(e)), None)
+    claim = next((e for e in reversed(events) if e["kind"] == "claimed"), None)
+    if not block or not resume or not claim:
+        deny("ready_lineage_invalid")
+    rp = payload(resume)
+    if not (payload(block).get("kind") == "needs_input" and claim["run_id"] == last.id
+            and block["run_id"] == last.id
+            and claim["id"] < block["id"] < resume["id"]
+            and rp.get("previous_run_id") == last.id and rp.get("block_event_id") == block["id"]
+            and rp.get("action") == "resume"
+            and isinstance(rp.get("request_id"), str) and rp.get("request_id")
+            and isinstance(rp.get("fingerprint"), str) and len(rp["fingerprint"]) == 64
+            and any(e["kind"] == "unblocked" and block["id"] < e["id"] < resume["id"] for e in events)):
+        deny("ready_lineage_invalid")
+    if any(e["kind"] in ("claimed", "blocked", "block_loop_detected", "review_requested",
+                          "changes_requested", "status", "reclaimed", "unblocked", "promoted")
+           and e["id"] > resume["id"] for e in events):
+        deny("ready_lineage_changed")
+    rc = next((c for c in comments if c["id"] == rp.get("comment_id")), None)
+    if not rc or rc["author"] != "mrpanache-mcp":
+        deny("ready_lineage_invalid")
+    # All recorded historical workers must be absent. Unknown PID identity or
+    # permission is not exit; never signal/reclaim a process from this route.
+    pids = [r.worker_pid for r in runs if r.worker_pid is not None]
+    spawns = [e for e in events if e["kind"] == "spawned"]
+    if not any(e["run_id"] == last.id for e in spawns):
+        deny("worker_exit_not_confirmed")
+    pids.extend(payload(e).get("pid") for e in spawns)
+    import psutil
+    for pid in pids:
+        if type(pid) is not int or pid <= 0:
+            deny("worker_exit_not_confirmed")
+        try:
+            exists = psutil.pid_exists(pid)
+        except (OSError, psutil.Error):
+            deny("worker_exit_not_confirmed")
+        if exists:
+            deny("worker_exit_not_confirmed")
+    state = {name: getattr(task, name) for name in (
+        "id", "body", "assignee", "status", "block_kind", "workspace_kind", "workspace_path",
+        "branch_name", "current_run_id", "claim_lock", "worker_pid", "max_runtime_seconds",
+        "consecutive_failures", "goal_mode")}
+    snapshot = {"task": state, "runs": [dict(r) for r in conn.execute(
+        "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,))],
+        "parents": parent_ids(conn, task_id), "events": events, "comments": comments}
+    sha = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False).encode()).hexdigest()
+    return {"schema": "hermes.ready-resume.v1", "task_id": task_id, "owner": task.assignee,
+            "expected_run_id": last.id, "block_event_id": block["id"],
+            "resume_event_id": resume["id"], "expected_event_id": events[-1]["id"],
+            "binding_sha256": sha}
+
+
+def ready_resume_admitted(conn, task_id):
+    """Consume only a fresh authenticated resumed receipt, never a clarify."""
+    row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                       "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if not row:
+        return False
+    try:
+        p = json.loads(row["payload"])
+        admission = p["ready_admission"]
+        comment = conn.execute("SELECT * FROM task_comments WHERE task_id=? AND id=?",
+                               (task_id, p["comment_id"])).fetchone()
+        ce = admission["decision_comment_event_id"]
+        frontier = conn.execute("SELECT id,kind,payload FROM task_events WHERE task_id=? "
+                                "AND kind!='respawn_guarded' ORDER BY id DESC LIMIT 2", (task_id,)).fetchall()
+        if (len(frontier) != 2 or frontier[0]["id"] != row["id"] or frontier[1]["id"] != ce
+                or frontier[1]["kind"] != "commented" or not comment
+                or comment["author"] != "mrpanache-mcp" or p.get("action") != "resume"
+                or p.get("previous_run_id") != admission["binding"]["expected_run_id"]
+                or p.get("block_event_id") != admission["binding"]["block_event_id"]
+                or not isinstance(p.get("request_id"), str)
+                or not isinstance(p.get("fingerprint"), str) or len(p["fingerprint"]) != 64
+                or hashlib.sha256(comment["body"].encode()).hexdigest() != admission["comment_sha256"]):
+            return False
+        if conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND id>? LIMIT 1",
+                        (task_id, comment["id"])).fetchone():
+            return False
+        return ready_resume_binding(conn, task_id, before_event=ce,
+                                    before_comment=comment["id"]) == admission["binding"]
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9656,6 +9798,8 @@ def check_respawn_guard(
                 ).fetchone()
                 if explicit_wake:
                     return None
+            if ready_resume_admitted(conn, task_id):
+                return None
             return "active_pr"
 
     return None
