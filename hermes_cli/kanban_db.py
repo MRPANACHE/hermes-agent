@@ -5454,10 +5454,23 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, goal_mode FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # These top-level booleans describe THIS task's authorized objective,
+        # not a parent North Star or review readiness. A positive partial
+        # acceptance (or an unavailable judge) cannot override explicit false.
+        # Keep the claim/run alive for the existing bounded native goal loop;
+        # never reopen DONE, create a successor, or run a second judge here.
+        if (prior and prior["goal_mode"] and isinstance(metadata, dict)
+                and any(metadata.get(key) is False
+                        for key in ("objective_complete", "goal_complete"))):
+            raise ValueError(
+                "current task objective explicitly incomplete; continue the same "
+                "task/run within its mandate and turn budget, or report a genuine "
+                "external blocker through the existing block/review route"
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
