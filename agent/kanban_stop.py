@@ -1,6 +1,7 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
+Kanban workers must end with ``kanban_complete``, ``kanban_block``, or a
+successful ``kanban_schedule``. Models
 (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
@@ -13,6 +14,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -63,6 +65,15 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
             name = str(msg.get("name") or "")
             if name in _TERMINAL_KANBAN_TOOLS:
                 return True
+            if name == "kanban_schedule":
+                # A mere schedule invocation or a rejected timestamp must not
+                # suppress the lifecycle nudge while the task is still running.
+                try:
+                    receipt = json.loads(msg.get("content") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(receipt, dict) and receipt.get("ok") is True and receipt.get("status") == "scheduled":
+                    return True
     return False
 
 
@@ -95,7 +106,8 @@ def build_kanban_stop_nudge(
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, OR `kanban_block(reason=...)` if you are blocked, OR "
+        "`kanban_schedule(wake_at=..., reason=...)` for a timed dependency.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

@@ -135,6 +135,13 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_worker_mode() -> bool:
+    """Timed waits belong to the dispatcher worker's own task/run only."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
+        not _is_delegated_child_context() and _is_dispatcher_owned_worker()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1052,6 +1059,50 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _handle_schedule(args: dict, **kw) -> str:
+    """Park the owning worker's run until an explicit future instant."""
+    delegated_err = _reject_delegated_child_mutation("kanban_schedule")
+    if delegated_err:
+        return delegated_err
+    if not _check_kanban_worker_mode():
+        return tool_error("kanban_schedule requires an owning dispatcher worker")
+    tid = _default_task_id(args.get("task_id"))
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    run_id = _worker_run_id(tid)
+    if run_id is None or run_id <= 0:
+        return tool_error("kanban_schedule requires the dispatcher's valid run id")
+    reason = args.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return tool_error("reason is required — explain the timed dependency")
+    wake_at = args.get("wake_at")
+    if not isinstance(wake_at, str) or not wake_at.strip():
+        return tool_error("wake_at is required — use an ISO timestamp with timezone")
+    reason = redact_sensitive_text(reason.strip(), force=True)
+    try:
+        from hermes_cli import kanban_db as kb
+        wake_timestamp = kb.parse_schedule_time(wake_at)
+        if wake_timestamp <= int(kb.time.time()):
+            return tool_error("wake_at must be in the future; continue work if already due")
+        # No board override: the dispatcher pins this worker to its own board.
+        kb, conn = _connect()
+        try:
+            ok = kb.schedule_task(conn, tid, reason=reason, wake_at=wake_at,
+                                  expected_run_id=run_id)
+            if not ok:
+                return tool_error("could not schedule own task: run is no longer current")
+            return _ok(task_id=tid, run_id=run_id, status="scheduled", wake_at=wake_at,
+                       wake_timestamp=wake_timestamp)
+        finally:
+            conn.close()
+    except (ValueError, OverflowError) as exc:
+        return tool_error(f"kanban_schedule: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_schedule failed")
+        return tool_error(f"kanban_schedule: {exc}")
 
 
 def _handle_request_review(args: dict, **kw) -> str:
@@ -2062,6 +2113,29 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SCHEDULE_SCHEMA = {
+    "name": "kanban_schedule",
+    "description": (
+        "End your current worker run and wait until an explicit future time. "
+        "The existing dispatcher resumes this same task once due, subject to "
+        "parent completion and worker exit. Use for a real timed dependency "
+        "such as a planned verification after a scheduled cycle; this does "
+        "not complete the task. Use kanban_block for missing human input/access, "
+        "or link a parent task for a completion dependency. Own worker task only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "wake_at": {"type": "string", "description": (
+                "Future ISO timestamp with explicit timezone, e.g. 2026-10-07T11:20:00+02:00."
+            )},
+            "reason": {"type": "string", "description": "The timed dependency and what to verify when resumed."},
+        },
+        "required": ["wake_at", "reason"],
+    },
+}
+
 KANBAN_REQUEST_REVIEW_SCHEMA = {
     "name": "kanban_request_review",
     "description": (
@@ -2558,6 +2632,15 @@ registry.register(
     handler=_handle_request_review,
     check_fn=_check_kanban_mode,
     emoji="👀",
+)
+
+registry.register(
+    name="kanban_schedule",
+    toolset="kanban",
+    schema=KANBAN_SCHEDULE_SCHEMA,
+    handler=_handle_schedule,
+    check_fn=_check_kanban_worker_mode,
+    emoji="⏱",
 )
 
 registry.register(
