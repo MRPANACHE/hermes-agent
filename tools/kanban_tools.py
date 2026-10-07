@@ -272,9 +272,13 @@ def _goal_handoff_context(kb, conn, task) -> str:
     except ValueError:
         original = {}
     ingress = isinstance(original, dict) and original.get("schema") == "mrpanache.agent-request.v1"
-    effective = original.get("delivery_goal", "draft_pr") if ingress else None
-    if ingress and effective not in ("draft_pr", "verified_live"):
+    information = ingress and original.get("kind") == "information"
+    effective = original.get("delivery_goal", None if information else "draft_pr") if ingress else None
+    if ingress and ((information and effective is not None)
+                    or (not information and effective not in ("draft_pr", "verified_live"))):
         raise ValueError("missing mandate context: invalid original delivery goal")
+    if ingress and effective == "verified_live" and (original.get("agent") != "otto" or original.get("kind") != "codework"):
+        raise ValueError("missing mandate context: unsupported original delivery goal")
     amendments = []
     verified_comment_ids = set()
     for row in rows:
@@ -302,7 +306,7 @@ def _goal_handoff_context(kb, conn, task) -> str:
         if payload.get("delivery_goal") is None:
             continue
         goal = payload["delivery_goal"]
-        if not ingress or goal not in ("draft_pr", "verified_live"):
+        if not ingress or information or goal not in ("draft_pr", "verified_live"):
             raise ValueError(f"missing mandate context: invalid delivery event {row['id']}")
         if goal == "verified_live" and (original.get("agent") != "otto" or original.get("kind") != "codework"):
             raise ValueError(f"missing mandate context: unsupported delivery event {row['id']}")

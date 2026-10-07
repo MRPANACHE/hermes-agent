@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -4493,7 +4494,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'unblocked', 'scheduled', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -6967,7 +6968,7 @@ def unblock_task(
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
+            if current and current["status"] in ("blocked", "scheduled")
             else "ready"
         )
         _reclaim_dangling_run(
@@ -7994,20 +7995,54 @@ def set_branch_name(
 
 
 # ---------------------------------------------------------------------------
+def parse_schedule_time(value: str) -> int:
+    """Convert an ISO timestamp with an explicit timezone to epoch seconds."""
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--at requires an ISO timestamp with timezone, e.g. 2026-10-07T11:15:00+02:00") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("--at requires an explicit timezone offset or Z")
+    return int(timestamp.timestamp())
+
+
 def schedule_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[str] = None,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
-    ``scheduled`` tasks are intentionally not dispatchable; an external cron,
-    human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    An explicit timezone-aware ``wake_at`` is durably recorded on the native
+    event. The existing dispatcher resumes it once due, with parent gating.
+    Without a timestamp, the legacy manual ``unblock_task`` behavior remains.
     """
+    wake_timestamp = parse_schedule_time(wake_at) if wake_at is not None else None
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        resume_status = (
+            "review" if current["status"] == "review"
+            else _retry_status_for_run(conn, task_id) if current["status"] == "running"
+            else _resume_status_from_events(conn, task_id)
+        )
+        previous = None
+        previous_payload = {}
+        if current["status"] == "scheduled":
+            previous = conn.execute(
+                "SELECT run_id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'scheduled' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if previous and previous["payload"]:
+                previous_payload = json.loads(previous["payload"])
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8016,7 +8051,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review', 'scheduled')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -8029,14 +8064,66 @@ def schedule_task(
             outcome="scheduled", status="scheduled",
             summary=reason,
         )
+        if run_id is None and previous is not None:
+            run_id = previous["run_id"]
         if run_id is None and reason:
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {"reason": reason}
+        if wake_timestamp is not None:
+            payload["wake_at"] = wake_timestamp
+        if resume_status == "review":
+            payload["resume_status"] = resume_status
+        # The worker may schedule its card before its process exits. Keep the
+        # old PID on the receipt so a due tick cannot spawn beside that worker.
+        if current["worker_pid"] is not None:
+            payload["worker_pid"] = current["worker_pid"]
+        elif isinstance(previous_payload, dict) and previous_payload.get("worker_pid") is not None:
+            payload["worker_pid"] = previous_payload["worker_pid"]
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
+
+
+def wake_scheduled_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Consume only explicit due schedules; ordinary blocked cards stay put."""
+    now = int(time.time())
+    awakened = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT t.id, t.worker_pid, e.id AS event_id, e.run_id, e.payload "
+            "FROM tasks t JOIN task_events e ON e.id = ("
+            "SELECT MAX(id) FROM task_events WHERE task_id = t.id AND kind = 'scheduled') "
+            "WHERE t.status = 'scheduled' AND t.claim_lock IS NULL "
+            "AND t.current_run_id IS NULL ORDER BY e.id"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            wake_at = payload.get("wake_at")
+            if type(wake_at) is not int or wake_at > now:
+                continue
+            original_pid = payload.get("worker_pid")
+            if original_pid is not None and type(original_pid) is not int:
+                continue
+            if _pid_alive(row["worker_pid"]) or _pid_alive(original_pid):
+                continue
+            # Savepoint composes the existing run/parent/phase transition with
+            # its durable wake receipt. Leaving 'scheduled' consumes the timer.
+            if unblock_task(conn, row["id"], allow_nested=True):
+                _append_event(
+                    conn, row["id"], "schedule_woke",
+                    {"schedule_event_id": row["event_id"], "wake_at": wake_at},
+                    run_id=row["run_id"],
+                )
+                awakened.append(row["id"])
+    return awakened
 
 
 # Dispatcher (one-shot pass)
@@ -8101,6 +8188,7 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    awakened: list[str] = field(default_factory=list)
     reconciled_orphans: list[str] = field(default_factory=list)
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
@@ -10250,6 +10338,8 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    if not dry_run:
+        result.awakened = wake_scheduled_tasks(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
