@@ -641,6 +641,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
+    p_schedule.add_argument("--at", default=None,
+                            help="Resume once due: ISO timestamp with timezone, e.g. 2026-10-07T11:15:00+02:00")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
@@ -2379,6 +2381,13 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
+    wake_at = getattr(args, "at", None)
+    if wake_at is not None:
+        try:
+            kb.parse_schedule_time(wake_at)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2391,11 +2400,13 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                wake_at=wake_at,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
-                print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+                print(f"Scheduled {tid}" + (f" until {wake_at}" if wake_at else "")
+                      + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -2682,6 +2693,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "awakened": res.awakened,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2709,6 +2721,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    print(f"Awakened:     {len(res.awakened)}")
+    if res.awakened:
+        print(f"  {', '.join(res.awakened)}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""

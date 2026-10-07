@@ -40,6 +40,59 @@ class ProjectionTests(unittest.TestCase):
     def project(self):
         return _goal_handoff_context(self.kb, self.conn, self.task)
 
+    def set_information(self, **changes):
+        metadata = {'schema': 'mrpanache.agent-request.v1', 'agent': 'otto',
+                    'kind': 'information', 'fingerprint': 'b' * 64}
+        metadata.update(changes)
+        self.task.body = json.dumps(metadata) + '\nRead only; provide verified receipt. No code.'
+        self.runs[-1].summary = 'Verified information receipt'
+
+    def test_information_judge_uses_original_information_goal_without_pr(self):
+        self.set_information()
+        original_body = self.task.body
+        self.amendment(delivery_goal=None)
+        data = json.loads(self.project().split('\n', 1)[1])
+        self.assertIsNone(data['effective_delivery_goal'])
+        self.assertEqual(data['original_body'], original_body)
+        self.assertEqual(self.task.body, original_body)
+        self.assertEqual(data['latest_run_evidence']['summary'], 'Verified information receipt')
+        self.assertEqual(data['native_delivery_transitions'], [])
+
+    def test_information_cannot_acquire_code_delivery_from_original_or_transition(self):
+        for goal in ('draft_pr', 'verified_live'):
+            with self.subTest(goal=goal):
+                self.set_information(delivery_goal=goal)
+                with self.assertRaisesRegex(ValueError, 'invalid original delivery goal'):
+                    self.project()
+                self.set_information()
+                self.amendment(delivery_goal=goal)
+                with self.assertRaisesRegex(ValueError, 'invalid delivery event'):
+                    self.project()
+                self.comments.clear()
+                self.conn.execute('DELETE FROM task_events')
+
+    def test_legacy_codework_still_requires_draft_and_otto_live_transition_is_retained(self):
+        self.runs[-1].summary = 'Current exact evidence'
+        metadata = json.loads(self.task.body.split('\n', 1)[0])
+        metadata.pop('delivery_goal')
+        self.task.body = json.dumps(metadata)
+        data = json.loads(self.project().split('\n', 1)[1])
+        self.assertEqual(data['effective_delivery_goal'], 'draft_pr')
+        metadata['agent'] = 'otto'
+        self.task.body = json.dumps(metadata)
+        self.amendment(delivery_goal='verified_live')
+        data = json.loads(self.project().split('\n', 1)[1])
+        self.assertEqual(data['effective_delivery_goal'], 'verified_live')
+        self.assertEqual(data['delivery_source'], 'native_transition')
+
+    def test_non_otto_original_live_delivery_is_not_a_grant(self):
+        self.runs[-1].summary = 'Current exact evidence'
+        metadata = json.loads(self.task.body.split('\n', 1)[0])
+        metadata['delivery_goal'] = 'verified_live'
+        self.task.body = json.dumps(metadata)
+        with self.assertRaisesRegex(ValueError, 'unsupported original delivery goal'):
+            self.project()
+
     def test_large_history_is_deterministic_and_lossless_by_reference(self):
         self.amendment()
         old = self.comment(2, 'noor', 'historical worker log' * 10000)
