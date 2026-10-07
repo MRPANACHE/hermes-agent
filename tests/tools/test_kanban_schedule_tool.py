@@ -63,14 +63,14 @@ def test_schedule_native_run_receipt_and_one_time_wake(worker, monkeypatch):
 
 
 def test_schedule_goal_loop_stops_without_judge_completion_or_budget_block(worker, monkeypatch):
-    task, _ = worker
+    task, run_id = worker
     def unexpected(*a, **kw):
         raise AssertionError("scheduled worker must stop without judging or another turn")
     monkeypatch.setattr(goals, "judge_goal", unexpected)
     assert json.loads(kt._handle_schedule(args()))["ok"]
     def status():
         with kb.connect() as conn:
-            return kb.get_task(conn, task).status
+            return kb.goal_run_status(conn, task, run_id)
     result = goals.run_kanban_goal_loop(task_id=task, goal_text="still open",
         first_response="Scheduled exact follow-up", run_turn=unexpected,
         task_status_fn=status, block_fn=unexpected, max_turns=1)
