@@ -1430,7 +1430,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, *, admit_new: bool = True) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1481,6 +1481,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    admit_new=admit_new,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1519,7 +1520,7 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
-        def _tick_once() -> "list[tuple[str, Optional[object]]]":
+        def _tick_once(*, admit_new: bool = True) -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
             Enumerating boards on every tick keeps the dispatcher honest
@@ -1533,7 +1534,7 @@ class GatewayKanbanWatchersMixin:
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+                out.append((slug, _tick_once_for_board(slug, admit_new=admit_new)))
             return out
 
         def _ready_nonempty() -> bool:
@@ -1693,14 +1694,29 @@ class GatewayKanbanWatchersMixin:
 
             try:
                 # Global emergency stop (`hermes pause`) and gateway lifecycle
-                # drain both skip auto-decompose and dispatch entirely — no NEW
+                # drain both skip auto-decompose and admission — no NEW
                 # workers while paused or while a SIGUSR1/restart drain is in
-                # progress. Running workers finish naturally; zombie reaping
-                # above still runs.
-                if getattr(self, "_draining", False):
-                    ready_pending = False
-                    bad_ticks = 0
-                elif not _kanban_dispatch_allowed():
+                # progress. Running-worker housekeeping still uses the normal
+                # board lock and unchanged ownership/reclaim/deadline rules.
+                if getattr(self, "_draining", False) or not _kanban_dispatch_allowed():
+                    # Lifecycle preflight must also see an in-flight paused
+                    # housekeeping tick before allowing gateway teardown.
+                    try:
+                        self._kanban_dispatch_active_count = (
+                            int(getattr(self, "_kanban_dispatch_active_count", 0) or 0) + 1
+                        )
+                    except Exception:
+                        self._kanban_dispatch_active_count = 1
+                    try:
+                        await asyncio.to_thread(_tick_once, admit_new=False)
+                    finally:
+                        try:
+                            self._kanban_dispatch_active_count = max(
+                                0,
+                                int(getattr(self, "_kanban_dispatch_active_count", 0) or 0) - 1,
+                            )
+                        except Exception:
+                            self._kanban_dispatch_active_count = 0
                     ready_pending = False
                     bad_ticks = 0
                 else:
@@ -1717,10 +1733,13 @@ class GatewayKanbanWatchersMixin:
                     try:
                         if _ad_enabled:
                             await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
-                        if getattr(self, "_draining", False):
-                            results = []
-                        else:
-                            results = await asyncio.to_thread(_tick_once)
+                        results = await asyncio.to_thread(
+                            _tick_once,
+                            admit_new=(
+                                not getattr(self, "_draining", False)
+                                and _kanban_dispatch_allowed()
+                            ),
+                        )
                     finally:
                         try:
                             self._kanban_dispatch_active_count = max(

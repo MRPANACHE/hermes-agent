@@ -46,8 +46,13 @@ async def test_kanban_dispatcher_skips_spawns_while_gateway_draining(monkeypatch
     monkeypatch.setattr(kb, "reap_worker_zombies", lambda: [])
     monkeypatch.setattr(kb, "resolve_max_in_progress", lambda value: value)
 
+    ticks = []
+    monkeypatch.setattr(kb, "list_boards", lambda **kw: [{"slug": "default"}])
+    monkeypatch.setattr(kb, "connect", lambda **kw: type("Conn", (), {"close": lambda self: None})())
+    monkeypatch.setattr(kb, "dispatch_once", lambda conn, **kw: ticks.append(kw["admit_new"]))
+
     def should_not_dispatch(*_args, **_kwargs):
-        raise AssertionError("dispatcher must not inspect or spawn board work while draining")
+        raise AssertionError("dispatcher must not auto-decompose while draining")
 
     monkeypatch.setattr(kw, "_resolve_auto_decompose_settings", should_not_dispatch)
 
@@ -71,6 +76,7 @@ async def test_kanban_dispatcher_skips_spawns_while_gateway_draining(monkeypatch
     await runner._kanban_dispatcher_watcher()
 
     assert runner._kanban_dispatcher_lock_handle is None
+    assert ticks and not any(ticks)
 
 
 
@@ -106,7 +112,9 @@ async def test_kanban_dispatcher_rechecks_draining_after_auto_decompose(monkeypa
             runner._draining = True
             return 0
         if getattr(fn, "__name__", "") == "_tick_once":
-            raise AssertionError("dispatch tick must be skipped after drain begins")
+            assert kwargs["admit_new"] is False
+            ticks.append(kwargs["admit_new"])
+            return []
         return fn(*args, **kwargs)
 
     monkeypatch.setattr(kw.asyncio, "sleep", fake_sleep)
@@ -118,7 +126,9 @@ async def test_kanban_dispatcher_rechecks_draining_after_auto_decompose(monkeypa
         _kanban_dispatcher_lock_handle = None
         _kanban_dispatch_active_count = 0
 
+    ticks = []
     runner = Runner()
     await runner._kanban_dispatcher_watcher()
 
     assert runner._kanban_dispatch_active_count == 0
+    assert ticks and not any(ticks)

@@ -10189,6 +10189,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    admit_new: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10204,6 +10205,8 @@ def dispatch_once(
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
+    ``admit_new=False`` runs only existing running-worker housekeeping under
+    the same lock, without scheduled wakes, promotions, or ready/review spawns.
     """
     try:
         db_path = kanban_db_path(board=board)
@@ -10224,6 +10227,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            admit_new=admit_new,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10244,6 +10248,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                admit_new=admit_new,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -10271,6 +10276,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    admit_new: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10339,6 +10345,10 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Admission fencing must not suspend existing workers' lifecycle rules.
+    # Stop before scheduled wakes, promotions, and ready/review execution.
+    if not admit_new:
+        return result
     if not dry_run:
         result.awakened = wake_scheduled_tasks(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
