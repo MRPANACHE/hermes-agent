@@ -1255,7 +1255,19 @@ def judge_goal(
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, None, True
+        # Retain bounded machine fields, never arbitrary provider messages or
+        # headers, so an infrastructure refusal does not become a generic 500.
+        reason = f"judge error: {type(exc).__name__}"
+        status = getattr(exc, "status_code", None)
+        body = getattr(exc, "body", None)
+        error = body.get("error", body) if isinstance(body, dict) else {}
+        code = error.get("code") if isinstance(error, dict) else None
+        if type(status) is int:
+            reason += f" (HTTP {status}"
+            if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", code):
+                reason += f", code={code}"
+            reason += ")"
+        return "continue", reason, False, None, True
 
     try:
         raw = resp.choices[0].message.content or ""
@@ -2131,6 +2143,15 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 )
 
 
+def judge_transport_block_kind(reason: str) -> str:
+    """Do not label permanent credential/request failures as transient."""
+    if re.search(r"\(HTTP (?:408|409|429|5\d\d)(?:,|\))", reason):
+        return "transient"
+    if reason in ("judge error: APIConnectionError", "judge error: APITimeoutError"):
+        return "transient"
+    return "capability"
+
+
 def run_kanban_goal_loop(
     *,
     task_id: str,
@@ -2141,6 +2162,7 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    judge_unavailable_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -2168,7 +2190,9 @@ def run_kanban_goal_loop(
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"review_requested_by_worker"``,
     ``"changes_requested_by_reviewer"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"blocked_judge_unavailable"``, or ``"stopped"``.
+    An unavailable judge stops without consuming another task turn. This is an
+    infrastructure block for the existing owner route, not automatic recovery.
     """
 
     def _log(msg: str) -> None:
@@ -2219,7 +2243,24 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
+        if transport_failed:
+            # An unavailable auxiliary provider gave no task verdict. Preserve
+            # the work instead of spending the remaining goal turns on it.
+            unavailable_reason = (
+                "Goal judge unavailable; work and original goal retained. "
+                f"Resume through the existing owner route after provider recovery. {reason}"
+            )
+            try:
+                (judge_unavailable_fn or block_fn)(unavailable_reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: infrastructure block failed ({exc})")
+                return {"outcome": "stopped", "turns_used": turns_used,
+                        "reason": "infrastructure block failed"}
+            return {
+                "outcome": "blocked_judge_unavailable", "turns_used": turns_used,
+                "reason": unavailable_reason,
+            }
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")

@@ -20762,6 +20762,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import judge_transport_block_kind
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -20811,15 +20812,18 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    def _block(reason: str) -> None:
+    def _block(reason: str, *, kind=None) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(
+            accepted = _kb.block_task(
                 c,
                 task_id,
                 reason=reason,
+                kind=kind,
                 expected_run_id=worker_run_id,
             )
+            if not accepted:
+                raise RuntimeError("native goal block lost its run binding")
         finally:
             try:
                 c.close()
@@ -20832,6 +20836,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
+        judge_unavailable_fn=lambda reason: _block(reason, kind=judge_transport_block_kind(reason)),
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
