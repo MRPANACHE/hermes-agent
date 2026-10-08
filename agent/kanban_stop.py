@@ -20,6 +20,7 @@ from typing import Any, Iterable, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_REVIEW_TERMINAL_TOOL = "kanban_request_review"
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -49,10 +50,26 @@ def _tool_call_name(tc: Any) -> str:
     return str(getattr(tc, "name", "") or "")
 
 
+def _tool_receipt(msg: dict) -> dict | None:
+    try:
+        receipt = json.loads(msg.get("content") or "{}")
+    except (TypeError, ValueError):
+        return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _same_task_review_terminal(receipt: dict, *, active_task_id: str) -> bool:
+    if receipt.get("ok") is not True or receipt.get("status") != "review":
+        return False
+    receipt_task_id = str(receipt.get("task_id") or "").strip()
+    return bool(receipt_task_id and receipt_task_id == active_task_id)
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     """True if this conversation already invoked a terminal kanban tool."""
     if not messages:
         return False
+    active_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -68,11 +85,16 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
             if name == "kanban_schedule":
                 # A mere schedule invocation or a rejected timestamp must not
                 # suppress the lifecycle nudge while the task is still running.
-                try:
-                    receipt = json.loads(msg.get("content") or "{}")
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(receipt, dict) and receipt.get("ok") is True and receipt.get("status") == "scheduled":
+                receipt = _tool_receipt(msg)
+                if receipt and receipt.get("ok") is True and receipt.get("status") == "scheduled":
+                    return True
+            if name == _REVIEW_TERMINAL_TOOL:
+                # Same-card review handoff is a terminal lifecycle transition
+                # for the implementer. Only the successful receipt suppresses
+                # the stop nudge; rejected/failed/foreign review attempts leave
+                # the owning worker responsible for completing or blocking.
+                receipt = _tool_receipt(msg)
+                if receipt and _same_task_review_terminal(receipt, active_task_id=active_task_id):
                     return True
     return False
 
