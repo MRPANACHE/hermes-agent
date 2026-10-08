@@ -9683,6 +9683,56 @@ def ready_resume_admitted(conn, task_id):
         return False
 
 
+def _initial_parent_pr_reference(
+    conn: sqlite3.Connection, task_id: str, comment: sqlite3.Row,
+) -> bool:
+    """Recognize an ended parent's delivery, never a child's existing PR.
+
+    Only a pristine, parent-created child qualifies. Every URL must be bound
+    to a linked parent's latest completed run, by its original owner, before
+    completion. No state is changed; the ordinary claim still owns admission.
+    """
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if (not task or task["status"] != "ready" or task["started_at"] is not None
+            or task["claim_lock"] is not None or task["current_run_id"] is not None
+            or task["worker_pid"] is not None or comment["author"] != task["created_by"]
+            or comment["author"] == task["assignee"]
+            or conn.execute("SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (task_id,)).fetchone()):
+        return False
+    created = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        original = json.loads(created["payload"]) if created else None
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(original, dict) or original.get("assignee") != task["assignee"]:
+        return False
+    parents = conn.execute(
+        "SELECT p.status,p.assignee,r.profile,r.outcome,r.ended_at,r.metadata "
+        "FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "LEFT JOIN task_runs r ON r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=p.id) "
+        "WHERE l.child_id=?", (task_id,),
+    ).fetchall()
+    if not parents or any(p["status"] not in ("done", "archived") for p in parents):
+        return False
+    delivered = set()
+    for parent in parents:
+        if (parent["assignee"] != comment["author"] or parent["profile"] != comment["author"]
+                or parent["outcome"] != "completed" or parent["ended_at"] is None
+                or comment["created_at"] > parent["ended_at"]):
+            continue
+        try:
+            metadata = json.loads(parent["metadata"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(metadata, dict) and isinstance(metadata.get("pr_url"), str):
+            delivered.add(metadata["pr_url"])
+    urls = set(_RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or ""))
+    return bool(urls) and urls.issubset(delivered)
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9827,10 +9877,12 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body,author,created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if _initial_parent_pr_reference(conn, task_id, c):
+                continue
             # Dependency completion continues the original task, not a new PR.
             # Bind the promotion to its latest ended worker and dependency wait;
             # a claimed/newer run or changed owner cannot reuse that continuation.
