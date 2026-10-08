@@ -75,6 +75,84 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 
 
 
+def test_no_nudge_after_same_task_review_request(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_request_review", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": (
+                '{"ok": true, "task_id": "t_review", '
+                '"run_id": 422, "status": "review"}'
+            ),
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_review_call_without_successful_same_task_receipt_still_nudges(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+
+    rejected = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "kanban_request_review"}}],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "content": '{"error": "judge rejected the handoff"}',
+        },
+    ]
+    assert session_called_kanban_terminal(rejected) is False
+    assert build_kanban_stop_nudge(messages=rejected) is not None
+
+    still_running = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "kanban_request_review"}}],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "content": (
+                '{"ok": true, "task_id": "t_review", '
+                '"run_id": 419, "status": "running"}'
+            ),
+        },
+    ]
+    assert session_called_kanban_terminal(still_running) is False
+    assert build_kanban_stop_nudge(messages=still_running) is not None
+
+    foreign_review = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "kanban_request_review"}}],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "content": (
+                '{"ok": true, "task_id": "t_other", '
+                '"run_id": 422, "status": "review"}'
+            ),
+        },
+    ]
+    assert session_called_kanban_terminal(foreign_review) is False
+    assert build_kanban_stop_nudge(messages=foreign_review) is not None
 
 
 
