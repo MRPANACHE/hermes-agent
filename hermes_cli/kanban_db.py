@@ -4914,6 +4914,7 @@ def goal_run_status(
                 "changes_requested": "changes_requested",
                 "blocked": "blocked",
                 "dependency_wait": "blocked",
+                "scheduled": "scheduled",
             }.get(outcome)
             if outcome is not None
             else None

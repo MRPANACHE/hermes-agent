@@ -300,6 +300,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_schedule` | End the owning worker's run until an explicit future time; the existing dispatcher resumes the same task once due, after worker exit and parent completion. Hidden from orchestrators and delegated children. | `wake_at`, `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -322,6 +323,22 @@ kanban_complete(
     metadata={"changed_files": ["limiter.py", "tests/test_limiter.py"], "tests_run": 14},
 )
 ```
+
+For a time dependency, the owning worker can call:
+
+```python
+kanban_schedule(wake_at="2026-10-07T11:20:00+02:00", reason="Verify the normal 11:15 cycle's result")
+```
+
+The timestamp must be in the future and include a timezone offset or `Z`.
+This parks the original card and closes the current run; it does not claim
+completion or keep the worker process waiting. The existing dispatcher records
+one wake receipt when due and rechecks parents before dispatching the owner.
+Goal-mode workers stop cleanly on `scheduled` without a completion judge or
+budget-exhaustion block. Missing human input/access still uses `kanban_block`;
+waiting on another task uses a native parent dependency. An orchestrator can
+include the exact timestamp in its instruction to the owner. Operators can use
+`hermes kanban schedule TASK "reason" --at 2026-10-07T11:20:00+02:00`.
 
 An **orchestrator** worker fans out instead:
 

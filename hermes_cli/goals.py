@@ -2190,7 +2190,8 @@ def run_kanban_goal_loop(
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"review_requested_by_worker"``,
     ``"changes_requested_by_reviewer"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, ``"blocked_judge_unavailable"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"scheduled_by_worker"``,
+    ``"blocked_judge_unavailable"``, or ``"stopped"``.
     An unavailable judge stops without consuming another task turn. This is an
     infrastructure block for the existing owner route, not automatic recovery.
     """
@@ -2225,6 +2226,9 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+        if status == "scheduled":
+            _log(f"kanban goal loop: task {task_id} scheduled by worker after {turns_used} turn(s)")
+            return {"outcome": "scheduled_by_worker", "turns_used": turns_used, "reason": "worker scheduled a timed resumption"}
         if status == "review":
             # A legitimate worker-driven terminator (kanban_request_review),
             # not an unexpected stop: the implementation is done and the task
@@ -2240,9 +2244,8 @@ def run_kanban_goal_loop(
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
         # Still open — judge whether the latest response satisfies the card.
-        # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
-        # verdict is treated as CONTINUE here.
+        # A judge's textual WAIT is not a durable native schedule. Until the
+        # worker records a lifecycle transition, treat that verdict as CONTINUE.
         verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
         if transport_failed:
             # An unavailable auxiliary provider gave no task verdict. Preserve
@@ -2261,6 +2264,7 @@ def run_kanban_goal_loop(
                 "outcome": "blocked_judge_unavailable", "turns_used": turns_used,
                 "reason": unavailable_reason,
             }
+
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
