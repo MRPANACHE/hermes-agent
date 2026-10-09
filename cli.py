@@ -20830,6 +20830,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _budget_block(reason: str, *, turns_used: int, last_response: str) -> None:
+        with _kb.connect() as c:
+            usage = {key: getattr(cli.agent, key, 0) or 0 for key in (
+                "session_input_tokens", "session_output_tokens", "session_cache_read_tokens",
+                "session_cache_write_tokens", "session_estimated_cost_usd")}
+            if not _kb.block_goal_budget(c, task_id, expected_run_id=worker_run_id,
+                                         reason=reason, turns_used=turns_used,
+                                         last_response=last_response, session_id=cli.session_id,
+                                         usage=usage):
+                raise RuntimeError("native goal budget block lost its run binding")
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
@@ -20837,6 +20848,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         task_status_fn=_task_status,
         block_fn=_block,
         judge_unavailable_fn=lambda reason: _block(reason, kind=judge_transport_block_kind(reason)),
+        budget_block_fn=_budget_block,
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),

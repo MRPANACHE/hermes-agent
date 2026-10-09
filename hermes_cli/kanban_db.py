@@ -123,7 +123,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) records repeated blocking without making them
 # runnable or eligible for automatic triage/decomposition.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "turn_budget"}
 INPUT_BLOCK_KINDS = {"needs_input", "capability"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
@@ -4636,6 +4636,12 @@ def claim_task(
     with write_txn(conn):
         # Dispatcher read and claim may race a new operator control. Revalidate
         # this typed admission under the ordinary claim lock, before any repair.
+        budget = conn.execute("SELECT id FROM task_events WHERE task_id=? "
+                              "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        if budget and not conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                       "AND kind='claimed' AND id>?", (task_id, budget["id"])).fetchone():
+            if not goal_budget_admitted(conn, task_id):
+                return None
         admission = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
                                  "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1",
                                  (task_id,)).fetchone()
@@ -6284,6 +6290,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
+    allow_nested: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6318,7 +6326,7 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -6363,6 +6371,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6400,7 +6409,7 @@ def block_task(
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Triage is scanned for automatic decomposition. Missing input or
             # capability must not turn a limited resume into new runnable work.
-            target_status = "blocked" if kind in INPUT_BLOCK_KINDS else "triage"
+            target_status = "blocked" if kind in INPUT_BLOCK_KINDS or kind == "turn_budget" else "triage"
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6422,6 +6431,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6492,6 +6502,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6939,6 +6950,151 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+def _budget_assignment(task: Task) -> dict:
+    """The task authority and execution limits a continuation must retain."""
+    return {key: getattr(task, key) for key in (
+        "title", "body", "assignee", "workspace_kind", "workspace_path", "branch_name",
+        "goal_mode", "goal_max_turns", "max_runtime_seconds", "max_retries",
+        "model_override", "provider_override", "reasoning_effort")}
+
+
+def goal_budget_history(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Read use of this interrupted attempt and its continuations, not older work."""
+    turns, runtime, usage = 0, 0, {}
+    runs = list_runs(conn, task_id)
+    frontier = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=? "
+                            "AND kind IN ('review_requested','review_reopened','changes_requested',"
+                            "'completed','status','scheduled')", (task_id,)).fetchone()[0]
+    admission = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND id>? "
+                             "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id, frontier)).fetchone()
+    start = json.loads(admission["payload"]).get("chain_start_run") if admission else None
+    latest_budget = next((r for r in reversed(runs) if (r.metadata or {}).get("goal_budget") and conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND id>? AND kind='blocked'",
+        (task_id, r.id, frontier)).fetchone()), None)
+    if latest_budget:
+        start = latest_budget.metadata["goal_budget"].get("chain_start_run", latest_budget.id)
+    start = start or (runs[-1].id if runs else 0)
+    for run in runs:
+        if run.id < start:
+            continue
+        if run.ended_at is not None:
+            runtime += max(0, run.ended_at - run.started_at)
+        budget = (run.metadata or {}).get("goal_budget", {})
+        historical = re.fullmatch(r"Goal-mode worker exhausted its turn budget \((\d+)/(\d+)\) "
+                                  r"without completing the task\. Last judge verdict: .*", run.summary or "", re.S)
+        turns += int(budget.get("turns_used", int(historical[1]) if historical else 0))
+        for key, value in budget.get("usage", {}).items():
+            usage[key] = usage.get(key, 0) + value
+    return {"chain_start_run": start, "active_chain": bool(admission or latest_budget),
+            "turns_used": turns, "runtime_seconds": runtime, "usage": usage}
+
+
+def block_goal_budget(conn: sqlite3.Connection, task_id: str, *, expected_run_id: int,
+                      reason: str, turns_used: int, last_response: str,
+                      session_id: Optional[str] = None, usage: Optional[dict] = None) -> bool:
+    """Store an actual loop exhaustion, its checkpoint and native run together."""
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if not task or task.current_run_id != expected_run_id:
+            return False
+        history = goal_budget_history(conn, task_id)
+        budget = {"schema": "hermes.goal-budget.v1", "turns_used": turns_used,
+                  "chain_start_run": history["chain_start_run"],
+                  "last_response": last_response, "session_id": session_id,
+                  "usage": usage or {}, "assignment": _budget_assignment(task)}
+        return block_task(conn, task_id, reason=reason, kind="turn_budget",
+                          expected_run_id=expected_run_id, metadata={"goal_budget": budget},
+                          allow_nested=True)
+
+
+def goal_budget_binding(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Admit only the current proven turn exhaustion, never a low turn setting."""
+    def deny(reason: str) -> None:
+        raise ValueError(reason)
+
+    task = get_task(conn, task_id)
+    if not task or task.status != "blocked" or task.current_run_id is not None:
+        deny("budget_block_changed")
+    if task.claim_lock or task.worker_pid is not None or not task.goal_mode:
+        deny("budget_worker_exit_not_confirmed")
+    runs = list_runs(conn, task_id)
+    if not runs or any(r.ended_at is None for r in runs):
+        deny("budget_worker_exit_not_confirmed")
+    last = runs[-1]
+    spawned = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                           "AND kind='spawned' ORDER BY id DESC LIMIT 1", (task_id, last.id)).fetchone()
+    if spawned:
+        pid = json.loads(spawned["payload"] or "{}").get("pid")
+        if type(pid) is not int or pid <= 0:
+            deny("budget_worker_exit_not_confirmed")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            deny("budget_worker_exit_not_confirmed")
+        else:
+            deny("budget_worker_exit_not_confirmed")
+    row = conn.execute("SELECT id,run_id,payload FROM task_events WHERE task_id=? "
+                       "AND kind='blocked' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if not row or row["run_id"] != last.id or last.outcome != "blocked" or last.profile != task.assignee:
+        deny("budget_run_changed")
+    payload = json.loads(row["payload"] or "{}")
+    budget = (last.metadata or {}).get("goal_budget", {})
+    if budget.get("schema") == "hermes.goal-budget.v1":
+        if task.block_kind != "turn_budget" or payload.get("kind") != "turn_budget":
+            deny("budget_block_changed")
+        if budget.get("assignment") != _budget_assignment(task):
+            deny("budget_assignment_changed")
+    else:
+        # Historical inference requires the native run's exact exhaustion
+        # receipt AND its linked block event; goal_max_turns is not evidence.
+        match = re.fullmatch(r"Goal-mode worker exhausted its turn budget \((\d+)/(\d+)\) "
+                             r"without completing the task\. Last judge verdict: .*", last.summary or "", re.S)
+        if (task.block_kind is not None or payload.get("kind") is not None or not match
+                or int(match[1]) < int(match[2]) or payload.get("reason") != last.summary):
+            deny("budget_execution_proof_missing")
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? "
+                    "AND kind NOT IN ('commented','mrpanache_clarified','respawn_guarded') LIMIT 1",
+                    (task_id, row["id"])).fetchone():
+        deny("budget_control_changed")
+    if not _parents_satisfied(conn, task_id):
+        deny("budget_parents_not_complete")
+    if task.consecutive_failures >= (task.max_retries if task.max_retries is not None else DEFAULT_FAILURE_LIMIT):
+        deny("budget_retry_limit_reached: explicit operator action required")
+    if task.block_recurrences >= BLOCK_RECURRENCE_LIMIT:
+        deny("budget_continuation_limit_reached: explicit operator action required")
+    history = goal_budget_history(conn, task_id)
+    history["active_chain"] = True
+    if task.max_runtime_seconds is not None and history["runtime_seconds"] >= task.max_runtime_seconds:
+        deny("budget_runtime_limit_reached: explicit operator action required")
+    return {"schema": "hermes.budget-continuation.v1", "task_id": task_id,
+            "expected_run_id": last.id, "block_event_id": row["id"],
+            "chain_start_run": history["chain_start_run"],
+            "consecutive_failures": task.consecutive_failures,
+            "block_recurrences": task.block_recurrences,
+            "assignment": _budget_assignment(task), "history": history}
+
+
+def goal_budget_admitted(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Revalidate a supervisor's single admission under the native claim lock."""
+    row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                       "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if not row:
+        return False
+    binding = json.loads(row["payload"])
+    task = get_task(conn, task_id)
+    if (not task or task.status != "ready" or _budget_assignment(task) != binding["assignment"]
+            or task.consecutive_failures != binding["consecutive_failures"]
+            or task.block_recurrences != binding["block_recurrences"]):
+        return False
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? "
+                    "AND kind NOT IN ('commented','mrpanache_resumed','respawn_guarded') LIMIT 1",
+                    (task_id, row["id"])).fetchone():
+        return False
+    return goal_budget_history(conn, task_id) == binding["history"]
+
+
 def unblock_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6963,6 +7119,15 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn, allow_nested=allow_nested):
+        task = get_task(conn, task_id)
+        budget_binding = None
+        if task and task.status == "blocked":
+            if task.block_kind == "turn_budget":
+                budget_binding = goal_budget_binding(conn, task_id)
+            elif task.block_kind is None:
+                runs = list_runs(conn, task_id)
+                if runs and (runs[-1].summary or "").startswith("Goal-mode worker exhausted its turn budget ("):
+                    budget_binding = goal_budget_binding(conn, task_id)
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6994,9 +7159,9 @@ def unblock_task(
         # still reset here, which is correct: a deliberate unblock is a fresh
         # start for the dispatcher's retry budget.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "UPDATE tasks SET status = ?, current_run_id = NULL"
+            + (" " if budget_binding else ", consecutive_failures = 0, last_failure_error = NULL ")
+            + "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -7009,6 +7174,8 @@ def unblock_task(
                 else None
             ),
         )
+        if budget_binding:
+            _append_event(conn, task_id, "budget_continued", budget_binding)
         return True
 
 
@@ -8631,6 +8798,11 @@ def enforce_max_runtime(
         # intentionally records the first time a task ever started, so retries
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='budget_continued' LIMIT 1",
+                        (row["id"],)).fetchone():
+            history = goal_budget_history(conn, row["id"])
+            if history["active_chain"]:
+                elapsed += history["runtime_seconds"]
         if elapsed < int(row["max_runtime_seconds"]):
             continue
 
@@ -9842,6 +10014,13 @@ def check_respawn_guard(
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
+
+    task = get_task(conn, task_id)
+    if task and task.max_runtime_seconds is not None and conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='budget_continued' LIMIT 1", (task_id,)).fetchone():
+        history = goal_budget_history(conn, task_id)
+        if history["active_chain"] and history["runtime_seconds"] >= task.max_runtime_seconds:
+            return "budget_runtime_limit_reached: explicit operator action required"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
     # URL comment are the canonical *inputs* to a review handoff (worker
@@ -11556,6 +11735,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             if run.error and run.error.strip():
                 lines.append(f"_error_: {_cap(run.error)}")
             if run.metadata:
+                checkpoint = run.metadata.get("goal_budget")
+                if checkpoint:
+                    lines.append("Retained goal-loop response:")
+                    lines.append(_cap(checkpoint.get("last_response", ""), _CTX_MAX_BODY_BYTES))
+                    lines.append(f"Goal turns in this attempt: {checkpoint['turns_used']}; "
+                                 f"continuation chain starts at run {checkpoint['chain_start_run']}.")
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
                     lines.append(f"_metadata_: `{_cap(meta_str)}`")

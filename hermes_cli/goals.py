@@ -2163,6 +2163,7 @@ def run_kanban_goal_loop(
     first_response: str = "",
     log=None,
     judge_unavailable_fn=None,
+    budget_block_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -2281,7 +2282,7 @@ def run_kanban_goal_loop(
                     )
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "judged done, never finalized"}
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -2291,10 +2292,11 @@ def run_kanban_goal_loop(
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             try:
-                block_fn(
+                (budget_block_fn or (lambda reason, **_kwargs: block_fn(reason)))(
                     f"Goal-mode worker exhausted its turn budget "
                     f"({turns_used}/{max_turns}) without completing the task. "
-                    f"Last judge verdict: {_truncate(reason, 300)}"
+                    f"Last judge verdict: {_truncate(reason, 300)}",
+                    turns_used=turns_used, last_response=last_response,
                 )
             except Exception as exc:
                 _log(f"kanban goal loop: block_fn failed ({exc})")
