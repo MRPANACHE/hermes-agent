@@ -273,27 +273,113 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_task(conn, tid).completed_at is None
+        assert kb.latest_run(conn, tid).outcome is None
     finally:
         conn.close()
 
 
 def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
-    """`capability` / `transient` are valid kinds in general but must not
+    """`transient` is valid in general but must not
     let a goal_mode worker exit the loop without going through the judge."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
-    for kind in ("capability", "transient"):
-        out = kt._handle_block({"reason": "blocked", "kind": kind})
-        d = json.loads(out)
-        assert "error" in d, f"kind={kind} should be rejected for goal_mode"
+    out = kt._handle_block({"reason": "blocked", "kind": "transient"})
+    d = json.loads(out)
+    assert "error" in d
 
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_task(conn, tid).completed_at is None
+        assert kb.latest_run(conn, tid).outcome is None
     finally:
         conn.close()
+
+
+def test_block_goal_mode_capability_preserves_unfinished_goal(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        run_id = kb.latest_run(conn, tid).id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    # A missing capability must not invoke the completion judge or fabricate DONE.
+    monkeypatch.setattr(kt, "judge_goal", lambda *a, **kw: pytest.fail("block is not completion"))
+    reason = "Existing owner must expose the already authorized read route; no new access."
+    reply = json.loads(kt._handle_block({"kind": "capability", "reason": reason}))
+    assert reply.get("ok") is True
+    assert reply["status"] == "blocked"
+    assert reply["block_kind"] == "capability"
+    with kb.connect() as conn:
+        kb.recompute_ready(conn)
+        task, run = kb.get_task(conn, tid), kb.latest_run(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        assert task.completed_at is None
+        assert task.body == "Must achieve X."
+        assert task.assignee == "test-worker"
+        assert run.id == run_id and run.outcome == "blocked"
+        assert run.ended_at is not None and run.summary == reason
+        assert kb.claim_task(conn, tid) is None
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='completed'").fetchone()[0] == 0
+
+
+def test_repeated_goal_capability_remains_sticky_after_explicit_unblock(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    for attempt in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
+        with kb.connect() as conn:
+            run_id = kb.latest_run(conn, tid).id
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        assert json.loads(kt._handle_block({"kind": "capability", "reason": "Existing scoped route unavailable"})).get("ok")
+        with kb.connect() as conn:
+            kb.recompute_ready(conn)
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked" and task.block_kind == "capability"
+            assert task.completed_at is None
+            assert kb.latest_run(conn, tid).outcome == "blocked"
+            assert kb.claim_task(conn, tid) is None
+            if attempt < kb.BLOCK_RECURRENCE_LIMIT:
+                # Explicit owner intervention only; no automatic retry/decomposition.
+                assert kb.unblock_task(conn, tid)
+                assert kb.claim_task(conn, tid) is not None
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='block_loop_detected'").fetchone()[0] > 0
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='completed'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("invalid", ["foreign_task", "stale_run"])
+def test_goal_capability_block_keeps_worker_identity_boundary(monkeypatch, tmp_path, invalid):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        old_run = kb.latest_run(conn, tid).id
+        if invalid == "foreign_task":
+            target = kb.create_task(conn, title="Foreign goal", assignee="peer", goal_mode=True)
+            assert kb.claim_task(conn, target) is not None
+        else:
+            target = tid
+            assert kb.reclaim_task(conn, tid, reason="Fixture stale worker")
+            assert kb.claim_task(conn, tid) is not None
+        before = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+        target_run = kb.latest_run(conn, target).id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old_run))
+    reply = json.loads(kt._handle_block({"task_id": target, "kind": "capability", "reason": "No route"}))
+    assert reply.get("error")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, target).status == "running"
+        assert kb.get_task(conn, target).completed_at is None
+        assert kb.latest_run(conn, target).id == target_run
+        assert kb.latest_run(conn, target).ended_at is None
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == before
 
 
 def test_heartbeat_extends_claim_expires(worker_env):
