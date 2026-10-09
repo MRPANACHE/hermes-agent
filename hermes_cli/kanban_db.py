@@ -7027,13 +7027,7 @@ def goal_budget_binding(conn: sqlite3.Connection, task_id: str) -> dict:
         pid = json.loads(spawned["payload"] or "{}").get("pid")
         if type(pid) is not int or pid <= 0:
             deny("budget_worker_exit_not_confirmed")
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            deny("budget_worker_exit_not_confirmed")
-        else:
+        if _pid_alive(pid):
             deny("budget_worker_exit_not_confirmed")
     row = conn.execute("SELECT id,run_id,payload FROM task_events WHERE task_id=? "
                        "AND kind='blocked' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
