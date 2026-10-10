@@ -246,6 +246,8 @@ KANBAN_GUIDANCE = (
     "The `kanban_*` tools in your schema are your primary coordination surface — "
     "they write directly to the shared SQLite DB and work regardless of terminal "
     "backend (local/docker/modal/ssh).\n"
+    "Notes/summaries start `Status: <Dutch, max 100 chars>`; block reasons "
+    "`Blokkade: <specific Dutch reason, max 100 chars>`. Record at start/change/end; proof in metadata.\n"
     "\n"
     "## Lifecycle\n"
     "\n"
