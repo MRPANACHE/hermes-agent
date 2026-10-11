@@ -20,6 +20,7 @@ from hermes_cli.auth import (
     AuthError,
     _codex_usage_probe_url,
     _is_codex_rate_limit_shaped,
+    _probe_codex_quota_snapshot,
     _probe_codex_quota_restored,
     clear_codex_pool_quota_cooldowns,
     resolve_codex_runtime_credentials,
@@ -127,6 +128,20 @@ def test_probe_sends_chatgpt_account_id_from_jwt(monkeypatch):
 # ---------------------------------------------------------------------------
 # clear_codex_pool_quota_cooldowns
 # ---------------------------------------------------------------------------
+
+
+def test_quota_snapshot_exposes_each_window_for_pool_ranking(monkeypatch):
+    _patch_httpx(monkeypatch, _StubResponse(200, _usage_payload(12.0, 44.0)))
+    token = _jwt({"exp": time.time() + 3600})
+
+    snapshot = _probe_codex_quota_snapshot(token)
+
+    assert snapshot == {
+        "primary_used_percent": 12.0,
+        "secondary_used_percent": 44.0,
+        "worst_used_percent": 44.0,
+    }
+    assert _probe_codex_quota_restored(token) is True
 
 
 def _write_auth_store(hermes_home, payload):

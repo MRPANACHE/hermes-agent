@@ -33,6 +33,9 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+_resolve_buzz_event_read_adapter = _buzz_mod._resolve_buzz_event_read_adapter
+_handle_buzz_event_read = _buzz_mod._handle_buzz_event_read
+_handle_buzz_send_image = _buzz_mod._handle_buzz_send_image
 
 # Real key pair (Chip's public identity — public information, not a secret)
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
@@ -131,6 +134,42 @@ class TestBuzzAdapterInit:
         from gateway.config import PlatformConfig
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ([CHANNEL, "other"], {CHANNEL, "other"}),
+            (f"{CHANNEL}, other", {CHANNEL, "other"}),
+        ],
+    )
+    def test_free_response_channels_accept_list_or_csv(self, configured, expected):
+        adapter = _make_adapter({"free_response_channels": configured})
+        assert adapter.free_response_channels == expected
+
+    def test_interactive_resume_defaults_true(self):
+        """Existing Buzz users keep interactive auto-resume unless opted out."""
+        adapter = _make_adapter()
+        assert adapter.interactive_resume is True
+
+    def test_interactive_resume_config_false_yields_false(self):
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "interactive_resume": False},
+        )
+        adapter = BuzzAdapter(cfg)
+        assert adapter.interactive_resume is False
+
+    @pytest.mark.parametrize("raw", ["false", "0", "no", "off"])
+    def test_interactive_resume_string_false_yields_false(self, raw):
+        """YAML strings parse like require_mention (same boolean style)."""
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "interactive_resume": raw},
+        )
+        adapter = BuzzAdapter(cfg)
+        assert adapter.interactive_resume is False
 
 # ── Multiplex secondary-profile scope (#98738) ─────────────────────────────
 
@@ -1613,6 +1652,25 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_unaddressed_message_dispatched_in_free_response_channel(self):
+        adapter = _make_adapter({"free_response_channels": [CHANNEL]})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        await self._poll_with(
+            adapter,
+            _event("e1", content="natural follow-up without a mention", created_at=10),
+        )
+
+        assert [message["message_id"] for message in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
     async def test_unknown_sender_tag_gets_no_reaction(self, adapter):
         adapter._allowed_pubkeys = {OTHER_PUBKEY}
         adapter._reaction_only_pubkeys = {AGENT_PUBKEY}
@@ -2047,6 +2105,38 @@ class TestThreadRoots:
 
         assert dispatched[0].source.thread_id == "stable-root"
 
+# ── Dispatch source carries the Buzz event id ─────────────────────────────
+
+
+class TestDispatchSourceMessageId:
+
+    @pytest.mark.asyncio
+    async def test_dispatch_source_carries_buzz_event_id(self):
+        """_dispatch_message must pass message_id into build_source so
+        SessionSource (HERMES_SESSION_MESSAGE_ID) exposes the exact Buzz
+        event id for Buzz-to-OOS correlation."""
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        sent = []
+
+        async def fake_handle(event):
+            sent.append(event)
+
+        adapter.handle_message = fake_handle
+        await adapter._dispatch_message(
+            text="hello",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Tester",
+            message_id="evt-src-1",
+            created_at=1000,
+        )
+        assert len(sent) == 1
+        assert sent[0].source.message_id == "evt-src-1"
+        assert sent[0].message_id == "evt-src-1"
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 class TestBuzzAdapterSend:
@@ -2283,24 +2373,6 @@ class TestBuzzAdapterSend:
         assert cli.calls[1][1] == "See @\u200bsession:default/example."
 
     @pytest.mark.asyncio
-    async def test_send_image_file_missing_local_path_uses_base_fallback_notice(self, tmp_path):
-        missing = tmp_path / "missing.png"
-        adapter = _make_adapter()
-        cli = _ScriptedCli()
-        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
-        adapter._run_cli = cli
-
-        result = await adapter.send_image_file(CHANNEL, str(missing), caption="screenshot")
-
-        assert result.success is True
-        args, stdin_text = cli.calls[0]
-        assert args[:2] == ["messages", "send"]
-        assert "--file" not in args
-        assert str(missing) not in args
-        assert stdin_text.startswith("screenshot\n")
-        assert str(missing) not in stdin_text
-
-    @pytest.mark.asyncio
     async def test_send_multiple_images_file_url_uses_native_file_send(self, tmp_path):
         img = tmp_path / "shot with spaces.png"
         img.write_bytes(b"\x89PNG fake")
@@ -2319,6 +2391,14 @@ class TestBuzzAdapterSend:
         assert args[args.index("--content") + 1] == "-"
         assert stdin_text == "screenshot"
         assert "Couldn't deliver the image attachment." not in stdin_text
+
+    @pytest.mark.asyncio
+    async def test_missing_local_image_does_not_send_path_as_text(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._run_cli = AsyncMock()
+        result = await adapter.send_image_file(CHANNEL, str(tmp_path / "missing.jpg"))
+        assert result.success is False
+        adapter._run_cli.assert_not_awaited()
 
 # ── Thread anchoring ──────────────────────────────────────────────────────
 
@@ -2853,6 +2933,7 @@ class TestInboundMediaAuthorizationGate:
         assert result == {
             "success": True,
             "message_id": "evt-second",
+            "message_ids": ["evt-text", "evt-first", "evt-second"],
             "media_delivered": True,
         }
         assert len(cli.calls) == 3
@@ -2995,6 +3076,387 @@ class TestEnvEnablement:
     def test_returns_none_when_unconfigured(self):
         assert _env_enablement() is None
 
+
+class TestBuzzEventRead:
+
+    @pytest.fixture
+    def adapter(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_credential_file_auth_payload_is_redacted_without_env(self, adapter, monkeypatch):
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        fixture_secret = "credential-file-auth-payload"
+        adapter._auth_tag = json.dumps(["auth", {"token": fixture_secret}])
+        event = _event("a" * 64, content=f"evidence {fixture_secret}", created_at=10)
+        adapter._run_cli = AsyncMock(return_value=(0, json.dumps([event]), ""))
+
+        result = await adapter.read_event(CHANNEL, "a" * 64)
+
+        assert result["content"] == "evidence <redacted>"
+        assert fixture_secret not in json.dumps(result)
+
+    @pytest.mark.asyncio
+    async def test_returns_exact_event_from_watched_channel(self, adapter):
+        root = _event("a" * 64, content="thread root", created_at=10)
+        requested = _event("b" * 64, content="canonical receipt", created_at=11)
+        requested["tags"].append(["e", "a" * 64, "", "root"])
+        reply = _event("c" * 64, content="later reply", created_at=12)
+        reply["tags"].append(["e", "a" * 64, "", "root"])
+        adapter._run_cli = AsyncMock(
+            return_value=(0, json.dumps([root, requested, reply]), "")
+        )
+
+        result = await adapter.read_event(CHANNEL, "b" * 64)
+
+        assert result == {
+            "id": "b" * 64,
+            "pubkey": OTHER_PUBKEY,
+            "kind": 9,
+            "tags": requested["tags"],
+            "content": "canonical receipt",
+            "channel": CHANNEL,
+        }
+        adapter._run_cli.assert_awaited_once_with([
+            "messages", "thread", "--channel", CHANNEL,
+            "--event", "b" * 64, "--limit", "100",
+        ])
+
+    @pytest.mark.asyncio
+    async def test_rejects_unwatched_channel_without_cli_call(self, adapter):
+        adapter._run_cli = AsyncMock()
+
+        result = await adapter.read_event("not-watched", "a" * 64)
+
+        assert result == {"error": "channel_not_watched", "channel": "not-watched"}
+        adapter._run_cli.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_not_found_for_watched_channel(self, adapter):
+        adapter._run_cli = AsyncMock(return_value=(0, "[]", ""))
+
+        result = await adapter.read_event(CHANNEL, "a" * 64)
+
+        assert result == {
+            "error": "event_not_found",
+            "id": "a" * 64,
+            "channel": CHANNEL,
+        }
+
+    @pytest.mark.asyncio
+    async def test_mismatched_response_id_fails_closed(self, adapter):
+        wrong_event = _event("b" * 64, content="wrong event", created_at=10)
+        adapter._run_cli = AsyncMock(return_value=(0, json.dumps([wrong_event]), ""))
+
+        result = await adapter.read_event(CHANNEL, "a" * 64)
+
+        assert result == {
+            "error": "event_not_found",
+            "id": "a" * 64,
+            "channel": CHANNEL,
+        }
+
+    @pytest.mark.asyncio
+    async def test_response_from_wrong_channel_fails_closed(self, adapter):
+        wrong_channel_event = _event("a" * 64, content="wrong channel", created_at=10)
+        wrong_channel_event["tags"] = [["h", "different-channel"]]
+        adapter._run_cli = AsyncMock(
+            return_value=(0, json.dumps([wrong_channel_event]), "")
+        )
+
+        result = await adapter.read_event(CHANNEL, "a" * 64)
+
+        assert result == {
+            "error": "event_channel_mismatch",
+            "id": "a" * 64,
+            "channel": CHANNEL,
+        }
+
+    @pytest.mark.asyncio
+    async def test_cli_failure_does_not_return_or_log_stderr(self, adapter, caplog):
+        secret_stderr = "relay rejected auth signature-do-not-expose"
+        adapter._run_cli = AsyncMock(return_value=(2, "", secret_stderr))
+
+        result = await adapter.read_event(CHANNEL, "a" * 64)
+
+        assert result == {
+            "error": "event_read_failed",
+            "id": "a" * 64,
+            "channel": CHANNEL,
+            "code": 2,
+        }
+        assert secret_stderr not in json.dumps(result)
+        assert secret_stderr not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_never_exposes_private_key_or_auth_tag(self, adapter, monkeypatch, caplog):
+        private_key = "private-key-must-not-escape"
+        auth_tag = '["auth","owner","kind","signature-must-not-escape"]'
+        adapter._private_key = private_key
+        monkeypatch.setenv("BUZZ_AUTH_TAG", auth_tag)
+        event = _event(
+            "a" * 64,
+            content=f"receipt {private_key} {auth_tag} signature-must-not-escape",
+            created_at=10,
+        )
+        event["tags"].extend([
+            json.loads(auth_tag),
+            ["x", private_key],
+        ])
+        adapter._run_cli = AsyncMock(return_value=(0, json.dumps([event]), ""))
+
+        result = await adapter.read_event(CHANNEL, "a" * 64)
+
+        rendered = json.dumps(result)
+        assert private_key not in rendered
+        assert auth_tag not in rendered
+        assert "signature-must-not-escape" not in rendered
+        assert private_key not in caplog.text
+        assert auth_tag not in caplog.text
+        cli_args = adapter._run_cli.await_args.args[0]
+        assert private_key not in json.dumps(cli_args)
+        assert auth_tag not in json.dumps(cli_args)
+        assert not any(tag and tag[0] == "auth" for tag in result["tags"])
+
+    def test_resolves_existing_profile_adapter_without_module_state(
+        self, adapter, monkeypatch
+    ):
+        from gateway import run as gateway_run
+        from gateway import session_context
+        from gateway.config import Platform
+
+        adapter._running = True
+        runner = MagicMock()
+        runner._authorization_adapter.return_value = adapter
+        monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": (
+                "otto" if name == "HERMES_SESSION_PROFILE" else default
+            ),
+        )
+
+        assert _resolve_buzz_event_read_adapter() is adapter
+        runner._authorization_adapter.assert_called_once_with(
+            Platform("buzz"), profile="otto"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_handler_uses_only_channel_and_event_id(
+        self, adapter, monkeypatch
+    ):
+        adapter.read_event = AsyncMock(
+            return_value={
+                "id": "a" * 64,
+                "pubkey": OTHER_PUBKEY,
+                "kind": 9,
+                "tags": [["h", CHANNEL]],
+                "content": "receipt",
+                "channel": CHANNEL,
+            }
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+
+        rendered = await _handle_buzz_event_read(
+            {"channel": CHANNEL, "event_id": "A" * 64}
+        )
+
+        assert json.loads(rendered)["id"] == "a" * 64
+        adapter.read_event.assert_awaited_once_with(CHANNEL, "A" * 64)
+
+    @pytest.mark.asyncio
+    async def test_tool_handler_ignores_dispatch_kwargs_without_leaking_them(
+        self, adapter, monkeypatch
+    ):
+        dispatch_task_id = "task-id-must-not-reach-buzz"
+        event = _event("a" * 64, content="canonical receipt", created_at=10)
+        adapter._run_cli = AsyncMock(
+            return_value=(0, json.dumps([event]), "")
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+
+        rendered = await _handle_buzz_event_read(
+            {"channel": CHANNEL, "event_id": "a" * 64},
+            task_id=dispatch_task_id,
+        )
+
+        assert json.loads(rendered)["content"] == "canonical receipt"
+        assert dispatch_task_id not in rendered
+        assert dispatch_task_id not in json.dumps(adapter._run_cli.await_args.args)
+
+
+class TestBuzzSendImage:
+
+    @pytest.fixture
+    def adapter(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group", "last_ts": 0, "seen": {}
+        }
+        adapter._running = True
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_sends_to_current_buzz_channel_and_returns_native_event_id(
+        self, adapter, monkeypatch
+    ):
+        from gateway import session_context
+
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "buzz",
+                "HERMES_SESSION_CHAT_ID": CHANNEL,
+            }.get(name, default),
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+        adapter.send_image_file = AsyncMock(
+            return_value=_buzz_mod.SendResult(
+                success=True, message_id="a" * 64
+            )
+        )
+
+        rendered = await _handle_buzz_send_image(
+            {"image_path": "/home/agent/final.png", "caption": "Review"}
+        )
+
+        assert json.loads(rendered) == {
+            "success": True,
+            "message_id": "a" * 64,
+        }
+        adapter.send_image_file.assert_awaited_once_with(
+            CHANNEL, "/home/agent/final.png", caption="Review"
+        )
+
+    @pytest.mark.asyncio
+    async def test_accepted_send_without_native_event_id_is_unknown(self, adapter, monkeypatch):
+        from gateway import session_context
+
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "buzz",
+                "HERMES_SESSION_CHAT_ID": CHANNEL,
+            }.get(name, default),
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+        adapter.send_image_file = AsyncMock(
+            return_value=_buzz_mod.SendResult(success=True, message_id=None)
+        )
+
+        response = json.loads(
+            await _handle_buzz_send_image({"image_path": "/home/agent/final.png"})
+        )
+
+        assert response["success"] is False
+        assert "delivery outcome is unknown" in response["error"]
+        assert "no native event ID" in response["error"]
+
+    @pytest.mark.asyncio
+    async def test_relay_failure_preserves_error_and_any_returned_event_id(
+        self, adapter, monkeypatch
+    ):
+        from gateway import session_context
+
+        relay_error = "relay error 422: unsupported media metadata"
+        event_id = "b" * 64
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "buzz",
+                "HERMES_SESSION_CHAT_ID": CHANNEL,
+            }.get(name, default),
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+        adapter.send_image_file = AsyncMock(
+            return_value=_buzz_mod.SendResult(
+                success=False, message_id=event_id, error=relay_error
+            )
+        )
+
+        response = json.loads(
+            await _handle_buzz_send_image({"image_path": "/home/agent/final.png"})
+        )
+
+        assert response == {
+            "success": False,
+            "message_id": event_id,
+            "error": relay_error,
+        }
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_buzz_session_without_sending(self, adapter, monkeypatch):
+        from gateway import session_context
+
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "terminal",
+                "HERMES_SESSION_CHAT_ID": CHANNEL,
+            }.get(name, default),
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+        adapter.send_image_file = AsyncMock()
+
+        rendered = await _handle_buzz_send_image(
+            {"image_path": "/home/agent/final.png"}
+        )
+
+        assert json.loads(rendered) == {
+            "success": False,
+            "error": "buzz_session_unavailable",
+        }
+        adapter.send_image_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_channel_outside_active_adapter_without_sending(
+        self, adapter, monkeypatch
+    ):
+        from gateway import session_context
+
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "buzz",
+                "HERMES_SESSION_CHAT_ID": "not-watched",
+            }.get(name, default),
+        )
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_buzz_event_read_adapter", lambda: adapter
+        )
+        adapter.send_image_file = AsyncMock()
+
+        rendered = await _handle_buzz_send_image(
+            {"image_path": "/home/agent/final.png"}
+        )
+
+        assert json.loads(rendered) == {
+            "success": False,
+            "error": "buzz_session_unavailable",
+        }
+        adapter.send_image_file.assert_not_awaited()
+
+
 class TestBuzzPluginRegistration:
 
     def test_register_platform_contract(self):
@@ -3012,6 +3474,34 @@ class TestBuzzPluginRegistration:
         assert callable(kwargs["standalone_sender_fn"])
         assert callable(kwargs["env_enablement_fn"])
         assert set(kwargs["required_env"]) == {"BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"}
+        tool_calls = {
+            call.kwargs["name"]: call.kwargs
+            for call in ctx.register_tool.call_args_list
+        }
+        assert set(tool_calls) == {"buzz_event_read", "buzz_send_image"}
+        read_tool = tool_calls["buzz_event_read"]
+        assert read_tool["toolset"] == "buzz"
+        assert read_tool["is_async"] is True
+        assert set(read_tool["schema"]["parameters"]["properties"]) == {
+            "channel",
+            "event_id",
+        }
+        assert set(read_tool["schema"]["parameters"]["required"]) == {
+            "channel",
+            "event_id",
+        }
+        assert callable(read_tool["handler"])
+        assert callable(read_tool["check_fn"])
+        send_tool = tool_calls["buzz_send_image"]
+        assert send_tool["toolset"] == "buzz"
+        assert send_tool["is_async"] is True
+        assert set(send_tool["schema"]["parameters"]["properties"]) == {
+            "image_path",
+            "caption",
+        }
+        assert send_tool["schema"]["parameters"]["required"] == ["image_path"]
+        assert callable(send_tool["handler"])
+        assert callable(send_tool["check_fn"])
 
 class TestStandaloneSend:
 
@@ -3374,6 +3864,8 @@ class TestBuzzAdapterEdit:
 
         fake_cli = tmp_path / "buzz"
         fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        report = tmp_path / "report.txt"
+        report.write_text("fixture report", encoding="utf-8")
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
         monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
         monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
@@ -3393,7 +3885,7 @@ class TestBuzzAdapterEdit:
             PlatformConfig(enabled=True, extra={}),
             CHANNEL,
             "hello",
-            media_files=[("/tmp/report.txt", False)],
+            media_files=[(str(report), False)],
         )
 
         assert "upload rejected" in result["error"]

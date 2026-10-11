@@ -72,7 +72,7 @@ _KNOWN_HERMES_KEYS = {
     "command", "args", "env", "cwd",
     "url", "headers", "transport",
     "timeout", "connect_timeout",
-    "enabled", "description"}
+    "enabled", "description", "tools"}
 _KEYS_DROPPED_WITH_WARNING = {"sampling"}
 
 # (hermes key, codex key, skip note) — timeouts are emitted as floats or skipped when non-numeric.
@@ -124,6 +124,21 @@ def _translate_one_server(name: str, hermes_cfg: dict) -> tuple[Optional[dict], 
                 skipped.append(note)
     if hermes_cfg.get("enabled") is False:
         out["enabled"] = False
+    tools_cfg = hermes_cfg.get("tools")
+    if tools_cfg is not None:
+        if not isinstance(tools_cfg, dict):
+            skipped.append("tools (expected mapping)")
+        else:
+            for hermes_key, codex_key in (("include", "enabled_tools"), ("exclude", "disabled_tools")):
+                values = tools_cfg.get(hermes_key)
+                if values is None:
+                    continue
+                if not isinstance(values, list) or not all(
+                    isinstance(value, str) and value.strip() for value in values
+                ):
+                    skipped.append(f"tools.{hermes_key} (expected string list)")
+                    continue
+                out[codex_key] = [value.strip() for value in values]
     for key in hermes_cfg:
         if key in _KEYS_DROPPED_WITH_WARNING:
             skipped.append(f"{key} (no codex equivalent)")
@@ -240,6 +255,57 @@ def _strip_unmanaged_plugin_tables(toml_text: str) -> str:
         if not in_plugin_table:  # swallow keys/comments/blanks until the next table header
             out.append(line)
     return "".join(out)
+
+
+def _strip_unmanaged_owned_mcp_tables(
+    toml_text: str,
+    server_names: set[str],
+) -> str:
+    """Remove pre-existing MCP tables that Hermes is about to manage.
+
+    User-owned MCP servers with different names remain untouched.  Exact name
+    collisions must be removed, including child tables such as
+    ``[mcp_servers.fleet.env]``, or the managed replacement would leave Codex
+    with duplicate TOML table headers.
+    """
+    if not server_names:
+        return toml_text
+
+    def is_owned_header(stripped: str) -> bool:
+        header = stripped.split("#", 1)[0].strip()
+        for name in server_names:
+            rendered_names = {_quote_key(name), f'"{name}"'}
+            for rendered in rendered_names:
+                root = f"[mcp_servers.{rendered}]"
+                child = f"[mcp_servers.{rendered}."
+                if header == root or header.startswith(child):
+                    return True
+        return False
+
+    lines = toml_text.splitlines(keepends=True)
+    out: list[str] = []
+    in_owned_table = False
+    for line in lines:
+        stripped = line.lstrip()
+        if _looks_like_table_header(stripped):
+            in_owned_table = is_owned_header(stripped)
+            if in_owned_table:
+                continue
+        if in_owned_table:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _has_top_level_key(toml_text: str, key: str) -> bool:
+    """Return whether ``key`` is already defined before the first table."""
+    for line in toml_text.splitlines():
+        stripped = line.lstrip()
+        if _looks_like_table_header(stripped):
+            return False
+        if stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="):
+            return True
+    return False
 
 
 def _unmanaged_mcp_server_names(toml_text: str) -> set[str]:
@@ -466,8 +532,6 @@ def migrate(
         # re-render and may strip pre-existing tables outside the managed block.
         plugin_query_succeeded = not plugin_err
         report.migrated_plugins += [f"{p['name']}@{p['marketplace']}" for p in plugins]
-    if default_permission_profile:
-        report.wrote_permissions_default = default_permission_profile
     if expose_hermes_tools:
         translated[HERMES_TOOLS_MCP_SERVER_NAME] = _build_hermes_tools_mcp_entry()
         if HERMES_TOOLS_MCP_SERVER_NAME not in report.migrated:
@@ -488,6 +552,15 @@ def migrate(
                     "; existing config.toml was unloadable — re-run `hermes codex-runtime migrate` "
                     "to migrate plugins")
         without_managed = _strip_existing_managed_block(existing)
+        # A profile's explicit tool boundary must survive a pre-existing server of the same
+        # name. Servers without Hermes filters keep upstream's user-owned collision policy.
+        filtered_servers = {
+            name for name, entry in translated.items()
+            if "enabled_tools" in entry or "disabled_tools" in entry
+        }
+        without_managed = _strip_unmanaged_owned_mcp_tables(without_managed, filtered_servers)
+        if _has_top_level_key(without_managed, "default_permissions"):
+            default_permission_profile = None
         if plugin_query_succeeded:
             without_managed = _strip_unmanaged_plugin_tables(without_managed)
         # Preserve-user policy: a name the user already declares outside the managed block is
@@ -498,6 +571,8 @@ def migrate(
             report.preserved_user_servers.append(name)
     managed_block = render_codex_toml_section(
         translated, plugins=plugins, default_permission_profile=default_permission_profile)
+    if default_permission_profile:
+        report.wrote_permissions_default = default_permission_profile
     new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
     try:
         tomllib.loads(new_text)

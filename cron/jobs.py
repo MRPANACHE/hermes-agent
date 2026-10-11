@@ -286,7 +286,7 @@ def _release_flock(lock_fd) -> None:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, strict: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
@@ -295,6 +295,8 @@ def _jobs_lock():
     scheduler."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if strict and not getattr(_jobs_lock_state, "cross_process", False):
+            raise RuntimeError("Cron recovery requires the cross-process jobs lock")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -304,6 +306,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process = False
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
@@ -315,7 +318,9 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                _jobs_lock_state.cross_process = acquired is True
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -330,12 +335,15 @@ def _jobs_lock():
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
             try:
+                if strict and not _jobs_lock_state.cross_process:
+                    raise RuntimeError("Cron recovery requires the cross-process jobs lock")
                 yield
             finally:
                 if lock_fd is not None:
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process = False
             _jobs_lock_state.load_stamp = None
 
 
@@ -2460,6 +2468,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    preserve_next_run_at: Optional[str] = None,
     model_unreachable: bool = False,
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
@@ -2487,28 +2496,34 @@ def mark_job_run(
     (cron/quota_hold.py, #89376).
     """
     def apply(jobs, _i, job):
+        claim = job.get("fire_claim")
         if expected_fire_owner is not None:
-            claim = job.get("fire_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
                 logger.warning(
                     "mark_job_run: job_id %s fire claim owner changed; discarding stale completion",
                     job_id)
                 return False
         now = _hermes_now().isoformat()
+        # The recovery claim owns this boundary across worker handoff and shutdown paths.
+        preserved_next = preserve_next_run_at
+        if preserved_next is None and isinstance(claim, dict):
+            preserved_next = claim.get("preserve_next_run_at")
         _record_run_outcome(job, success, error, delivery_error, status, now)
         _advance_after_run(job, now, ladder_rung=ladder_rung)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
-        if not success and model_unreachable and not is_terminal_job(job):
+        if not success and model_unreachable and not is_terminal_job(job) and preserved_next is None:
             plan_retry(job)
         else:
             # Any run that reached the model (either outcome) resets the re-run ladder.
             clear_state(job)
-        if not success and quota_hold_seconds and not is_terminal_job(job):
+        if not success and quota_hold_seconds and not is_terminal_job(job) and preserved_next is None:
             quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
         else:
             quota_hold.clear_state(job)
+        if preserved_next is not None and not is_terminal_job(job):
+            job["next_run_at"] = preserved_next
         save_jobs(jobs)
         return True
 
@@ -2741,6 +2756,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
+    advance_schedule: bool = True,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2795,9 +2811,11 @@ def claim_job_for_fire(
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        if not advance_schedule:
+            job["fire_claim"]["preserve_next_run_at"] = job.get("next_run_at")
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
-        if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+        if advance_schedule and job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt

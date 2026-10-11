@@ -105,6 +105,7 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    awakened: list[str] = field(default_factory=list)
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -152,6 +153,7 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -415,10 +417,15 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
-    """``signal_fn`` test hook, else ``os.kill`` when the platform has one."""
+    """Signal the verified worker tree; keep the injected signal hook for tests."""
     if signal_fn is not None:
         return signal_fn
-    return os.kill if hasattr(os, "kill") else None
+    if not hasattr(os, "kill"):
+        return None
+    from hermes_cli import _subprocess_compat as compat
+    def kill(pid, signum):
+        compat.terminate_process_tree(pid, force=signum == getattr(signal, "SIGKILL", object()))
+    return kill
 
 
 def _poll_worker_exit(pid: int, started_at: Optional[int] = None) -> bool:
@@ -499,6 +506,7 @@ def _terminate_reclaimed_worker(
         info["sigkill"] = True
     info["terminated"] = not _worker_alive(pid, started_at)
     return info
+
 
 
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -675,6 +683,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
         limit = int(row["max_runtime_seconds"])
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='budget_continued' LIMIT 1",
+                        (row["id"],)).fetchone():
+            history = _kb.goal_budget_history(conn, row["id"])
+            if history["active_chain"]:
+                elapsed += history["runtime_seconds"]
         if elapsed < limit:
             continue
 
@@ -738,6 +751,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
     return timed_out
+
 
 
 # A running task with no heartbeat for this long is inactive regardless of
@@ -1591,6 +1605,13 @@ def check_respawn_guard(
     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
+    task = _kb.get_task(conn, task_id)
+    if task and task.max_runtime_seconds is not None and conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='budget_continued' LIMIT 1", (task_id,)).fetchone():
+        history = _kb.goal_budget_history(conn, task_id)
+        if history["active_chain"] and history["runtime_seconds"] >= task.max_runtime_seconds:
+            return "budget_runtime_limit_reached: explicit operator action required"
+
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
     if lane == "review":
@@ -1627,12 +1648,14 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
+        "SELECT id, body, author, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+            continue
+        if _kb._initial_parent_pr_reference(conn, task_id, c):
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -1643,9 +1666,81 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
+        # Dependency completion continues the original task, not a new PR.
+        # Bind the promotion to its latest ended worker and dependency wait;
+        # a claimed/newer run or changed owner cannot reuse that continuation.
+        continuation = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r ON r.task_id = t.id "
+            "JOIN task_events w ON w.task_id = t.id AND w.run_id = r.id "
+            "JOIN task_events p ON p.task_id = t.id AND p.id > w.id "
+            "WHERE t.id = ? AND t.status = 'ready' "
+            "AND t.block_kind = 'dependency' AND t.current_run_id IS NULL "
+            "AND t.claim_lock IS NULL AND t.worker_pid IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM task_runs active "
+            "WHERE active.task_id = t.id AND active.ended_at IS NULL) "
+            "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id) "
+            "AND r.profile = t.assignee AND r.outcome = 'blocked' "
+            "AND r.ended_at IS NOT NULL AND w.kind = 'dependency_wait' "
+            "AND json_valid(w.payload) "
+            "AND json_extract(w.payload, '$.kind') = 'dependency' "
+            "AND json_extract(w.payload, '$.source_status') = 'ready' "
+            "AND p.kind = 'promoted' "
+            "AND w.id > COALESCE((SELECT MAX(id) FROM task_events "
+            "WHERE task_id = t.id AND kind = 'commented'), 0) "
+            "AND p.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id "
+            "AND kind IN ('promoted', 'dependency_wait', 'claimed', 'status', "
+            "'unblocked', 'reclaimed', 'blocked', 'changes_requested')) "
+            "AND EXISTS (SELECT 1 FROM task_links WHERE child_id = t.id) "
+            "AND NOT EXISTS (SELECT 1 FROM task_links l "
+            "LEFT JOIN tasks parent ON parent.id = l.parent_id "
+            "WHERE l.child_id = t.id "
+            "AND (parent.id IS NULL OR parent.status NOT IN ('done', 'archived'))) "
+            "LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if continuation:
+            return None
+        # A canonical reviewer return authorizes correction on this task,
+        # not another PR. Never carry that permission past a newer run or
+        # owner change; auth, cooldown and recent-success guards stay above.
+        rework = conn.execute(
+            "SELECT 1 FROM task_runs r JOIN task_events e "
+            "ON e.task_id = r.task_id AND e.run_id = r.id "
+            "JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.task_id = ? AND r.id = "
+            "(SELECT MAX(id) FROM task_runs WHERE task_id = ?) "
+            "AND r.outcome = 'changes_requested' "
+            "AND e.kind = 'changes_requested' AND json_valid(e.payload) "
+            "AND json_extract(e.payload, '$.status') IN ('ready', 'todo') "
+            "AND json_extract(e.payload, '$.implementer') = t.assignee "
+            "AND t.status = 'ready' AND t.current_run_id IS NULL LIMIT 1",
+            (task_id, task_id),
+        ).fetchone()
+        if rework:
+            return None
+        # A monitor/operator explicitly waking the card after recording
+        # evidence is not duplicate PR work. Use event order, not seconds:
+        # comment + unblock commonly happen in the same second. A newer
+        # comment restores the conservative PR guard until another wake.
+        last_comment = conn.execute(
+            "SELECT MAX(id) AS id FROM task_events "
+            "WHERE task_id = ? AND kind = 'commented'",
+            (task_id,),
+        ).fetchone()
+        if last_comment and last_comment["id"] is not None:
+            explicit_wake = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'unblocked' AND id > ? LIMIT 1",
+                (task_id, last_comment["id"]),
+            ).fetchone()
+            if explicit_wake:
+                return None
+        if _kb.ready_resume_admitted(conn, task_id):
+            return None
         return "active_pr"
 
     return None
+
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
@@ -1964,6 +2059,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    admit_new: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1987,6 +2083,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            admit_new=admit_new,
         )
 
     try:
@@ -2007,6 +2104,7 @@ def dispatch_once(
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
@@ -2202,7 +2300,6 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
 def _tick_spawn_budget(
@@ -2339,6 +2436,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    admit_new: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2350,6 +2448,11 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    if not admit_new:
+        return result
+    if not dry_run:
+        result.awakened = _kb.wake_scheduled_tasks(conn)
+    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -2427,6 +2530,7 @@ def _dispatch_once_locked(
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
     return result
+
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -2854,6 +2958,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # HERMES_PROFILE (set below) instead.
         profile_home = None
 
+    worker_config = _kb._resolve_worker_config(profile_home)
+    direct_command = worker_config is not None
+
     # Scrub for a ROUTED home, not only under multiplex: the authority test is "does this worker act
     # for another profile", exactly as served_profile_child_env decides it (tools/environments/local.py).
     # Gating on the gateway-wide flag left B's worker inheriting the dispatcher's own OPENAI_API_KEY and
@@ -2862,17 +2969,27 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # build_subprocess_env's secret scrub resolves terminal.env_passthrough vars through get_secret(),
     # which without a bound scope reads the LAUNCH profile's ambient environment for a worker spawned
     # on B's behalf (and raises under multiplex) — so bind B's secret scope around the build.
-    with (_worker_profile_scope(profile_home, bind_home=False) if profile_home
-          else contextlib.nullcontext()):
-        env = build_subprocess_env(
-            scrub_secrets=is_multiplex_active() or routed,
-            inherit_profile_home=True,
-        )
+    if direct_command:
+        from tools.environments.local import hermes_subprocess_env
+        env = hermes_subprocess_env(inherit_credentials=False)
+    else:
+        with (_worker_profile_scope(profile_home, bind_home=False) if profile_home
+              else contextlib.nullcontext()):
+            env = build_subprocess_env(
+                scrub_secrets=is_multiplex_active() or routed,
+                inherit_profile_home=True,
+            )
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    if direct_command:
+        # Do not let stale parent/dispatcher Kanban values reach an arbitrary
+        # profile command. Only the explicit bounded context below is passed.
+        for key in list(env):
+            if key.startswith("HERMES_KANBAN_"):
+                env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml:
     # without it the child's get_hermes_home() falls back to the DEFAULT
@@ -2885,6 +3002,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         strip_launch_profile_env(env, profile_home)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    if direct_command:
+        env["HERMES_KANBAN_TASK_ID"] = task.id
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by
@@ -2937,7 +3056,19 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    if direct_command:
+        ignored = [name for name in ("skills", "model_override", "provider_override", "reasoning_effort", "goal_mode")
+                   if getattr(task, name)]
+        if ignored:
+            _kb._log.warning("kanban worker: task %s runs a direct command; agent-only settings ignored: %s",
+                             task.id, ", ".join(ignored))
+        env["HERMES_KANBAN_WORKER_COMMAND"] = _kb._json_or_null(list(worker_config.command))
+        env[_kb._WORKER_COMPLETION_MODE_ENV] = worker_config.completion_mode
+        cmd = [sys.executable, "-P", "-m", "hermes_cli.kanban_command_worker"]
+        root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([root, *filter(None, env.get("PYTHONPATH", "").split(os.pathsep))]))
+    else:
+        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
@@ -2970,6 +3101,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
     return proc.pid
+
 
 
 # ---------------------------------------------------------------------------

@@ -68,7 +68,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS, judge_transport_block_kind
 
     # Goal text = title + body (the acceptance criteria the judge evaluates against).
     with _kbc.connect_closing() as conn:
@@ -98,13 +98,26 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
         with _kbc.connect_closing() as c:
             return _kb.goal_run_status(c, task_id, worker_run_id)
 
-    def _block(reason: str) -> None:
+    def _block(reason: str, *, kind=None) -> None:
         with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
+            if not _kb.block_task(c, task_id, reason=reason, kind=kind, expected_run_id=worker_run_id):
+                raise RuntimeError("goal block lost task/run ownership")
+
+    def _budget_block(reason: str, *, turns_used: int, last_response: str) -> None:
+        usage = {key: getattr(cli.agent, key, 0) or 0 for key in (
+            "session_input_tokens", "session_output_tokens", "session_cache_read_tokens",
+            "session_cache_write_tokens", "session_estimated_cost_usd")}
+        with _kbc.connect_closing() as c:
+            if not _kb.block_goal_budget(c, task_id, expected_run_id=worker_run_id,
+                    reason=reason, turns_used=turns_used, last_response=last_response,
+                    session_id=getattr(cli, "session_id", None), usage=usage):
+                raise RuntimeError("goal budget block lost task/run ownership")
 
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
         task_status_fn=_task_status, block_fn=_block,
+        judge_unavailable_fn=lambda reason: _block(reason, kind=judge_transport_block_kind(reason)),
+        budget_block_fn=_budget_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=log or (lambda m: logger.info("%s", m)),
     )

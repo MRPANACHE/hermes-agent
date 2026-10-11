@@ -292,12 +292,13 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         except StopAsyncIteration:
             self._persist_oauth_metadata_if_changed()  # metadata discovered lazily in the 401 branch
         finally:
-            if resource_lock_released:
-                # Balance the SDK's surrounding ``async with`` even when HTTPX cancels/closes the
-                # flow mid-request; shield only this local bookkeeping.
-                import anyio
-                with anyio.CancelScope(shield=True):
+            import anyio
+            # Close the SDK generator here, after balancing its context guard,
+            # so an aborted request cannot retain the OAuth semaphore until GC.
+            with anyio.CancelScope(shield=True):
+                if resource_lock_released:
                     await self.context.lock.acquire()
+                await inner.aclose()
         if retry_after_concurrent_auth:
             yield request
             self._persist_oauth_metadata_if_changed()

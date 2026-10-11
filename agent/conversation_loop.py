@@ -882,6 +882,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+    # Rebuild legacy prompts that imported the Codex-only worker policy into Hermes.
+    from agent.prompt_builder import _CODEX_LUNA_SECTION_BEGIN
+
+    if _CODEX_LUNA_SECTION_BEGIN in prompt:
+        return False
+
     # Model/provider identity, then cwd drift.  A cwd change is a real content change (context
     # files, the workspace snapshot and the coding posture are all resolved from it), so it
     # still rebuilds; the runtime surface does not (agent/surface_switch.py).

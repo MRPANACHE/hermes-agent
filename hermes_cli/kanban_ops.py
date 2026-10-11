@@ -95,7 +95,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _print_json({
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
-                         "reaped_terminal_workers")},
+                         "reaped_terminal_workers", "awakened")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
@@ -128,6 +128,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    print(f"Awakened:     {len(res.awakened)}")
+    if res.awakened:
+        print(f"  {', '.join(res.awakened)}")
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
@@ -155,6 +158,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
     return 0
+
 
 
 _DAEMON_DEPRECATED = (

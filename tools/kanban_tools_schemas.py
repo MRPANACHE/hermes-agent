@@ -31,14 +31,14 @@ def _board_schema_prop() -> dict[str, str]:
     return _prop("string", _DESC_BOARD)
 
 
-def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    """Build a tool schema; every kanban tool takes an optional trailing ``board``."""
+def _schema(name: str, description: str, properties: dict[str, Any], required: list[str], *, include_board: bool = True) -> dict[str, Any]:
+    """Build a tool schema, with an optional board for cross-board routing tools."""
     return {
         "name": name,
         "description": description,
         "parameters": {
             "type": "object",
-            "properties": {**properties, "board": _board_schema_prop()},
+            "properties": {**properties, **({"board": _board_schema_prop()} if include_board else {})},
             "required": required,
         },
     }
@@ -176,9 +176,10 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "``reason`` is shown to the human on the board. Repeated transient or "
+        "untyped blocks escalate to triage at the native recurrence limit; "
+        "needs_input and capability stay "
+        "blocked for owner resolution. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     {
@@ -202,24 +203,21 @@ KANBAN_BLOCK_SCHEMA = _schema(
     ["reason"],
 )
 
+
 KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
-    (
-        "Park your current task in the 'scheduled' state while it waits for "
-        "time or an external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
-    ),
+    "Pause your own dispatcher task for a timed external dependency. Record an explicit future "
+    "ISO timestamp with timezone and a reason. Ends this run; the dispatcher wakes the same "
+    "card when due, after its old worker exits and parents are satisfied.",
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
-        "reason": _prop("string", (
-            "Optional reason or machine-readable wake-up marker recorded on "
-            "the completed run and scheduled event."
-        )),
+        "wake_at": _prop("string", "Future ISO timestamp with explicit timezone, e.g. 2026-10-11T15:00:00+02:00"),
+        "reason": _prop("string", "Specific reason for the timed external dependency"),
     },
-    [],
+    ["wake_at", "reason"],
+    include_board=False,
 )
+
 
 
 KANBAN_REQUEST_REVIEW_SCHEMA = _schema(

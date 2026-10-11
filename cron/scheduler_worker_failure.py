@@ -41,6 +41,7 @@ def record_unknown_worker_outcome(
                 expected_fire_owner=owner,
                 # A ladder re-run's occurrence already counted toward repeat.
                 **({"ladder_rung": True} if is_retry_run(job) else {}),
+                **scheduler._recovery_mark_kwargs(job),
             )
     return True
 

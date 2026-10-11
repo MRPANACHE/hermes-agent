@@ -112,6 +112,7 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
+        recovered = _sched._run_admitted_scheduled_recoveries(adapters=adapters, loop=loop, verbose=verbose)
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
@@ -126,13 +127,13 @@ def _tick_admitted(
                 _sched.logger.info("%s - No jobs due", _sched._hermes_now().strftime('%H:%M:%S'))
             store_health.recheck_idle()
             _sched._sweep_mcp_orphans()
-            return 0
+            return recovered
 
         if store_health.dispatch_blocked(due_jobs):
             # Known-unwritable store, re-probed at most once a minute: every advance/claim would
             # fail, so skip them (the skip is recorded) and keep the tick's housekeeping alive.
             _sched._sweep_mcp_orphans()
-            return 0
+            return recovered
 
         if verbose:
             _sched.logger.info("%s - %s job(s) due", _sched._hermes_now().strftime('%H:%M:%S'), len(due_jobs))
@@ -143,7 +144,7 @@ def _tick_admitted(
         due_jobs = _advance_or_drop_recurring(_sched, due_jobs)
         if not due_jobs:
             _sched._sweep_mcp_orphans()
-            return 0
+            return recovered
 
         _max_workers = _sched._resolve_max_parallel_workers()
         if verbose:
@@ -176,9 +177,9 @@ def _tick_admitted(
                     _sched.logger.error("Cron job future failed: %s", exc)
                     _results.append(False)
             _sched._sweep_mcp_orphans()
-            return sum(_results)
+            return recovered + sum(_results)
 
         _sched._sweep_mcp_orphans_when_all_done(_all_futures)
-        return sum(_results)
+        return recovered + sum(_results)
     finally:
         _sched._release_tick_lock(lock_fd)

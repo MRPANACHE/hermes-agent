@@ -16,7 +16,7 @@ import shlex
 import sys
 import threading
 import time
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import closing, contextmanager, nullcontext, suppress
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -195,7 +195,34 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + self._active_kanban_work_count()
         )
+
+    def _active_kanban_work_count(self) -> int:
+        return self._active_kanban_dispatch_count() + self._active_kanban_worker_count()
+
+    def _active_kanban_dispatch_count(self) -> int:
+        return max(0, int(getattr(self, "_kanban_dispatch_active_count", 0)))
+
+    @staticmethod
+    def _active_kanban_worker_count() -> int:
+        """Count native running cards; an unreadable board remains busy during maintenance."""
+        import sqlite3
+        from hermes_cli import kanban_db as kb
+
+        try:
+            boards = kb.list_boards(include_archived=False)
+            paths = {kb.kanban_db_path(board=board["slug"]).resolve() for board in boards}
+            count = 0
+            for path in paths:
+                if not path.exists():
+                    continue
+                with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as conn:
+                    count += conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+            return count
+        except Exception:
+            logger.warning("Cannot read Kanban work count; keeping gateway busy", exc_info=True)
+            return 1
 
     @staticmethod
     def _running_cron_job_count() -> int:
@@ -799,10 +826,11 @@ class GatewayShutdownMixin:
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred, kanban)`` — sources the drain waits on."""
         return (
             self._running_agent_count(), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            self._active_kanban_work_count(),
         )
 
     async def _drain_active_agents(
@@ -822,9 +850,9 @@ class GatewayShutdownMixin:
                 last_counts, last_status_at = counts, now
 
         # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
-        _cron0, _api0, _deferred0 = last_counts[1:]
+        _cron0, _api0, _deferred0, _kanban0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not self._running_agents and not (_cron0 or _api0 or _deferred0 or _kanban0):
             return snapshot, False
         # Cron and api_server runs ride the cron floor: a chat turn is announced+resumable, but a killed
         # cron run is a permanent failure and a killed /v1 run fails a caller blocked on its result.
@@ -835,8 +863,8 @@ class GatewayShutdownMixin:
 
         def _still_draining() -> bool:
             now = loop.time()
-            agents, cron, api, deferred = self._drain_work_counts()
-            return bool(((agents or deferred) and now < deadline) or ((cron or api) and now < cron_deadline))
+            agents, cron, api, deferred, kanban = self._drain_work_counts()
+            return bool(((agents or deferred or kanban) and now < deadline) or ((cron or api) and now < cron_deadline))
 
         # Both budgets at 0 = an expired deadline (loop unentered), so timed_out still comes from real state.
         while _still_draining():

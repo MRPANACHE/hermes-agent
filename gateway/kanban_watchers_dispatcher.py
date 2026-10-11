@@ -173,7 +173,7 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
-    def tick_once_for_board(self, slug: str) -> Optional[object]:
+    def tick_once_for_board(self, slug: str, *, admit_new: bool = True) -> Optional[object]:
         """Run one dispatch_once for a specific board.
 
         The per-board DB is opened explicitly so boards never share a
@@ -193,7 +193,7 @@ class _KanbanDispatcher:
             from hermes_cli import kanban_db as _kb
             with _kb.pin_first_board_resolution():
                 conn = _kbc().connect(board=slug)
-                return _kbd().dispatch_once(conn, board=slug, **kwargs)
+                return _kbd().dispatch_once(conn, board=slug, admit_new=admit_new, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -213,9 +213,9 @@ class _KanbanDispatcher:
                 with contextlib.suppress(Exception):
                     conn.close()
 
-    def tick_once(self) -> list[tuple[str, Optional[object]]]:
+    def tick_once(self, *, admit_new: bool = True) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        return [(slug, self.tick_once_for_board(slug, admit_new=admit_new)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?

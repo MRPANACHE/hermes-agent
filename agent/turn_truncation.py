@@ -584,6 +584,15 @@ def continue_codex_incomplete(
 
     agent._codex_incomplete_retries += 1
     n = agent._codex_incomplete_retries
+    incomplete_details = getattr(response, "incomplete_details", None)
+    incomplete_reason = (
+        incomplete_details.get("reason") if isinstance(incomplete_details, dict)
+        else getattr(incomplete_details, "reason", None)
+    )
+    logger.info(
+        "%sCodex response incomplete (response.status=%s, incomplete_details.reason=%s, continuation=%d/3)",
+        agent.log_prefix, getattr(response, "status", None) or "unknown", incomplete_reason or "unspecified", n,
+    )
 
     interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
     interim_has_content = bool((interim_msg.get("content") or "").strip())

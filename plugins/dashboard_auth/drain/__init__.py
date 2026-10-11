@@ -11,58 +11,32 @@ from __future__ import annotations
 
 import hmac
 import logging
-import math
 import os
-from collections import Counter
 from typing import Optional
 
-from hermes_cli.dashboard_auth import DashboardAuthProvider, Session, TokenPrincipal
-from plugins.dashboard_auth._shared import NonInteractiveMixin, SkipRegistration, load_config_section, register_provider
+from hermes_cli.dashboard_auth import (
+    DashboardAuthProvider,
+    Session,
+    TokenPrincipal,
+)
+from hermes_cli.dashboard_auth.secret_strength import (
+    _DEFAULT_MIN_SECRET_CHARS,
+    _MIN_DISTINCT_CHARS,
+    _MIN_SHANNON_BITS,
+    _shannon_bits,
+    assess_secret_strength,
+)
+from plugins.dashboard_auth._shared import NonInteractiveMixin, SkipRegistration, load_config_section
 
 logger = logging.getLogger(__name__)
 _TAG = "dashboard-auth-drain"
 
-# token_urlsafe(32) produces exactly 43 chars, so a correctly-provisioned
-# secret clears the default bar exactly.
-_DEFAULT_MIN_SECRET_CHARS = 43
-# Rejects degenerate values like "aaaa..." that are long but trivially low-entropy.
-_MIN_DISTINCT_CHARS = 16
-# Distribution-aware second guard on top of length + distinct-count.
-_MIN_SHANNON_BITS = 128.0
-
-# Kept here (not imported from web_server) to avoid a heavy import at plugin load.
+# The path the begin/cancel-drain endpoint lives on. Registered as a
+# token-authable route by ``register()`` so the generic seam guards it. Kept
+# here (not imported from web_server) to avoid a heavy import at plugin load.
 DRAIN_ROUTE_PATH = "/api/gateway/drain"
 
 LAST_SKIP_REASON: str = ""
-
-
-def _shannon_bits(value: str) -> float:
-    """Total Shannon entropy (bits) of ``value`` over its character distribution."""
-    if not value:
-        return 0.0
-    n = len(value)
-    per_char = -sum((c / n) * math.log2(c / n) for c in Counter(value).values())
-    return per_char * n
-
-
-def assess_secret_strength(secret: str, *, min_chars: int = _DEFAULT_MIN_SECRET_CHARS) -> Optional[str]:
-    """Human-readable rejection reason if ``secret`` is too weak, else ``None``. Checks, in
-    order: length >= ``min_chars``, distinct chars >= ``_MIN_DISTINCT_CHARS``, Shannon
-    entropy >= ``_MIN_SHANNON_BITS``."""
-    if not secret:
-        return "secret is empty"
-    if len(secret) < min_chars:
-        return (
-            f"secret too short: {len(secret)} chars (need >= {min_chars}; "
-            "use a >=256-bit value, e.g. `python -c \"import secrets; "
-            "print(secrets.token_urlsafe(32))\"`)")
-    distinct = len(set(secret))
-    if distinct < _MIN_DISTINCT_CHARS:
-        return f"secret has only {distinct} distinct characters (need >= {_MIN_DISTINCT_CHARS}); looks structured/low-entropy"
-    bits = _shannon_bits(secret)
-    if bits < _MIN_SHANNON_BITS:
-        return f"secret entropy too low: {bits:.0f} bits (need >= {_MIN_SHANNON_BITS:.0f}); looks structured/repeated"
-    return None
 
 
 class DrainSecretProvider(NonInteractiveMixin, DashboardAuthProvider):
@@ -141,17 +115,40 @@ def register(ctx) -> None:
     success also registers the drain route as token-authable via the generic seam."""
     global LAST_SKIP_REASON
     LAST_SKIP_REASON = ""
-    kwargs, LAST_SKIP_REASON = register_provider(ctx, logger, _TAG, DrainSecretProvider, _settings)
-    if kwargs is None:
+    try:
+        kwargs = _settings()
+        provider = DrainSecretProvider(**kwargs)
+    except SkipRegistration as skip:
+        LAST_SKIP_REASON = skip.reason
+        getattr(logger, skip.level)("%s: %s", _TAG, LAST_SKIP_REASON)
         return
-    # Opt the drain endpoint into the token-auth seam so the interactive cookie gate
-    # doesn't bounce NAS's bearer call.
+    except ValueError as exc:
+        LAST_SKIP_REASON = f"DrainSecretProvider construction failed: {exc}"
+        logger.warning("dashboard-auth-drain: %s", LAST_SKIP_REASON)
+        return
+
+    # Opt the begin/cancel-drain endpoint into the generic token-auth seam so
+    # the dashboard's interactive cookie gate doesn't bounce NAS's bearer call.
     try:
         from hermes_cli.dashboard_auth.token_auth import register_token_route
 
-        register_token_route(DRAIN_ROUTE_PATH)
-    except Exception as exc:  # noqa: BLE001 — seam import must not crash plugin load
-        logger.warning("dashboard-auth-drain: could not register token route %s: %s", DRAIN_ROUTE_PATH, exc)
+        register_token_route(
+            DRAIN_ROUTE_PATH,
+            methods=("POST",),
+            required_scope=kwargs["scope"],
+        )
+    except (ImportError, TypeError, ValueError) as exc:
+        LAST_SKIP_REASON = (
+            f"Drain token-route registration failed: {exc}; provider remains "
+            "disabled."
+        )
+        logger.warning(
+            "dashboard-auth-drain: %s", LAST_SKIP_REASON,
+        )
+        return
+
+    ctx.register_dashboard_auth_provider(provider)
+
     logger.info(
         "dashboard-auth-drain: registered drain service-credential provider (scope=%s, route=%s)",
         kwargs["scope"], DRAIN_ROUTE_PATH)

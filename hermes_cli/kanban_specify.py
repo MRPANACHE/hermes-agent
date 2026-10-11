@@ -199,6 +199,8 @@ def specify_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+    if task.block_kind in kb.INPUT_BLOCK_KINDS:
+        return SpecifyOutcome(task_id, False, "input/capability blocker requires owner resolution")
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
@@ -234,8 +236,9 @@ def specify_task(
     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
 
 
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Task ids in the triage column; ``tenant`` narrows the sweep."""
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+    return [t.id for t in tasks if t.block_kind not in kb.INPUT_BLOCK_KINDS]

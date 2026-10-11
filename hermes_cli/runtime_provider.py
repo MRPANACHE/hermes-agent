@@ -1066,6 +1066,15 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
         yield _local_endpoint_bypass(requested_provider, explicit_api_key, explicit_base_url)
     provider = resolve_provider(requested_provider, explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url)
     model_cfg = _get_model_config()
+    # The opted-in Codex subprocess owns authentication; keep Hermes from resolving a duplicate
+    # OAuth store merely to construct its unused OpenAI client.
+    if provider == "openai-codex" and _maybe_apply_codex_app_server_runtime(
+        provider=provider, api_mode="codex_responses", model_cfg=model_cfg
+    ) == "codex_app_server":
+        yield _runtime(
+            provider, "codex_app_server", (explicit_base_url or DEFAULT_CODEX_BASE_URL).rstrip("/"),
+            "no-key-required", source="codex-cli", requested_provider=requested_provider
+        )
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
                                     target_model=target_model)

@@ -107,7 +107,8 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "turn_budget"}
+
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -895,8 +896,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
+    -- BLOCK_RECURRENCE_LIMIT generic/transient blocks route to ``triage``;
+    -- input/capability blocks stay ``blocked``. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
@@ -1006,6 +1007,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+
 
 
 # --- ID generation ---
@@ -1240,6 +1242,9 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    # Empty / whitespace-only keys mean "no idempotency". Store them as NULL
+    # so repeated keyless creates remain independent under the partial index.
+    idempotency_key = _canonical_idempotency_key(idempotency_key)
 
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
@@ -1251,9 +1256,9 @@ def create_task(
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            f"SELECT id FROM tasks WHERE {_IDEMPOTENCY_KEY_SQL_EXPR} = ? "
             "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
             return row["id"]
@@ -1349,10 +1354,33 @@ def create_task(
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            error_text = str(exc)
+            idempotency_conflict = (
+                "UNIQUE constraint failed: index 'idx_tasks_idempotency'"
+                in error_text
+            )
+            if idempotency_conflict:
+                # The UNIQUE partial index rejected this insert because a
+                # concurrent writer committed the same active key. The failed
+                # write transaction has rolled back, so this read sees the
+                # committed winner and preserves the create_task API.
+                winner = conn.execute(
+                    f"SELECT id FROM tasks WHERE {_IDEMPOTENCY_KEY_SQL_EXPR} = ? "
+                    "AND status != 'archived' "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if winner is not None:
+                    return winner["id"]
+            elif "UNIQUE constraint failed: tasks.id" not in error_text:
+                # Do not turn unrelated constraint failures into retries or
+                # incorrectly return an existing task for the same key.
+                raise
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
+
 
 
 def _board_meta_for(board: Optional[str]) -> dict:
@@ -2047,7 +2075,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'unblocked', 'scheduled', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
@@ -2056,6 +2084,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         if payload.get(key) == "review":
             return "review"
     return "ready"
+
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
@@ -2206,6 +2235,21 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        budget = conn.execute("SELECT id FROM task_events WHERE task_id=? "
+                              "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        if budget and not conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                       "AND kind='claimed' AND id>?", (task_id, budget["id"])).fetchone():
+            if not goal_budget_admitted(conn, task_id):
+                return None
+        admission = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                                 "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        if admission:
+            typed = _json_dict(admission["payload"])
+            if "ready_admission" in typed:
+                consumed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                        "AND kind='claimed' AND id>? LIMIT 1", (task_id, admission["id"])).fetchone()
+                if not consumed and (not ready_resume_admitted(conn, task_id) or check_respawn_guard(conn, task_id)):
+                    return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2226,6 +2270,7 @@ def claim_task(
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
+
 
 
 def claim_review_task(
@@ -2280,6 +2325,7 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "changes_requested": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",
+    "scheduled": "scheduled",
 }
 
 
@@ -2311,6 +2357,7 @@ def goal_run_status(
         if event and event["kind"] == "changes_requested":
             return "changes_requested"
     return task.status
+
 
 
 def heartbeat_claim(
@@ -2700,10 +2747,17 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, goal_mode, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        if (trow and trow["goal_mode"] and isinstance(metadata, dict)
+                and any(metadata.get(key) is False for key in ("objective_complete", "goal_complete"))):
+            raise ValueError(
+                "current task objective explicitly incomplete; continue the same "
+                "task/run within its mandate and turn budget, or report a genuine "
+                "external blocker through the existing block/review route"
+            )
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
@@ -2760,6 +2814,7 @@ def complete_task(
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
     return True
+
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
@@ -3143,6 +3198,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None, allow_nested: bool = False,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3160,7 +3216,7 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3222,9 +3278,11 @@ def block_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="blocked", status="blocked", summary=reason, metadata=metadata, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        if event_kind == "block_loop_detected" and new_status == "blocked":
+            _append_event(conn, task_id, "blocked", {**payload, "loop_detected": True}, run_id=run_id)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
@@ -3232,6 +3290,7 @@ def block_task(
             return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
+
 
 
 def _route_block(
@@ -3259,7 +3318,9 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        target = "blocked" if kind in INPUT_BLOCK_KINDS or kind == "turn_budget" else "triage"
+        payload["target_status"] = target
+        return target, "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3576,14 +3637,46 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_nested: bool = False,
+) -> bool:
+    """Transition ``blocked``/``scheduled`` to its safe resumable phase.
+
+    Defensively closes any stale ``current_run_id`` pointer before flipping
+    status. In the common path (``block_task`` closed the run already) this
+    is a no-op. If a future or external write left the pointer dangling,
+    the leaked run is closed as ``reclaimed`` inside the same txn so the
+    runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
+    state) holds for the rest of this function's lifetime.
+
+    ``allow_nested`` is deliberately false by default, preserving the
+    write_txn nesting guard for ordinary callers. Adapter code that must
+    atomically compose an existing idempotency receipt/comment with the
+    native unblock can opt in and inherit savepoint semantics from
+    :func:`write_txn`; the inner release is not durable until the outer
+    transaction commits.
+    """
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
+        task = get_task(conn, task_id)
+        budget_binding = None
+        if task and task.status == "blocked":
+            if task.block_kind == "turn_budget":
+                budget_binding = goal_budget_binding(conn, task_id)
+            elif task.block_kind is None:
+                runs = list_runs(conn, task_id)
+                if runs and (runs[-1].summary or "").startswith("Goal-mode worker exhausted its turn budget ("):
+                    budget_binding = goal_budget_binding(conn, task_id)
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if current and current["status"] in ("blocked", "scheduled")
             else "ready"
         )
         _reclaim_dangling_run(
@@ -3597,15 +3690,21 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # NOTE: deliberately does NOT touch ``block_recurrences`` or
+        # ``block_kind``. Resetting the recurrence counter on unblock is exactly
+        # the amnesia that let a cron unblock → worker re-block loop run
+        # unbounded (Dale's report). The counter survives the unblock so that a
+        # subsequent same-cause ``block_task`` can detect the loop. Input/access
+        # blocks stay blocked; generic/transient blocks route to triage. Reset
+        # only on successful completion (see ``complete_task``). ``consecutive_failures``
+        # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
+        # still reset here, which is correct: a deliberate unblock is a fresh
+        # start for the dispatcher's retry budget.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "UPDATE tasks SET status = ?, current_run_id = NULL"
+            + (" " if budget_binding else ", consecutive_failures = 0, last_failure_error = NULL ")
+            + "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -3617,16 +3716,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
+        if budget_binding:
+            _append_event(conn, task_id, "budget_continued", budget_binding)
         return True
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+
+def reopen_review_task(conn: sqlite3.Connection, task_id: str, *, allow_nested: bool = False) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
     not a block; only :func:`complete_task` clears them)."""
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -3654,6 +3756,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
         return True
+
 
 
 def invalidate_descendants_for_parent_reopen(
@@ -3764,10 +3867,13 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, block_kind FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # Old loop escalation cards are still access/input blocks, not new work.
+        if existing["block_kind"] in INPUT_BLOCK_KINDS:
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -3806,6 +3912,7 @@ def specify_triage_task(
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
     return True
+
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
@@ -3885,12 +3992,42 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def schedule_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[str] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park a task in ``scheduled`` so it is waiting on time, not human input.
+
+    An explicit timezone-aware ``wake_at`` is durably recorded on the native
+    event. The existing dispatcher resumes it once due, with parent gating.
+    Without a timestamp, the legacy manual ``unblock_task`` behavior remains.
+    """
+    wake_timestamp = parse_schedule_time(wake_at) if wake_at is not None else None
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        resume_status = (
+            "review" if current["status"] == "review"
+            else _retry_status_for_run(conn, task_id) if current["status"] == "running"
+            else _resume_status_from_events(conn, task_id)
+        )
+        previous = None
+        previous_payload = {}
+        if current["status"] == "scheduled":
+            previous = conn.execute(
+                "SELECT run_id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'scheduled' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if previous and previous["payload"]:
+                previous_payload = json.loads(previous["payload"])
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -3899,18 +4036,41 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review', 'scheduled')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params.append(int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
             return False
-        run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+        run_id = _end_run(
+            conn, task_id,
+            outcome="scheduled", status="scheduled",
+            summary=reason,
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        if run_id is None and previous is not None:
+            run_id = previous["run_id"]
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="scheduled",
+                summary=reason,
+            )
+        payload = {"reason": reason}
+        if wake_timestamp is not None:
+            payload["wake_at"] = wake_timestamp
+        if resume_status == "review":
+            payload["resume_status"] = resume_status
+        # The worker may schedule its card before its process exits. Keep the
+        # old PID on the receipt so a due tick cannot spawn beside that worker.
+        if current["worker_pid"] is not None:
+            payload["worker_pid"] = current["worker_pid"]
+        elif isinstance(previous_payload, dict) and previous_payload.get("worker_pid") is not None:
+            payload["worker_pid"] = previous_payload["worker_pid"]
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
+
 
 
 # --- Worker context builder (what a spawned worker sees) ---
@@ -3933,6 +4093,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
+
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -4036,6 +4197,12 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
             lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
+        checkpoint = (run.metadata or {}).get("goal_budget")
+        if checkpoint:
+            lines.append("Retained goal-loop response:")
+            lines.append(_ctx_cap(checkpoint.get("last_response", ""), _CTX_MAX_BODY_BYTES))
+            lines.append(f"Goal turns in this attempt: {checkpoint['turns_used']}; "
+                         f"continuation chain starts at run {checkpoint['chain_start_run']}.")
         meta_line = _ctx_metadata_line(run.metadata)
         if meta_line:
             lines.append(meta_line)
@@ -4426,6 +4593,8 @@ from hermes_cli.kanban_db_boards import (  # noqa: E402
 )
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
+    connect,
+    connect_closing,
     init_db,
     write_txn,
 )
@@ -4439,6 +4608,10 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
+    dispatch_once,
+    check_respawn_guard,
+    enforce_max_runtime,
+    _default_spawn,
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
@@ -4447,4 +4620,42 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+
+
+INPUT_BLOCK_KINDS = {"needs_input", "capability"}
+
+
+_IDEMPOTENCY_KEY_WHITESPACE = " \t\n\r\v\f"
+
+
+_IDEMPOTENCY_KEY_SQL_EXPR = (
+    "TRIM(idempotency_key, char(9) || char(10) || char(11) || "
+    "char(12) || char(13) || ' ')"
+)
+
+
+_WORKER_COMPLETION_MODE_ENV = "HERMES_KANBAN_WORKER_COMPLETION_MODE"
+
+
+_WORKER_COMPLETION_MODES = frozenset({"exit_code", "self_reported"})
+
+
+
+from hermes_cli.kanban_db_continuation import (
+    _dedupe_active_idempotency_keys,
+    _canonical_idempotency_key,
+    _budget_assignment,
+    goal_budget_history,
+    block_goal_budget,
+    goal_budget_binding,
+    goal_budget_admitted,
+    parse_schedule_time,
+    wake_scheduled_tasks,
+    ready_resume_binding,
+    ready_resume_admitted,
+    _initial_parent_pr_reference,
+    WorkerCommandConfig,
+    _resolve_worker_config,
+    _resolve_worker_command,
 )

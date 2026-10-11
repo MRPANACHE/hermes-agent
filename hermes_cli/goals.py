@@ -899,6 +899,7 @@ def judge_goal(
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    exact_goal: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -924,7 +925,7 @@ def judge_goal(
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=goal if exact_goal else _truncate(goal, 2000),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
@@ -950,12 +951,25 @@ def judge_goal(
         return "continue", f"goal_judge auxiliary client unavailable: {exc}", False, None, True
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, None, True
+        # Retain bounded machine fields, never arbitrary provider messages or
+        # headers, so an infrastructure refusal does not become a generic 500.
+        reason = f"judge error: {type(exc).__name__}"
+        status = getattr(exc, "status_code", None)
+        body = getattr(exc, "body", None)
+        error = body.get("error", body) if isinstance(body, dict) else {}
+        code = error.get("code") if isinstance(error, dict) else None
+        if type(status) is int:
+            reason += f" (HTTP {status}"
+            if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", code):
+                reason += f", code={code}"
+            reason += ")"
+        return "continue", reason, False, None, True
 
     verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
     logger.info("goal judge: verdict=%s reason=%s%s", verdict, _truncate(reason, 120),
                 f" wait={wait_directive}" if wait_directive else "")
     return verdict, reason, parse_failed, wait_directive, False
+
 
 
 def count_active_delegations(session_id: Optional[str]) -> int:
@@ -1614,6 +1628,7 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 # Worker-driven terminal task statuses → loop outcome. The card's own acceptance criteria are the
 # goal; the worker already has the full task body, so these outcomes stop the loop cleanly.
 _KANBAN_TERMINAL_STATUSES = {
+    "scheduled": ("scheduled_by_worker", "worker scheduled the task", "task {task_id} scheduled by worker after {turns} turn(s)"),
     "done": ("completed_by_worker", "worker completed the task", "task {task_id} completed by worker after {turns} turn(s)"),
     "blocked": ("blocked_by_worker", "worker blocked the task", "task {task_id} blocked by worker after {turns} turn(s)"),
     # kanban_request_review is a legitimate terminator: implementation done, awaiting a reviewer.
@@ -1632,6 +1647,8 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    judge_unavailable_fn=None,
+    budget_block_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1685,13 +1702,22 @@ def run_kanban_goal_loop(
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
         try:
-            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response, exact_goal=True)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
         if _transport_failed:
-            _log(f"kanban goal loop: judge transport failed on turn {turns_used}; stopping")
-            return _result("stopped", "judge transport failure")
+            _log(f"kanban goal loop: judge unavailable on turn {turns_used}; retaining goal and work")
+            unavailable_reason = (
+                "Goal judge unavailable; work and original goal retained. "
+                "Resume through existing owner route after provider recovery. " + reason
+            )
+            try:
+                (judge_unavailable_fn or block_fn)(unavailable_reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: could not retain judge block ({exc}); stopping")
+                return _result("stopped", "judge unavailable block failed")
+            return _result("blocked_judge_unavailable", unavailable_reason)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -1712,7 +1738,7 @@ def run_kanban_goal_loop(
                     f"Goal-mode worker's output looked complete but it never "
                     f"called kanban_complete after a finalize nudge ({reason})."
                 )
-                return _result("blocked_budget", "judged done, never finalized")
+                return _result("blocked_by_worker", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -1721,11 +1747,19 @@ def run_kanban_goal_loop(
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            _block(
+            budget_reason = (
                 f"Goal-mode worker exhausted its turn budget "
                 f"({turns_used}/{max_turns}) without completing the task. "
                 f"Last judge verdict: {_truncate(reason, 300)}"
             )
+            try:
+                if budget_block_fn is not None:
+                    budget_block_fn(budget_reason, turns_used=turns_used, last_response=last_response)
+                else:
+                    _block(budget_reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: budget block failed ({exc}); stopping")
+                return _result("stopped", "budget block failed")
             return _result("blocked_budget", "turn budget exhausted")
 
         try:
@@ -1748,6 +1782,7 @@ def run_kanban_goal_loop(
         turns_used += 1
 
 
+
 __all__ = [
     "GoalState", "GoalContract", "GoalGate", "GoalManager", "parse_contract", "draft_contract", "run_gate",
     "CONTINUATION_PROMPT_TEMPLATE", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
@@ -1757,3 +1792,12 @@ __all__ = [
     "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
     "run_kanban_goal_loop",
 ]
+
+
+def judge_transport_block_kind(reason: str) -> str:
+    """Do not label permanent credential/request failures as transient."""
+    if re.search(r"\(HTTP (?:408|409|429|5\d\d)(?:,|\))", reason):
+        return "transient"
+    if reason in ("judge error: APIConnectionError", "judge error: APITimeoutError"):
+        return "transient"
+    return "capability"

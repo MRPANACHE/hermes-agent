@@ -270,6 +270,8 @@ KANBAN_GUIDANCE = (
     "`$HERMES_KANBAN_TASK`; your workspace is `$HERMES_KANBAN_WORKSPACE`. The `kanban_*` tools in your schema are your "
     "primary coordination surface — they write directly to the shared SQLite DB and work regardless of terminal "
     "backend (local/docker/modal/ssh).\n"
+    "Notes/summaries start `Status: <Dutch, max 100 chars>`; block reasons "
+    "`Blokkade: <specific Dutch reason, max 100 chars>`. Record at start/change/end; proof in metadata.\n"
     "\n"
     "## Lifecycle\n\n"
     "1. **Orient.** Call `kanban_show()` first (no args — it defaults to your task). The response includes title, "
@@ -283,9 +285,11 @@ KANBAN_GUIDANCE = (
     "`kanban.dispatch_stale_timeout_seconds` (default 4 hours) when no heartbeat has arrived in the last hour. A "
     "reclaim re-queues the task as `ready` without penalty (no failure counter tick), but you lose your current run's "
     "progress.\n"
-    "4. **Block on genuine ambiguity.** If you need a human decision you cannot infer (missing credentials, UX choice, "
-    "paywalled source, peer output you need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. The "
-    "user will unblock with context and the dispatcher will respawn you.\n"
+    "4. **Route the actual blocker.** Use `kanban_block(kind=\"needs_input\", reason=...)` for a decision or input "
+    "you cannot infer, `kind=\"capability\"` for missing credentials/access, and `kind=\"dependency\"` only for "
+    "an unfinished parent task. For a timed external dependency use `kanban_schedule(wake_at=<future ISO timestamp "
+    "with timezone>, reason=...)`; the dispatcher resumes this same card when due. Do not invent a wake time. "
+    "Keep input/capability blockers blocked until the owning human or agent supplies the missing prerequisite.\n"
     "5. **Finish with the review model encoded by the task graph.** Always include the structured handoff (`summary`, "
     "`metadata`) on the lifecycle transition itself; never put secrets, tokens, or raw PII in these durable fields. If "
     "`kanban_show()` lists child IDs, inspect those cards with `kanban_show(task_id=...)` before choosing the terminal "
@@ -338,12 +342,13 @@ KANBAN_GUIDANCE = (
     "- Do not complete a task you didn't actually finish. Block it.\n"
     "- Do not call `clarify` to ask questions. You are running headless — there is no live user to answer. The call "
     "will time out and the task will sit silently in `running` with no signal to the operator. Instead: "
-    "`kanban_comment` the context, then `kanban_block(reason=...)` so the task surfaces on the board as needing "
+    "`kanban_comment` the context, then `kanban_block(kind=\"needs_input\", reason=...)` so the task surfaces on the board as needing "
     "input.\n"
     "- Do not assign follow-up work to yourself. Assign it to the right specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is for short reasoning subtasks inside your "
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
+
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
@@ -1819,6 +1824,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     sections: list[str] = []
     seen_content: set = set()
     for label, candidate, content in _agents_md_candidates(cwd_path):
+        content = _strip_codex_only_delegation_sections(content, label)
         if content and content not in seen_content:  # else: empty, or an identical copy along the chain
             seen_content.add(content)
             sections.append(_context_section(content, label, label, candidate, context_length))
@@ -1829,12 +1835,15 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
                              read_path=str(cwd_path.resolve() / "AGENTS.md"))
 
 
+
 def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name, path, content in _claude_md_candidates(cwd_path):
+        content = _strip_codex_only_delegation_sections(content, name)
         if content:
             return _context_section(content, name, "CLAUDE.md", path, context_length)
     return ""
+
 
 
 def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
@@ -1876,3 +1885,36 @@ def build_context_files_prompt(
         return ""
     return ("# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n"
             + "\n".join(sections))
+
+
+_CODEX_LUNA_SECTION_BEGIN = "<!-- BEGIN CODEX LUNA SUBSCRIPTION DELEGATION -->"
+
+
+_CODEX_LUNA_SECTION_END = "<!-- END CODEX LUNA SUBSCRIPTION DELEGATION -->"
+
+
+def _strip_codex_only_delegation_sections(content: str, filename: str) -> str:
+    """Remove Codex/Claude-only delegation policy from Hermes context.
+
+    Shared ``AGENTS.md`` and ``CLAUDE.md`` files are also consumed directly by
+    Codex and Claude, so their subscription-delegation policy must remain on
+    disk. Hermes has native ``delegate_task`` children and must never receive
+    that foreign runtime policy in its effective prompt. An unclosed marker is
+    removed through EOF so a malformed edit fails closed instead of leaking
+    the conflicting rule back into Hermes.
+    """
+    while _CODEX_LUNA_SECTION_BEGIN in content:
+        start = content.index(_CODEX_LUNA_SECTION_BEGIN)
+        end = content.find(_CODEX_LUNA_SECTION_END, start)
+        if end < 0:
+            logger.warning(
+                "Unclosed Codex-only delegation section in %s; stripping through EOF",
+                filename,
+            )
+            content = content[:start]
+            break
+        end += len(_CODEX_LUNA_SECTION_END)
+        before = content[:start].rstrip()
+        after = content[end:].lstrip()
+        content = "\n\n".join(part for part in (before, after) if part)
+    return content.strip()

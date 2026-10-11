@@ -533,6 +533,15 @@ class BuzzAdapter(BasePlatformAdapter):
         # Channel messages must @mention the agent unless disabled; DMs always dispatch.
         _rm_cfg = _setting_or("BUZZ_REQUIRE_MENTION", extra, "require_mention", True)
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
+        self.free_response_channels = {
+            str(channel).strip()
+            for channel in _split_csv(extra.get("free_response_channels", []) or [])
+            if str(channel).strip()
+        }
+        # Autonomous profiles can resume interrupted work without a human prompt.
+        self.interactive_resume = str(extra.get("interactive_resume", True)).strip().lower() not in (
+            "false", "0", "no", "off"
+        )
         self._reply_to_mode: str = _reply_to_mode(config, extra)
         # Inbound transport: "auto" (WebSocket with poll fallback), "websocket" (required), "poll".
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
@@ -708,6 +717,134 @@ class BuzzAdapter(BasePlatformAdapter):
         self._poll_task = None
         self._channel_state = {}
         self._poll_count = 0
+
+    # ── Secret-safe event evidence reads ─────────────────────────────────
+
+    def _event_secret_values(self) -> tuple:
+        """Return configured secret material and opaque auth payload values."""
+        auth_tag = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "")
+        secrets = [self._private_key, self._auth_tag, auth_tag]
+        def collect(value: Any) -> None:
+            if isinstance(value, str) and len(value) >= 16:
+                secrets.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        for raw_auth in (self._auth_tag, auth_tag):
+            try:
+                parsed_auth = json.loads(raw_auth) if raw_auth else None
+            except ValueError:
+                continue
+            collect(parsed_auth)
+        return tuple(secret for secret in secrets if secret)
+
+    def _redact_event_value(self, value: Any) -> Any:
+        """Remove configured Buzz secrets from a returned event value."""
+        if isinstance(value, str):
+            redacted = value
+            for secret in self._event_secret_values():
+                redacted = redacted.replace(secret, "<redacted>")
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_event_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): self._redact_event_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _sanitize_event_tags(self, tags: list) -> list:
+        """Preserve native non-secret tags while omitting owner auth tags."""
+        sanitized = []
+        for tag in tags:
+            if isinstance(tag, (list, tuple)) and tag and tag[0] == "auth":
+                continue
+            native_tag = list(tag) if isinstance(tag, tuple) else tag
+            sanitized.append(self._redact_event_value(native_tag))
+        return sanitized
+
+    async def read_event(self, channel_id: str, event_id: str) -> Dict[str, Any]:
+        """Read one exact event from a watched channel without exposing auth.
+
+        The Buzz CLI credential remains inside ``_run_cli``'s subprocess
+        environment. Only the allow-listed native evidence envelope is
+        returned; signatures and owner auth-tag payloads are never surfaced.
+        """
+        channel = str(channel_id or "").strip()
+        event = str(event_id or "").strip().lower()
+        if channel not in self._channel_state:
+            return {"error": "channel_not_watched", "channel": channel}
+        if not re.fullmatch(r"[0-9a-f]{64}", event):
+            return {"error": "invalid_event_id", "channel": channel}
+
+        code, out, _err = await self._run_cli(
+            [
+                "messages",
+                "thread",
+                "--channel",
+                channel,
+                "--event",
+                event,
+                "--limit",
+                "100",
+            ]
+        )
+        if code != 0:
+            return {
+                "error": "event_read_failed",
+                "id": event,
+                "channel": channel,
+                "code": code,
+            }
+        try:
+            payload = json.loads(out or "[]")
+        except ValueError:
+            payload = None
+        if not isinstance(payload, list):
+            return {"error": "invalid_event_response", "id": event, "channel": channel}
+
+        matches = [
+            item
+            for item in payload
+            if isinstance(item, dict) and item.get("id") == event
+        ]
+        if len(matches) != 1:
+            return {"error": "event_not_found", "id": event, "channel": channel}
+        native = matches[0]
+        tags = native.get("tags")
+        if not isinstance(tags, list):
+            return {"error": "invalid_event_response", "id": event, "channel": channel}
+        if not any(
+            isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "h"
+            and str(tag[1]) == channel
+            for tag in tags
+        ):
+            return {"error": "event_channel_mismatch", "id": event, "channel": channel}
+
+        pubkey = native.get("pubkey")
+        kind = native.get("kind")
+        content = native.get("content")
+        if (
+            not isinstance(pubkey, str)
+            or not isinstance(kind, int)
+            or not isinstance(content, str)
+        ):
+            return {"error": "invalid_event_response", "id": event, "channel": channel}
+        return {
+            "id": event,
+            "pubkey": self._redact_event_value(pubkey),
+            "kind": kind,
+            "tags": self._sanitize_event_tags(tags),
+            "content": self._redact_event_value(content),
+            "channel": channel,
+        }
 
     # ── Sending ───────────────────────────────────────────────────────────
 
@@ -930,10 +1067,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
         See #74999.
         """
-        local = Path(image_path).expanduser()
-        if local.is_file():
-            return await self._send_file_attachment(chat_id, local, caption=caption, reply_to=reply_to, metadata=metadata, probe=False)
-        return await super().send_image_file(chat_id=chat_id, image_path=image_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs)
+        safe_path = self.validate_media_delivery_path(image_path)
+        if safe_path is None or not Path(safe_path).is_file():
+            return SendResult(success=False, error="Image attachment is unavailable")
+        return await self._send_file_attachment(
+            chat_id, Path(safe_path), caption=caption, reply_to=reply_to, metadata=metadata, probe=False
+        )
 
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
@@ -1526,7 +1665,8 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_to_is_own = bool(reply_meta is not None and reply_meta[0] == self._self_pubkey)
         # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
         # unless require_mention is off. DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own:
+        free_response = channel_id in self.free_response_channels or "*" in self.free_response_channels
+        if not is_dm and self.require_mention and not free_response and not self._is_addressed(event) and not reply_to_is_own:
             return
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
@@ -1932,7 +2072,11 @@ async def _standalone_send(
     if thread_id and _reply_to_mode(pconfig, extra) != "off":
         args += ["--reply-to", str(thread_id)]
     for media in media_files or []:
-        args += ["--file", str(media[0] if isinstance(media, (list, tuple)) and media else media)]
+        media_path = media[0] if isinstance(media, (list, tuple)) and media else media
+        safe_path = BasePlatformAdapter.validate_media_delivery_path(str(media_path))
+        if safe_path is None or not Path(safe_path).is_file():
+            return send_error("Buzz image attachment is unavailable")
+        args += ["--file", safe_path]
     try:
         code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key, auth_tag=auth_tag, input_text=message)
         escaped = _escape_unresolved_presentation_mention(message, err) if code != 0 else None
@@ -2004,6 +2148,26 @@ def interactive_setup() -> None:
 
 def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
+    ctx.register_tool(
+        name="buzz_event_read",
+        toolset="buzz",
+        schema=_BUZZ_EVENT_READ_SCHEMA,
+        handler=_handle_buzz_event_read,
+        check_fn=_buzz_event_read_available,
+        is_async=True,
+        description=_BUZZ_EVENT_READ_SCHEMA["description"],
+        emoji="🔎",
+    )
+    ctx.register_tool(
+        name="buzz_send_image",
+        toolset="buzz",
+        schema=_BUZZ_SEND_IMAGE_SCHEMA,
+        handler=_handle_buzz_send_image,
+        check_fn=_buzz_event_read_available,
+        is_async=True,
+        description=_BUZZ_SEND_IMAGE_SCHEMA["description"],
+        emoji="📷",
+    )
     ctx.register_platform(
         name="buzz", label="Buzz", adapter_factory=lambda cfg: BuzzAdapter(cfg), check_fn=check_requirements,
         validate_config=validate_config, is_connected=is_connected, required_env=["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"],
@@ -2020,3 +2184,151 @@ def register(ctx):
             "reach you without a mention. Keep responses conversational."
         ),
     )
+
+
+_BUZZ_EVENT_READ_SCHEMA = {
+    "name": "buzz_event_read",
+    "description": (
+        "Read one exact native Buzz event from a channel watched by the active "
+        "Buzz adapter. This tool is read-only and omits signatures and secrets."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "channel": {
+                "type": "string",
+                "description": "Configured and watched Buzz channel UUID.",
+            },
+            "event_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$",
+                "description": "Exact 64-character hexadecimal Buzz event id.",
+            },
+        },
+        "required": ["channel", "event_id"],
+        "additionalProperties": False,
+    },
+}
+
+
+_BUZZ_SEND_IMAGE_SCHEMA = {
+    "name": "buzz_send_image",
+    "description": (
+        "Send one local image to the current authorized Buzz conversation and "
+        "return its native event id. The current Buzz session determines the "
+        "destination; image paths must pass native media-delivery validation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "image_path": {
+                "type": "string",
+                "description": "Local path to the image file to send.",
+            },
+            "caption": {
+                "type": "string",
+                "description": "Optional caption to send with the image.",
+            },
+        },
+        "required": ["image_path"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _resolve_buzz_event_read_adapter() -> Optional[BuzzAdapter]:
+    """Resolve the current profile's existing live adapter without caching it."""
+    try:
+        from gateway.run import _gateway_runner_ref
+        from gateway.session_context import get_session_env
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        profile = get_session_env("HERMES_SESSION_PROFILE", "").strip() or None
+        adapter = runner._authorization_adapter(Platform("buzz"), profile=profile)
+    except Exception:
+        return None
+    if not isinstance(adapter, BuzzAdapter) or not adapter.is_connected:
+        return None
+    return adapter
+
+
+def _buzz_event_read_available() -> bool:
+    return _resolve_buzz_event_read_adapter() is not None
+
+
+async def _handle_buzz_event_read(args: dict, **_kwargs) -> str:
+    """Tool boundary for secret-safe, profile-scoped Buzz evidence reads."""
+    if not isinstance(args, dict):
+        return json.dumps({"error": "invalid_arguments"})
+    channel = args.get("channel")
+    event_id = args.get("event_id")
+    if not isinstance(channel, str) or not channel.strip():
+        return json.dumps({"error": "invalid_channel"})
+    if not isinstance(event_id, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{64}", event_id.strip()
+    ):
+        return json.dumps({"error": "invalid_event_id", "channel": channel.strip()})
+    adapter = _resolve_buzz_event_read_adapter()
+    if adapter is None:
+        return json.dumps({"error": "buzz_adapter_unavailable"})
+    result = await adapter.read_event(channel.strip(), event_id.strip())
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def _resolve_buzz_current_channel() -> Optional[tuple[BuzzAdapter, str]]:
+    """Resolve the connected Buzz adapter and channel bound to this session."""
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower() != "buzz":
+            return None
+        channel = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        if not channel:
+            return None
+        adapter = _resolve_buzz_event_read_adapter()
+    except Exception:
+        return None
+    if adapter is None or channel not in adapter._channel_state:
+        return None
+    return adapter, channel
+
+
+async def _handle_buzz_send_image(args: dict, **_kwargs) -> str:
+    """Send one validated local image to the trusted current Buzz channel."""
+    if not isinstance(args, dict):
+        return json.dumps({"success": False, "error": "invalid_arguments"})
+    image_path = args.get("image_path")
+    caption = args.get("caption")
+    if not isinstance(image_path, str) or not image_path.strip():
+        return json.dumps({"success": False, "error": "invalid_image_path"})
+    if caption is not None and not isinstance(caption, str):
+        return json.dumps({"success": False, "error": "invalid_caption"})
+
+    target = _resolve_buzz_current_channel()
+    if target is None:
+        return json.dumps({"success": False, "error": "buzz_session_unavailable"})
+    adapter, channel = target
+    result = await adapter.send_image_file(
+        channel,
+        image_path.strip(),
+        caption=caption,
+    )
+    message_id = str(result.message_id) if result.message_id is not None else None
+    response = {"success": bool(result.success and message_id)}
+    if message_id is not None:
+        response["message_id"] = message_id
+    if result.error:
+        response["error"] = result.error
+    if result.success and message_id is None:
+        receipt_error = (
+            "Buzz accepted the image but returned no native event ID; "
+            "delivery outcome is unknown"
+        )
+        response["error"] = "; ".join(
+            value for value in (response.get("error"), receipt_error) if value
+        )
+    elif not result.success and not result.error:
+        response["error"] = "Buzz image delivery failed"
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":"))

@@ -312,6 +312,8 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+    if task.block_kind in kb.INPUT_BLOCK_KINDS:
+        return DecomposeOutcome(task_id, False, "input/capability blocker requires owner resolution")
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
@@ -336,8 +338,9 @@ def decompose_task(
     return _apply_fanout(task_id, parsed, routing, audit_author)
 
 
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+    return [row.id for row in rows if row.block_kind not in kb.INPUT_BLOCK_KINDS]

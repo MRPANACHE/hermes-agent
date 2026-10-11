@@ -931,6 +931,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except ValueError as goal_err:
+                fail_msg[tid] = f"cannot complete {tid}: {goal_err}"
+                return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
@@ -942,6 +945,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
@@ -1008,13 +1012,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
+    wake_at = getattr(args, "at", None)
+    if wake_at is not None:
+        try:
+            kb.parse_schedule_time(wake_at)
+        except ValueError as exc:
+            return _err(str(exc))
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, wake_at=wake_at, expected_run_id=_worker_run_id_for(tid)))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:

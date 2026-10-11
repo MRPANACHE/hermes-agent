@@ -103,7 +103,11 @@ def _load_auth_store_maybe_locked(lock: bool) -> Dict[str, Any]:
     """Load the auth store, taking the cross-process lock unless the caller already holds it."""
     from hermes_cli.auth import _auth_store_lock, _load_auth_store
     if lock:
-        with _auth_store_lock():
+        # Readers must wait for the same single-use-token transaction as refresh writers.
+        refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+        with _auth_store_lock(
+            timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
+        ):
             return _load_auth_store()
     return _load_auth_store()
 
@@ -710,12 +714,13 @@ def _entry_is_rate_limit_exhausted(entry: Dict[str, Any]) -> bool:
 # Throttle for the live Codex quota probe. It runs on the hot credential-selection path while the
 # pool is exhausted, so without a floor a busy gateway would hammer the usage endpoint per call.
 CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
-_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[Dict[str, Optional[float]]]]] = {}
 _codex_quota_probe_lock = threading.Lock()
 
 
-def _codex_quota_probe_cache_key(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+def _codex_quota_probe_cache_key(token: str, base_url: Optional[str] = None) -> str:
+    usage_url = _codex_usage_probe_url(base_url)
+    return hashlib.sha256(f"{usage_url}\0{token}".encode("utf-8")).hexdigest()[:16]
 
 
 def _codex_usage_probe_url(base_url: Optional[str]) -> str:
@@ -732,13 +737,13 @@ def _codex_usage_probe_url(base_url: Optional[str]) -> str:
     return prefix + "/usage"
 
 
-def _probe_codex_quota_restored(
+def _probe_codex_quota_snapshot(
     access_token: Any, *, base_url: Optional[str] = None,
-    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[bool]:
-    """Ask the Codex usage endpoint whether this account's quota is usable again.
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[Dict[str, Optional[float]]]:
+    """Return Codex usage windows; unknown stays None, and HTTP 429 means fully used.
 
-    Probes are throttled per access token (module-local cache) so the hot selection path can fire
-    this freely.
+    Probe results are cached per access token and endpoint. Additional model-scoped limits
+    still count against the worst window, as they do for quota-restored checks.
     """
     from hermes_cli.auth import _codex_quota_probe_cache, _nonempty_str
     token = _stripped(access_token)
@@ -746,7 +751,7 @@ def _probe_codex_quota_restored(
     # network calls for corrupt/placeholder entries (and keeps hermetic test fixtures offline).
     if not token or not _decode_jwt_claims(token):
         return None
-    cache_key = _codex_quota_probe_cache_key(token)
+    cache_key = _codex_quota_probe_cache_key(token, base_url)
     now = time.monotonic()
     with _codex_quota_probe_lock:
         cached = _codex_quota_probe_cache.get(cache_key)
@@ -754,7 +759,7 @@ def _probe_codex_quota_restored(
             return cached[1]
         # Reserve the slot immediately so concurrent selectors don't stampede the endpoint.
         _codex_quota_probe_cache[cache_key] = (now, None)
-    result: Optional[bool] = None
+    result: Optional[Dict[str, Optional[float]]] = None
     try:
         # Account/residency headers from the JWT (required for some account shapes).
         from agent.codex_headers import codex_account_headers
@@ -778,15 +783,39 @@ def _probe_codex_quota_restored(
                     if isinstance(used, (int, float)):
                         worst_used = max(worst_used or 0.0, float(used))
             if worst_used is not None:
-                result = worst_used < 100.0
+                account_limit = payload.get("rate_limit") or {}
+                primary = (account_limit.get("primary_window") or {}).get("used_percent")
+                secondary = (account_limit.get("secondary_window") or {}).get("used_percent")
+                result = {
+                    "primary_used_percent": float(primary) if isinstance(primary, (int, float)) else None,
+                    "secondary_used_percent": float(secondary) if isinstance(secondary, (int, float)) else None,
+                    "worst_used_percent": worst_used,
+                }
         elif response.status_code == 429:
-            result = False
+            result = {
+                "primary_used_percent": 100.0,
+                "secondary_used_percent": 100.0,
+                "worst_used_percent": 100.0,
+            }
     except Exception:
         logger.debug("Codex quota probe failed", exc_info=True)
         result = None
     with _codex_quota_probe_lock:
         _codex_quota_probe_cache[cache_key] = (now, result)
     return result
+
+
+def _probe_codex_quota_restored(
+    access_token: Any, *, base_url: Optional[str] = None,
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[bool]:
+    """Return whether every reported Codex quota window is below 100% used."""
+    snapshot = _probe_codex_quota_snapshot(
+        access_token, base_url=base_url, min_interval_seconds=min_interval_seconds
+    )
+    if snapshot is None:
+        return None
+    worst_used = snapshot.get("worst_used_percent")
+    return float(worst_used) < 100.0 if isinstance(worst_used, (int, float)) else None
 
 
 def _refresh_expired_codex_probe_token(

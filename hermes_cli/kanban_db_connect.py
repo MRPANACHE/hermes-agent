@@ -995,6 +995,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+    from hermes_cli.kanban_db import _dedupe_active_idempotency_keys, _IDEMPOTENCY_KEY_SQL_EXPR
+    if "status" in cols:
+        with write_txn(conn, allow_nested=True):
+            _dedupe_active_idempotency_keys(conn)
+            conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
+            conn.execute(
+                f"CREATE UNIQUE INDEX idx_tasks_idempotency ON tasks({_IDEMPOTENCY_KEY_SQL_EXPR}) "
+                f"WHERE idempotency_key IS NOT NULL AND {_IDEMPOTENCY_KEY_SQL_EXPR} != '' "
+                "AND status != 'archived'"
+            )
+
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

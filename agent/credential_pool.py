@@ -121,11 +121,13 @@ STRATEGY_FILL_FIRST = "fill_first"
 STRATEGY_ROUND_ROBIN = "round_robin"
 STRATEGY_RANDOM = "random"
 STRATEGY_LEAST_USED = "least_used"
+STRATEGY_MOST_REMAINING = "most_remaining"
 SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
+    STRATEGY_MOST_REMAINING,
 }
 
 # Cooldowns before retrying an exhausted credential. Transient 401s cool down
@@ -2000,6 +2002,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ---- selection ---------------------------------------------------------
 
     def select(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        if self.provider == "openai-codex" and self._strategy == STRATEGY_MOST_REMAINING:
+            return self._select_codex_most_remaining(model=model)
         entry, pending_refresh = self._select_under_lock(model=model)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -2009,6 +2013,115 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if entry is not None:
             self._unmatched_rotation_streak = 0
         return entry
+
+    @staticmethod
+    def _codex_quota_rank(
+        snapshot: Optional[Dict[str, Optional[float]]],
+    ) -> Optional[Tuple[int, float]]:
+        """Rank a Codex quota snapshot without mistaking unknown for empty.
+
+        Known usable quota outranks an indeterminate probe. A known fully-used
+        account is excluded. Within the usable group the worst (bottleneck)
+        window dominates, with short-window capacity as a deterministic tie
+        breaker.
+        """
+        if not isinstance(snapshot, dict):
+            return None
+        worst_used = snapshot.get("worst_used_percent")
+        if not isinstance(worst_used, (int, float)):
+            return None
+        if float(worst_used) >= 100.0:
+            return (0, 0.0)
+        bottleneck_remaining = max(0.0, 100.0 - float(worst_used))
+        primary_used = snapshot.get("primary_used_percent")
+        primary_remaining = (
+            max(0.0, 100.0 - float(primary_used))
+            if isinstance(primary_used, (int, float))
+            else bottleneck_remaining
+        )
+        return (2, bottleneck_remaining * 1000.0 + primary_remaining)
+
+    def _select_codex_most_remaining(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        """Select the Codex account with the most live subscription quota.
+
+        Usage probes run outside ``self._lock`` because each may perform an
+        upstream HTTP request. The probe helper caches results for five minutes,
+        making this safe on the gateway's hot path without turning local call
+        counts into a false proxy for real subscription capacity.
+        """
+        from hermes_cli.auth_codex import _codex_pool_route_base_url
+
+        with self._lock:
+            available, pending_refresh = self._available_entries(
+                clear_expired=True,
+                refresh=True,
+                model=model,
+            )
+        if pending_refresh:
+            self._refresh_pending_entries(pending_refresh)
+            with self._lock:
+                available, _ = self._available_entries(
+                    clear_expired=True,
+                    refresh=False,
+                    model=model,
+                )
+        if not available:
+            with self._lock:
+                self._current_id = None
+                self._log_no_available_entries()
+            return None
+
+        probes: Dict[str, Tuple[str, Optional[Dict[str, Optional[float]]]]] = {}
+        for entry in available:
+            try:
+                snapshot = auth_mod._probe_codex_quota_snapshot(
+                    entry.access_token,
+                    base_url=_codex_pool_route_base_url(entry.base_url),
+                )
+            except Exception:
+                logger.debug(
+                    "Codex quota ranking probe failed for pool entry %s",
+                    entry.id,
+                    exc_info=True,
+                )
+                snapshot = None
+            probes[entry.id] = (entry.access_token, snapshot)
+
+        with self._lock:
+            current, _ = self._available_entries(
+                clear_expired=False,
+                refresh=False,
+                model=model,
+            )
+            ranked: List[Tuple[int, float, int, PooledCredential]] = []
+            for entry in current:
+                probed_token, snapshot = probes.get(entry.id, ("", None))
+                if probed_token != entry.access_token:
+                    snapshot = None
+                quota_rank = self._codex_quota_rank(snapshot)
+                if quota_rank == (0, 0.0):
+                    continue
+                if quota_rank is None:
+                    # An indeterminate account remains a fail-open fallback,
+                    # but never outranks an account with confirmed free quota.
+                    rank_group, score = 1, 0.0
+                else:
+                    rank_group, score = quota_rank
+                ranked.append((rank_group, score, -entry.priority, entry))
+
+            if not ranked:
+                self._current_id = None
+                self._log_no_available_entries()
+                return None
+
+            selected = max(ranked, key=lambda item: item[:3])[3]
+            updated = self._adopt(
+                selected, persist=False, request_count=selected.request_count + 1
+            )
+            self._current_id = updated.id
+            self._last_no_entries_log_at = None
+            self._unmatched_rotation_streak = 0
+            return updated
 
     def _select_under_lock(self, *, model: Optional[str] = None) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         with self._lock:

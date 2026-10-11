@@ -544,12 +544,26 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
     else an error naming both; media uses the adapter's native media APIs under the same rules."""
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner, adapter = _live_adapter(platform)
+    if platform_name == "buzz" and runner is not None:
+        from gateway.session_context import get_session_env
+        profile = get_session_env("HERMES_SESSION_PROFILE", "").strip() or None
+        resolver = getattr(runner, "_authorization_adapter", None)
+        try:
+            if callable(resolver):
+                adapter = resolver(platform, profile=profile)
+            elif profile and profile != "default":
+                adapter = None
+        except Exception:
+            adapter = None
+        if adapter is None:
+            return {"error": "No live Buzz adapter for the current profile"}
     if adapter is not None:
         try:
             metadata = {**({"thread_id": thread_id} if thread_id else {}),
                         **({"publish_topic": chat_id} if platform_name == "ntfy" and chat_id else {})} or None
             if media_files:  # always a dict result, returned as-is below
-                make_coro = lambda: _send_live_adapter_media(  # noqa: E731
+                media_sender = _send_live_buzz_media if platform_name == "buzz" else _send_live_adapter_media
+                make_coro = lambda: media_sender(  # noqa: E731
                     adapter, chat_id, chunk, media_files, thread_id=thread_id, metadata=metadata,
                     force_document=force_document)
             else:
@@ -582,10 +596,57 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
     except Exception as e:
         logger.debug("Plugin standalone send for %s raised", platform_name, exc_info=True)
         return {"error": f"Plugin standalone send failed: {_bounded_send_error(e)}"}
+    if (platform_name == "buzz" and media_files and isinstance(result, dict)
+            and result.get("success") and not result.get("message_id")):
+        return {"error": "Buzz media send returned no event ID"}
     if isinstance(result, dict) and (result.get("success") or result.get("error")):
         return {**result, "error": _bounded_send_error(result["error"])} if result.get("error") else result
     return {"error": (f"Plugin standalone send for '{platform_name}' returned an invalid result: "
                       f"expected a dict with 'success' or 'error' keys, got {type(result).__name__}")}
+
+
+async def _send_live_buzz_media(adapter, chat_id, message, media_files, *, thread_id=None, metadata=None,
+                                force_document=False):
+    """Keep every native Buzz event receipt, including sends preceding a partial failure."""
+    message_ids = []
+    image_only = not force_document and all(
+        os.path.splitext(str(media[0] if isinstance(media, (tuple, list)) else media))[1].lower() in _IMAGE_EXTS
+        for media in media_files
+    )
+    if image_only:
+        caption, separate_text = message, None
+    else:
+        caption, separate_text = _media_caption_split(message, media_files, max_caption_len=_DEFAULT_CAPTION_LIMIT)
+    if separate_text and separate_text.strip():
+        result = await adapter.send(chat_id=chat_id, content=separate_text, metadata=metadata)
+        if not result.success or not result.message_id:
+            return {"error": f"Buzz media send failed: {_bounded_send_error(result.error or 'missing event ID')}",
+                    "sent_message_ids": message_ids}
+        message_ids.append(result.message_id)
+    for index, media in enumerate(media_files):
+        media_path = media[0] if isinstance(media, (tuple, list)) else media
+        is_voice = isinstance(media, (tuple, list)) and len(media) > 1 and bool(media[1])
+        ext = os.path.splitext(str(media_path))[1].lower()
+        method_name, _ = _adapter_media_method(ext, is_voice or ext in _AUDIO_EXTS, force_document)
+        path_kwarg = {
+            "send_image_file": "image_path", "send_video": "video_path",
+            "send_voice": "audio_path", "send_document": "file_path",
+        }[method_name]
+        try:
+            result = await getattr(adapter, method_name)(
+                chat_id=chat_id, **{path_kwarg: str(media_path)},
+                caption=caption if index == 0 and caption else None,
+                reply_to=thread_id, metadata=metadata,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {"error": f"Buzz media send failed: {_bounded_send_error(exc)}", "sent_message_ids": message_ids}
+        if not result.success or not result.message_id:
+            return {"error": f"Buzz media send failed: {_bounded_send_error(result.error or 'missing event ID')}",
+                    "sent_message_ids": message_ids}
+        message_ids.append(result.message_id)
+    return {"success": True, "message_id": message_ids[-1], "message_ids": message_ids, "media_delivered": True}
 
 
 async def _send_chunks(chunks, send_one):
@@ -704,6 +765,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
+    if not chunks and media_files and platform_name == "buzz":
+        chunks = [""]
     if (platform_name == "discord" or (platform_name == "whatsapp" and mentions)
             or (media_files and platform_name in _PLUGIN_STANDALONE_MEDIA)):
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files,

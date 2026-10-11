@@ -274,6 +274,36 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    @pytest.mark.parametrize("caption", ["", "Photo set for review"])
+    def test_buzz_media_tag_reaches_native_send(self, caption, tmp_path):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        image = tmp_path / "photo.jpg"
+        image.write_bytes(b"image bytes")
+        platform = Platform("buzz")
+        pconfig = SimpleNamespace(enabled=True, extra={})
+        config = SimpleNamespace(
+            platforms={platform: pconfig},
+            get_home_channel=lambda _platform: None,
+        )
+        message = f"MEDIA:{image}" + (f" {caption}" if caption else "")
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("tools.send_message_tool.resolve_send_target", return_value=("channel", None, None)), \
+             patch.object(BasePlatformAdapter, "filter_media_delivery_paths", return_value=[(str(image), False)]), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "event-photo"})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=False):
+            result = json.loads(send_message_tool({
+                "action": "send", "target": "buzz:channel", "message": message,
+            }))
+
+        assert result == {"success": True, "message_id": "event-photo"}
+        send_mock.assert_awaited_once_with(
+            platform, pconfig, "channel", caption, thread_id=None,
+            media_files=[(str(image), False)], force_document=False,
+        )
+
     def test_ntfy_topic_target_is_explicit(self):
         chat_id, thread_id, is_explicit = _parse_target_ref("ntfy", "alerts-channel")
 
@@ -1514,6 +1544,42 @@ class TestSendViaAdapterStandaloneFallback:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("caption", ["", "Photo set for review"])
+    async def test_buzz_media_only_and_captioned_route_before_non_media_guard(self, caption):
+        platform = Platform("buzz")
+        media = [("/safe/photo.jpg", False)]
+        native_result = {"success": True, "message_id": "event-photo", "message_ids": ["event-photo"]}
+        with patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value=native_result)) as send:
+            result = await _send_to_platform(
+                platform, SimpleNamespace(extra={}), "channel", caption,
+                media_files=media,
+            )
+        assert result == native_result
+        send.assert_awaited_once_with(
+            platform, SimpleNamespace(extra={}), "channel", caption,
+            thread_id=None, media_files=media, force_document=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_buzz_image_only_with_registered_length_limit(self):
+        platform = Platform("buzz")
+        media = [("/safe/photo.jpg", False)]
+        native_result = {"success": True, "message_id": "event-photo"}
+        entry = self._make_entry(None)
+        entry.name = "buzz"
+        entry.max_message_length = 4000
+        with patch("gateway.platform_registry.platform_registry.get", return_value=entry), \
+             patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value=native_result)) as send:
+            result = await _send_to_platform(
+                platform, SimpleNamespace(extra={}), "channel", "", media_files=media,
+            )
+        assert result == native_result
+        send.assert_awaited_once_with(
+            platform, SimpleNamespace(extra={}), "channel", "",
+            thread_id=None, media_files=media, force_document=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_live_ntfy_adapter_receives_explicit_publish_topic(self, monkeypatch):
         from tools.send_message_tool import _send_via_adapter
 
@@ -1543,6 +1609,129 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["chat_id"] == "alerts-channel"
         assert recorded["content"] == "done"
         assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
+
+    @pytest.mark.asyncio
+    async def test_buzz_media_uses_current_profile_and_native_file_receipts(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = Platform("buzz")
+        adapter = SimpleNamespace(
+            send=AsyncMock(),
+            send_image_file=AsyncMock(side_effect=[
+                SimpleNamespace(success=True, message_id="event-one", error=None),
+                SimpleNamespace(success=True, message_id="event-two", error=None),
+            ]),
+        )
+        resolved = []
+
+        def resolve(requested_platform, *, profile=None):
+            resolved.append((requested_platform, profile))
+            return adapter
+
+        runner = SimpleNamespace(
+            adapters={platform: SimpleNamespace(send=AsyncMock())},
+            _authorization_adapter=resolve,
+        )
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": "emma" if name == "HERMES_SESSION_PROFILE" else default,
+        )
+
+        result = await _send_via_adapter(
+            platform, SimpleNamespace(extra={}), "channel", "Caption",
+            thread_id="reply-event",
+            media_files=[("/safe/one.jpg", False), ("/safe/two.jpg", False)],
+        )
+
+        assert result == {
+            "success": True, "message_id": "event-two",
+            "message_ids": ["event-one", "event-two"],
+            "media_delivered": True,
+        }
+        assert resolved == [(platform, "emma")]
+        assert [call.kwargs["caption"] for call in adapter.send_image_file.await_args_list] == [
+            "Caption", None,
+        ]
+        assert all(call.kwargs["reply_to"] == "reply-event"
+                   for call in adapter.send_image_file.await_args_list)
+        adapter.send.assert_not_awaited()
+        runner.adapters[platform].send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_buzz_media_failure_never_reports_success(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = Platform("buzz")
+        adapter = SimpleNamespace(send_image_file=AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="event-one", error=None),
+            SimpleNamespace(success=False, message_id=None, error="upload rejected"),
+        ]))
+        runner = SimpleNamespace(_authorization_adapter=lambda *_args, **_kwargs: adapter)
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": "emma" if name == "HERMES_SESSION_PROFILE" else default,
+        )
+
+        result = await _send_via_adapter(
+            platform, SimpleNamespace(extra={}), "channel", "Caption",
+            media_files=[("/safe/one.jpg", False), ("/safe/two.jpg", False)],
+        )
+        assert result == {
+            "error": "Buzz media send failed: upload rejected",
+            "sent_message_ids": ["event-one"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_buzz_later_media_exception_preserves_prior_event_id(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = Platform("buzz")
+        adapter = SimpleNamespace(send_image_file=AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="event-one", error=None),
+            RuntimeError("upload failed"),
+        ]))
+        runner = SimpleNamespace(_authorization_adapter=lambda *_args, **_kwargs: adapter)
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": "emma" if name == "HERMES_SESSION_PROFILE" else default,
+        )
+
+        result = await _send_via_adapter(
+            platform, SimpleNamespace(extra={}), "channel", "Caption",
+            media_files=[("/safe/one.jpg", False), ("/safe/two.jpg", False)],
+        )
+        assert result == {
+            "error": "Buzz media send failed: upload failed",
+            "sent_message_ids": ["event-one"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_buzz_missing_profile_adapter_does_not_fall_back(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = Platform("buzz")
+        runner = SimpleNamespace(_authorization_adapter=lambda *_args, **_kwargs: None)
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": "emma" if name == "HERMES_SESSION_PROFILE" else default,
+        )
+        result = await _send_via_adapter(
+            platform, SimpleNamespace(extra={}), "channel", "Caption",
+            media_files=[("/safe/one.jpg", False)],
+        )
+        assert result == {"error": "No live Buzz adapter for the current profile"}
 
 
     @pytest.mark.asyncio

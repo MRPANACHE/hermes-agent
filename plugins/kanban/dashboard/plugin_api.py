@@ -642,7 +642,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected, ValueError):
+        with _map_errors(409 if s == "done" else 400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -714,6 +714,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         return {"task": _task_dict(
             updated, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
         ) if updated else None}
+
 
 
 @router.delete("/tasks/{task_id}")

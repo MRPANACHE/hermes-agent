@@ -325,6 +325,7 @@ _SPECS = [
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
+        _arg("--at", default=None, help="Future ISO timestamp with explicit timezone; omit for manual wake"),
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),

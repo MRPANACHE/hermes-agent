@@ -36,6 +36,67 @@ import pytest
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_hermes_provider_releases_lock_when_request_aborted(tmp_path, cancelled):
+    """An interrupted HTTP request must not poison subsequent OAuth requests."""
+    import asyncio
+
+    from mcp.shared.auth import OAuthClientMetadata, OAuthToken
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="aborted",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=["http://127.0.0.1:12345/callback"],
+        ),
+        storage=HermesTokenStorage("aborted", hermes_home=tmp_path),
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+    # Start from an authenticated session; no network or refresh is needed.
+    provider._initialized = True
+    provider.context.current_tokens = OAuthToken(
+        access_token="test-access", token_type="Bearer",
+    )
+    request = httpx.Request("POST", "https://example.com/mcp")
+    ready = asyncio.Event()
+
+    async def aborted_request():
+        flow = provider.async_auth_flow(request)
+        try:
+            await anext(flow)
+            ready.set()
+            if cancelled:
+                await asyncio.Event().wait()
+        finally:
+            # httpx closes its auth generator when a transport request aborts.
+            await flow.aclose()
+
+    task = asyncio.create_task(aborted_request())
+    await asyncio.wait_for(ready.wait(), timeout=2)
+    if cancelled:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+
+    assert provider.context.lock.value == 1
+    next_flow = provider.async_auth_flow(request)
+    try:
+        async with asyncio.timeout(2):
+            outbound = await anext(next_flow)
+            with pytest.raises(StopAsyncIteration):
+                await next_flow.asend(httpx.Response(200, request=outbound))
+    finally:
+        await next_flow.aclose()
+
+
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
@@ -294,21 +295,23 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Emergency stop (`hermes pause`): no auto-decompose or
-                # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
-                else:
+                # Finish bookkeeping for existing workers even while new work is paused.
+                admit_new = _kanban_dispatch_allowed() and not getattr(self, "_draining", False)
+                self._kanban_dispatch_active_count = getattr(self, "_kanban_dispatch_active_count", 0) + 1
+                try:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
-                    _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
-                    # See #49638.
-                    if _ad_enabled:
-                        await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(dispatcher.tick_once)
+                    if admit_new:
+                        _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
+                        # See #49638.
+                        if _ad_enabled:
+                            await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                    results = await _to_thread_process_service(partial(dispatcher.tick_once, admit_new=admit_new))
                     any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
+                    ready_pending = admit_new and await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                finally:
+                    self._kanban_dispatch_active_count -= 1
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))

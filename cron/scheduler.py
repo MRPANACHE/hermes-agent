@@ -2551,6 +2551,9 @@ def run_job(
     from run_agent import AIAgent
 
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if execution_id or job.get("execution_id"):
+        from cron.executions import record_execution_evidence
+        record_execution_evidence(execution_id or job["execution_id"], session_id=_cron_session_id)
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
@@ -2769,15 +2772,51 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+def _run_admitted_scheduled_recoveries(*, adapters=None, loop=None, verbose=False):
+    """Drain explicit recovery admissions through this owner's existing tick.
+
+    This is not automatic failure retry: a trusted ingress must bind one exact
+    failure first. The ledger tombstone is never reset by ticks or restarts.
+    """
+    from cron.executions import admitted_scheduled_recoveries, claim_scheduled_recovery
+    admissions = admitted_scheduled_recoveries()
+    if not admissions:
+        return 0
+    if not (load_config() or {}).get("cron", {}).get("scheduled_recovery", False):
+        return 0
+    processed = 0
+    for failure_id in admissions:
+        try:
+            claimed = claim_scheduled_recovery(failure_id)
+            if claimed:
+                job, extra_prompt = claimed
+                run_one_job(job, adapters=adapters, loop=loop, verbose=verbose,
+                            extra_prompt=extra_prompt,
+                            preserve_next_run_at=job.get("next_run_at"))
+                processed += 1
+        except Exception as exc:
+            logger.warning("Scheduled recovery %s not dispatched: %s", failure_id, exc)
+    return processed
+
+
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    preserve_next_run_at: Optional[str] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
+    if preserve_next_run_at is not None:
+        job["_preserve_next_run_at"] = preserve_next_run_at
+    recovery_claim = isinstance(job.get("fire_claim"), dict) and "preserve_next_run_at" in job["fire_claim"]
+    if preserve_next_run_at is not None or recovery_claim:
+        if extra_prompt is not None:
+            job["_scheduled_recovery_prompt"] = extra_prompt
+        else:
+            extra_prompt = job.get("_scheduled_recovery_prompt")
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
@@ -2827,6 +2866,7 @@ def run_one_job(
                     **({"expected_fire_owner": owner} if owner else {}),
                     # A ladder re-run's occurrence already counted toward repeat.
                     **({"ladder_rung": True} if is_retry_run(job) else {}),
+                    **_recovery_mark_kwargs(job),
                 )
             finally:
                 finish_execution(
@@ -2877,6 +2917,13 @@ def run_one_job(
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
 
 
+def _recovery_mark_kwargs(job: dict) -> dict:
+    preserved = job.get("_preserve_next_run_at")
+    if preserved is None and isinstance(job.get("fire_claim"), dict):
+        preserved = job["fire_claim"].get("preserve_next_run_at")
+    return {"preserve_next_run_at": preserved} if preserved is not None else {}
+
+
 def _record_fire_ownership_lost(
     job: dict, fire_owner: Optional[str], execution_id: str,
 ) -> None:
@@ -2891,6 +2938,7 @@ def _record_fire_ownership_lost(
         mark_job_run(
             job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
             **({"ladder_rung": True} if is_retry_run(job) else {}),
+            **_recovery_mark_kwargs(job),
         )
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
     else:
@@ -3061,6 +3109,9 @@ def _save_compose_deliver(
         output_file = (
             None if self_removal_delivery_allowed(job["id"])
             else save_job_output(job["id"], output))
+        if output_file is not None and job.get("execution_id"):
+            from cron.executions import record_execution_evidence
+            record_execution_evidence(job["execution_id"], output_path=output_file)
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)
 
@@ -3157,7 +3208,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
-    mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    mark_kwargs: dict = {"delivery_error": d.delivery_error, **_recovery_mark_kwargs(job)}
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
@@ -3484,7 +3535,7 @@ def _run_one_job_body(
                 not _consume_interrupted_flag(job["id"], execution_token)
                 and not self_removal_delivery_allowed(job["id"])  # no record left to mark
             ):
-                mark_kwargs = {}
+                mark_kwargs = _recovery_mark_kwargs(job)
                 if fire_owner is not None:
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
@@ -4263,6 +4314,23 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
+def _scheduled_recovery_boundary(job: dict) -> dict:
+    """Bind eligibility to the dispatched occurrence, before mutable cadence advances."""
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("kind") != "cron":
+        return {}
+    instant = job.get("_scheduled_instant") or job.get("next_run_at")
+    if not instant:
+        return {}
+    from cron.jobs import compute_next_run
+    from cron.executions import recovery_job_scope
+    expires = compute_next_run(schedule, instant)
+    return {
+        "recovery_expires_at": expires,
+        "recovery_scope_hash": recovery_job_scope(job) if expires else None,
+    }
+
+
 def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
     Running-set membership is released in the worker's finally."""
@@ -4320,7 +4388,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     execution = None
     try:
         execution = create_execution(
-            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
+            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"),
+            **_scheduled_recovery_boundary(job))
         dispatched_job = dict(job, execution_id=execution["id"])
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()
