@@ -220,7 +220,7 @@ def authenticate_token(
     request: Request,
     *,
     required_scope: str | None = None,
-) -> Tuple[Optional[TokenPrincipal], Optional[str]]:
+) -> tuple[Optional[TokenPrincipal], Optional[str]]:
     """Try every token provider against the request's bearer token.
 
     Returns ``(principal, unreachable_provider_name)``:
@@ -251,7 +251,7 @@ def authenticate_token(
             if unreachable is None:
                 unreachable = provider.name
             continue
-        except Exception as e:  # noqa: BLE001 — a buggy provider must not 500 the gate
+        except Exception as e:
             _log.warning("dashboard-auth: token provider %r raised during verify: %s",
                          provider.name, e)
             continue
