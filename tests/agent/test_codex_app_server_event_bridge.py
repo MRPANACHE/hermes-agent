@@ -324,9 +324,11 @@ class TestBridgeWiredInRuntime:
         from agent import codex_runtime
 
         captured: dict = {}
+        constructor_calls: list[dict] = []
 
         class FakeSession:
             def __init__(self, **kwargs):
+                constructor_calls.append(kwargs)
                 captured.update(kwargs)
 
             def run_turn(self, user_input, **_):
@@ -352,6 +354,8 @@ class TestBridgeWiredInRuntime:
         agent = SimpleNamespace(
             session_cwd=None,
             _codex_session=None,
+            _cached_system_prompt="CACHED_PROMPT",
+            ephemeral_system_prompt="EPHEMERAL_PROMPT",
             tool_progress_callback=MagicMock(),
             _fire_stream_delta=MagicMock(),
             _fire_reasoning_delta=MagicMock(),
@@ -373,14 +377,19 @@ class TestBridgeWiredInRuntime:
             _session_db=None,
         )
 
-        codex_runtime.run_codex_app_server_turn(
-            agent,
-            user_message="hi",
-            original_user_message="hi",
-            messages=[],
-            effective_task_id="t",
-        )
+        for _ in range(2):
+            codex_runtime.run_codex_app_server_turn(
+                agent,
+                user_message="hi",
+                original_user_message="hi",
+                messages=[],
+                effective_task_id="t",
+            )
 
+        assert len(constructor_calls) == 1
+        assert captured["developer_instructions"] == (
+            "CACHED_PROMPT\n\nEPHEMERAL_PROMPT"
+        )
         assert "on_event" in captured, (
             "run_codex_app_server_turn must pass on_event=<bridge> to the "
             "session — without it the gateway sees no live progress (#33200)"

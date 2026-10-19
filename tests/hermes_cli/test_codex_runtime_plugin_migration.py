@@ -238,9 +238,9 @@ class TestMigrate:
     def test_exact_unmanaged_mcp_collision_is_replaced(self, tmp_path):
         target = tmp_path / "config.toml"
         target.write_text(
-            '[mcp_servers.fleet]\ncommand = "old"\n\n'
-            '[mcp_servers.fleet.env]\nOLD = "1"\n\n'
-            '[mcp_servers.user-server]\ncommand = "keep"\n'
+            "[mcp_servers.fleet]\ncommand = \"old\"\n\n"
+            "[mcp_servers.fleet.env]\nOLD = \"1\"\n\n"
+            "[mcp_servers.user-server]\ncommand = \"keep\"\n"
         )
 
         migrate(

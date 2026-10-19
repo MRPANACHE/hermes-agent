@@ -411,7 +411,7 @@ def _strip_unmanaged_owned_mcp_tables(
 ) -> str:
     """Remove pre-existing MCP tables that Hermes is about to manage.
 
-    User-owned MCP servers with different names remain untouched. Exact name
+    User-owned MCP servers with different names remain untouched.  Exact name
     collisions must be removed, including child tables such as
     ``[mcp_servers.fleet.env]``, or the managed replacement would leave Codex
     with duplicate TOML table headers.

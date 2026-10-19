@@ -544,6 +544,10 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
                 return
+            finally:
+                # Close in the owning task: the SDK holds an AnyIO lock across
+                # yields, which a later async-generator finalizer cannot release.
+                await inner.aclose()
 
     return HermesMCPOAuthProvider
 

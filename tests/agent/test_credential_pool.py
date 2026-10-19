@@ -1701,6 +1701,89 @@ class TestLeastUsedStrategy:
         )
 
 
+class TestMostRemainingStrategy:
+    """Codex subscription selection must use upstream quota, not call counts."""
+
+    def test_selects_account_with_largest_bottleneck_remaining(self, monkeypatch):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STRATEGY_MOST_REMAINING,
+        )
+
+        entries = [
+            PooledCredential(provider="openai-codex", id="main", label="main",
+                             auth_type="oauth", source="manual:device_code",
+                             access_token="token-main", priority=0),
+            PooledCredential(provider="openai-codex", id="new", label="new",
+                             auth_type="oauth", source="manual:device_code",
+                             access_token="token-new", priority=1),
+        ]
+        snapshots = {
+            "token-main": {
+                "primary_used_percent": 10.0,
+                "secondary_used_percent": 70.0,
+                "worst_used_percent": 70.0,
+            },
+            "token-new": {
+                "primary_used_percent": 20.0,
+                "secondary_used_percent": 5.0,
+                "worst_used_percent": 20.0,
+            },
+        }
+        monkeypatch.setattr(
+            "agent.credential_pool.auth_mod._probe_codex_quota_snapshot",
+            lambda token, **_kwargs: snapshots[token],
+        )
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_MOST_REMAINING,
+        ):
+            pool = CredentialPool("openai-codex", entries)
+
+        selected = pool.select()
+
+        assert selected is not None
+        assert selected.id == "new"
+
+    def test_skips_fully_used_account_and_keeps_unknown_as_fallback(self, monkeypatch):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STRATEGY_MOST_REMAINING,
+        )
+
+        entries = [
+            PooledCredential(provider="openai-codex", id="full", label="full",
+                             auth_type="oauth", source="manual:device_code",
+                             access_token="token-full", priority=0),
+            PooledCredential(provider="openai-codex", id="unknown", label="unknown",
+                             auth_type="oauth", source="manual:device_code",
+                             access_token="token-unknown", priority=1),
+        ]
+        monkeypatch.setattr(
+            "agent.credential_pool.auth_mod._probe_codex_quota_snapshot",
+            lambda token, **_kwargs: (
+                {"primary_used_percent": 100.0,
+                 "secondary_used_percent": 100.0,
+                 "worst_used_percent": 100.0}
+                if token == "token-full" else None
+            ),
+        )
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_MOST_REMAINING,
+        ):
+            pool = CredentialPool("openai-codex", entries)
+
+        selected = pool.select()
+
+        assert selected is not None
+        assert selected.id == "unknown"
+
+
 # ── PR #10160 salvage: Nous OAuth cross-process sync tests ─────────────────
 
 

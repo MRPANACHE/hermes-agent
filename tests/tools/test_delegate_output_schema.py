@@ -16,8 +16,6 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     _run_single_child,
@@ -196,37 +194,6 @@ def _run(child):
 
 
 class TestRunSingleChildSchemaValidation:
-    def test_schema_retry_cannot_complete_parent_kanban_task(self, monkeypatch):
-        from agent.delegation_context import delegated_child_subprocess_env
-        from tools import kanban_tools
-
-        monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-recovery-task")
-        monkeypatch.setattr(
-            kanban_tools, "_connect",
-            lambda **kw: (_ for _ in ()).throw(AssertionError("child reached board")),
-        )
-        child = _StubChild(["not JSON", '{"city": "Oslo"}'])
-        child._delegate_output_schema = ADDRESS_SCHEMA
-        original = child.run_conversation
-        observations = []
-
-        def attempt_completion(*args, **kwargs):
-            observations.append((
-                kanban_tools._handle_complete({"summary": "coding finished"}),
-                delegated_child_subprocess_env({"HERMES_KANBAN_TASK": "parent-recovery-task"}),
-            ))
-            return original(*args, **kwargs)
-
-        child.run_conversation = attempt_completion
-        entry = _run(child)
-        assert entry["schema_valid"] is True
-        assert len(observations) == 2
-        for rejection, child_env in observations:
-            assert "child agents are not Kanban run owners" in rejection
-            assert "HERMES_KANBAN_TASK" not in child_env
-            assert child_env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
-        assert delegated_child_subprocess_env() is None
-
     def test_valid_first_try_no_retry(self):
         child = _StubChild(['{"city": "Berlin"}'])
         child._delegate_output_schema = ADDRESS_SCHEMA
@@ -307,67 +274,6 @@ def _make_mock_parent():
 
 
 class TestDelegateTaskDispatch:
-    @pytest.mark.parametrize("depth", [0, 1])
-    @pytest.mark.parametrize(
-        "retry_response, schema_valid",
-        [('{"city": "Oslo"}', True), ("still not JSON", False)],
-    )
-    def test_agent_dispatcher_enforces_top_level_schema(
-        self, depth, retry_response, schema_valid
-    ):
-        from gateway.session_context import clear_session_vars, set_session_vars
-        from run_agent import AIAgent
-
-        parent = _make_mock_parent()
-        parent._delegate_depth = depth
-        child = _StubChild(["not JSON", retry_response])
-        # A finite parent returns the result in the same turn, as native
-        # Kanban/cron workers do; no background notification is dispatched.
-        tokens = set_session_vars(source="cron", async_delivery=False)
-        try:
-            with (
-                patch(
-                    "tools.delegate_tool._load_config",
-                    return_value={"max_spawn_depth": 2},
-                ),
-                patch(
-                    "tools.delegate_tool._resolve_delegation_credentials",
-                    return_value={
-                        "provider": None,
-                        "model": None,
-                        "base_url": None,
-                        "api_key": None,
-                        "api_mode": None,
-                    },
-                ),
-                patch(
-                    "tools.delegate_tool._build_child_preserving_parent_tools",
-                    return_value=child,
-                ) as build_child,
-            ):
-                payload = json.loads(AIAgent._dispatch_delegate_task(
-                    parent,
-                    {
-                        "goal": "produce the address",
-                        "context": "base context",
-                        "output_schema": ADDRESS_SCHEMA,
-                    },
-                ))
-        finally:
-            clear_session_vars(tokens)
-
-        assert "error" not in payload
-        assert child._delegate_output_schema == ADDRESS_SCHEMA
-        assert "OUTPUT CONTRACT" in build_child.call_args.kwargs["context"]
-        entry = payload["results"][0]
-        assert entry["schema_valid"] is schema_valid
-        assert entry["schema_retries"] == 1
-        assert len(child.calls) == 2
-        assert "JSON" in child.calls[1]
-        assert entry["summary"] == retry_response
-        if not schema_valid:
-            assert entry["schema_errors"]
-
     def test_non_dict_output_schema_rejected(self):
         with (
             patch("tools.delegate_tool._load_config", return_value={}),

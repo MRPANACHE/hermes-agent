@@ -2258,6 +2258,97 @@ def test_duplicate_detection_distinguishes_different_codex_reasoning(monkeypatch
         assert items[0].get("encrypted_content") == "enc_second"
 
 
+def _request_has_incomplete_nudge(api_kwargs):
+    return any(
+        isinstance(item, dict)
+        and item.get("role") == "user"
+        and "only internal reasoning" in str(item.get("content"))
+        for item in api_kwargs["input"]
+    )
+
+
+def test_consecutive_opaque_reasoning_nudges_before_final_retry_and_keeps_tool_calls(
+    monkeypatch,
+    caplog,
+):
+    """One opaque replay is useful; a second identical response is a stall."""
+    agent = _build_agent(monkeypatch)
+    requests = []
+    first = _codex_reasoning_only_response(
+        encrypted_content="enc_first",
+        summary_text="",
+    )
+    second = _codex_reasoning_only_response(
+        encrypted_content="enc_second",
+        summary_text="",
+    )
+    first.status = second.status = "incomplete"
+    first.incomplete_details = second.incomplete_details = SimpleNamespace(
+        reason="opaque_only"
+    )
+    responses = [
+        first,
+        second,
+        _codex_tool_call_response(),
+        _codex_message_response("Recovered after the tool call."),
+    ]
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    def _fake_execute_tool_calls(
+        assistant_message,
+        messages,
+        effective_task_id,
+        api_call_count=0,
+    ):
+        messages.append({
+            "role": "tool",
+            "tool_call_id": assistant_message.tool_calls[0].id,
+            "content": '{"ok":true}',
+        })
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    with caplog.at_level("INFO"):
+        result = agent.run_conversation("inspect with tools")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered after the tool call."
+    assert len(requests) == 4
+    assert _request_has_incomplete_nudge(requests[1]) is False
+    assert _request_has_incomplete_nudge(requests[2]) is True
+    assert "incomplete_details.reason=opaque_only" in caplog.text
+
+
+def test_visible_partial_breaks_opaque_streak_without_nudge(monkeypatch):
+    """Visible partial output remains a normal continuation, not a stall."""
+    agent = _build_agent(monkeypatch)
+    requests = []
+    responses = [
+        _codex_reasoning_only_response(
+            encrypted_content="enc_first",
+            summary_text="",
+        ),
+        _codex_incomplete_message_response("Useful partial output."),
+        _codex_message_response("Completed normally."),
+    ]
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("analyze")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Completed normally."
+    assert not any(_request_has_incomplete_nudge(request) for request in requests)
+
+
 def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monkeypatch):
     """Identical commentary is emitted once while newer replay state wins."""
     agent = _build_agent(monkeypatch)

@@ -858,9 +858,22 @@ async def _send_via_adapter(
 
     if runner is not None:
         try:
-            adapter = runner.adapters.get(platform)
+            if platform_name == "buzz":
+                from gateway.session_context import get_session_env
+                profile = get_session_env("HERMES_SESSION_PROFILE", "") or None
+                resolver = getattr(runner, "_authorization_adapter", None)
+                if callable(resolver):
+                    adapter = resolver(platform, profile=profile)
+                elif profile and profile != "default":
+                    adapter = None
+                else:
+                    adapter = runner.adapters.get(platform)
+            else:
+                adapter = runner.adapters.get(platform)
         except Exception:
             adapter = None
+        if platform_name == "buzz" and adapter is None:
+            return {"error": "No live Buzz adapter for the current profile"}
         if adapter is not None:
             try:
                 metadata = {}
@@ -870,6 +883,36 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
+                if platform_name == "buzz" and media_files:
+                    message_ids = []
+                    for index, media in enumerate(media_files):
+                        media_path = media[0] if isinstance(media, (tuple, list)) else media
+                        try:
+                            result = await adapter.send_image_file(
+                                chat_id=chat_id,
+                                image_path=str(media_path),
+                                caption=chunk if index == 0 and chunk else None,
+                                reply_to=thread_id,
+                                metadata=metadata,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            return {
+                                "error": f"Buzz media send failed: {e}",
+                                "sent_message_ids": message_ids,
+                            }
+                        if not result.success or not result.message_id:
+                            return {
+                                "error": f"Buzz media send failed: {result.error or 'missing event ID'}",
+                                "sent_message_ids": message_ids,
+                            }
+                        message_ids.append(result.message_id)
+                    return {
+                        "success": True,
+                        "message_id": message_ids[-1],
+                        "message_ids": message_ids,
+                    }
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
@@ -902,6 +945,9 @@ async def _send_via_adapter(
             logger.debug("Plugin standalone send for %s raised", platform_name, exc_info=True)
             return {"error": f"Plugin standalone send failed: {e}"}
 
+        if (platform_name == "buzz" and media_files and isinstance(result, dict)
+                and result.get("success") and not result.get("message_id")):
+            return {"error": "Buzz media send returned no event ID"}
         if isinstance(result, dict) and (result.get("success") or result.get("error")):
             return result
         return {
@@ -1240,6 +1286,25 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # Buzz uploads local MEDIA files through its adapter's --file path. Keep
+    # the caption on the first file and return native event IDs as receipts.
+    if platform_name == "buzz" and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if i == len(chunks) - 1 else [],
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):

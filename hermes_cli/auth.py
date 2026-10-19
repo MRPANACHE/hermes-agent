@@ -484,6 +484,16 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("OPENCODE_GO_API_KEY",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
     ),
+    "opencode-free": ProviderConfig(
+        id="opencode-free",
+        name="OpenCode Free",
+        auth_type="api_key",
+        inference_base_url="https://opencode.ai/zen/v1",
+        # Deliberately NO api_key_env_vars: the free tier is served
+        # anonymously (any unrecognized bearer is a 401), so there is no
+        # secret to configure. Select via `hermes model` / `/model free`.
+        api_key_env_vars=(),
+    ),
     "kilocode": ProviderConfig(
         id="kilocode",
         name="Kilo Code",
@@ -2112,6 +2122,7 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
+        "free": "opencode-free", "opencode_free": "opencode-free",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
@@ -3686,7 +3697,12 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Raises AuthError if no Codex tokens are stored.
     """
     if _lock:
-        with _auth_store_lock():
+        # A reader can arrive while another process refreshes the single-use
+        # token. Use the same transaction deadline as that refresh writer.
+        refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+        with _auth_store_lock(
+            timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
+        ):
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
@@ -4252,7 +4268,9 @@ def _is_codex_rate_limit_shaped(
 # credential-selection path while the pool is exhausted, so without a floor a
 # busy gateway would hammer the usage endpoint on every model/auxiliary call.
 CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
-_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_probe_cache: Dict[
+    str, Tuple[float, Optional[Dict[str, Optional[float]]]]
+] = {}
 _codex_quota_probe_lock = threading.Lock()
 
 
@@ -4277,32 +4295,21 @@ def _codex_usage_probe_url(base_url: Optional[str]) -> str:
     return prefix + "/usage"
 
 
-def _probe_codex_quota_restored(
+def _probe_codex_quota_snapshot(
     access_token: Any,
     *,
     base_url: Optional[str] = None,
     min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
-) -> Optional[bool]:
-    """Ask the Codex usage endpoint whether this account's quota is usable again.
+) -> Optional[Dict[str, Optional[float]]]:
+    """Return the live Codex usage windows for one OAuth credential.
 
-    Hermes persists a Codex 429's ``reset_at`` locally and freezes the
-    credential until it elapses — but the upstream window can reopen EARLY
-    (the user redeems a banked rate-limit reset via the Codex CLI/ChatGPT UI,
-    upgrades their plan, or OpenAI resets the window).  This probe detects
-    that: it GETs the same ``/usage`` endpoint the Codex CLI uses and checks
-    the reported windows.
+    The result exposes both the short and weekly windows so the credential
+    pool can select the subscription with the largest usable bottleneck.
+    ``None`` means the probe was indeterminate. A direct HTTP 429 is represented
+    as fully used so selection can immediately prefer another credential.
 
-    Returns:
-      * ``True``  — every reported rate-limit window is below 100% used;
-        the account can serve requests again and stale local cooldowns
-        should be lifted.
-      * ``False`` — a window is still fully used (or the probe itself 429'd);
-        keep the cooldown.
-      * ``None``  — indeterminate (no token, network error, unexpected
-        payload/status); keep the cooldown.
-
-    Probes are throttled per access token (module-local cache) so the hot
-    selection path can fire this freely.
+    Probes are throttled per access token and endpoint (module-local cache) so
+    the hot selection path can call this without hammering the usage API.
     """
     token = str(access_token or "").strip()
     if not token:
@@ -4312,7 +4319,8 @@ def _probe_codex_quota_restored(
     # keeps hermetic test fixtures with dummy tokens offline).
     if not _decode_jwt_claims(token):
         return None
-    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    usage_url = _codex_usage_probe_url(base_url)
+    cache_key = hashlib.sha256(f"{usage_url}\0{token}".encode("utf-8")).hexdigest()[:16]
     now = time.monotonic()
     with _codex_quota_probe_lock:
         cached = _codex_quota_probe_cache.get(cache_key)
@@ -4322,7 +4330,7 @@ def _probe_codex_quota_restored(
         # the endpoint while this probe is in flight.
         _codex_quota_probe_cache[cache_key] = (now, None)
 
-    result: Optional[bool] = None
+    result: Optional[Dict[str, Optional[float]]] = None
     try:
         headers = {
             "Authorization": f"Bearer {token}",
@@ -4340,19 +4348,29 @@ def _probe_codex_quota_restored(
         if isinstance(account_id, str) and account_id.strip():
             headers["ChatGPT-Account-Id"] = account_id.strip()
         with httpx.Client(timeout=10.0) as client:
-            response = client.get(_codex_usage_probe_url(base_url), headers=headers)
+            response = client.get(usage_url, headers=headers)
         if response.status_code == 200:
             payload = response.json() or {}
             rate_limit = payload.get("rate_limit") or {}
-            worst_used: Optional[float] = None
-            for key in ("primary_window", "secondary_window"):
-                used = (rate_limit.get(key) or {}).get("used_percent")
-                if isinstance(used, (int, float)):
-                    worst_used = max(worst_used or 0.0, float(used))
-            if worst_used is not None:
-                result = worst_used < 100.0
+            primary_raw = (rate_limit.get("primary_window") or {}).get("used_percent")
+            secondary_raw = (rate_limit.get("secondary_window") or {}).get("used_percent")
+            primary_used = float(primary_raw) if isinstance(primary_raw, (int, float)) else None
+            secondary_used = (
+                float(secondary_raw) if isinstance(secondary_raw, (int, float)) else None
+            )
+            known = [value for value in (primary_used, secondary_used) if value is not None]
+            if known:
+                result = {
+                    "primary_used_percent": primary_used,
+                    "secondary_used_percent": secondary_used,
+                    "worst_used_percent": max(known),
+                }
         elif response.status_code == 429:
-            result = False
+            result = {
+                "primary_used_percent": 100.0,
+                "secondary_used_percent": 100.0,
+                "worst_used_percent": 100.0,
+            }
     except Exception:
         logger.debug("Codex quota probe failed", exc_info=True)
         result = None
@@ -4360,6 +4378,26 @@ def _probe_codex_quota_restored(
     with _codex_quota_probe_lock:
         _codex_quota_probe_cache[cache_key] = (now, result)
     return result
+
+
+def _probe_codex_quota_restored(
+    access_token: Any,
+    *,
+    base_url: Optional[str] = None,
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+) -> Optional[bool]:
+    """Return whether every reported Codex quota window is below 100% used."""
+    snapshot = _probe_codex_quota_snapshot(
+        access_token,
+        base_url=base_url,
+        min_interval_seconds=min_interval_seconds,
+    )
+    if snapshot is None:
+        return None
+    worst_used = snapshot.get("worst_used_percent")
+    if not isinstance(worst_used, (int, float)):
+        return None
+    return float(worst_used) < 100.0
 
 
 def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
@@ -7084,6 +7122,25 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         return {"configured": False}
+
+    # Keyless providers (opencode-free) are served anonymously: no credential
+    # exists, so every install counts as configured/logged in. Derived from
+    # the HermesOverlay keyless flag — the same source the provider catalog
+    # and GUI contract tests use.
+    try:
+        from hermes_cli.providers import HERMES_OVERLAYS
+        _overlay = HERMES_OVERLAYS.get(provider_id)
+    except Exception:
+        _overlay = None
+    if _overlay is not None and getattr(_overlay, "keyless", False):
+        return {
+            "configured": True,
+            "provider": provider_id,
+            "name": pconfig.name,
+            "key_source": "keyless",
+            "base_url": pconfig.inference_base_url,
+            "logged_in": True,
+        }
 
     api_key = ""
     key_source = ""

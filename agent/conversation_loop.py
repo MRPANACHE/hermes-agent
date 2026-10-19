@@ -1027,6 +1027,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
+    # One-time migration for prompts persisted before Hermes stopped importing
+    # the Codex/Claude-only subscription worker policy from shared AGENTS.md /
+    # CLAUDE.md files. Fresh Hermes prompts strip this marked section in
+    # prompt_builder; rejecting the legacy snapshot here lets long-lived Buzz
+    # sessions adopt that fix on their next turn without a manual /new.
+    from agent.prompt_builder import _CODEX_LUNA_SECTION_BEGIN
+
+    if _CODEX_LUNA_SECTION_BEGIN in prompt:
+        return False
+
     def line_value(label: str) -> str:
         """Last matching line wins.
 
@@ -1819,31 +1829,6 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
-
-    # If a background memory/skill review spawned at the end of a PRIOR turn
-    # (agent/background_review.py) is still running its own run_conversation()
-    # when THIS turn starts, cancel it now rather than letting both make
-    # outbound API calls concurrently against the same session_id/credentials.
-    # That concurrency can produce doubled prompt-token accounting on this
-    # turn's own calls and, because the review fork is a fully separate
-    # AIAgent with no route back to THIS agent's interrupt() by default, a
-    # lockup that survives a normal /stop and needs a hard Ctrl+C.
-    # ``review_agent.interrupt()`` is fire-and-forget here — it just flags
-    # cancellation and aborts the review's in-flight socket; it does not
-    # block waiting for the review's daemon thread to exit, so it can't add
-    # latency to this turn. Only ever set on the real owning agent (the
-    # review fork's own copy of this attribute stays None — reviews don't
-    # spawn nested reviews), so this is a no-op on every other run_conversation
-    # caller (subagents, the review fork itself, etc).
-    _pending_review = getattr(agent, "_background_review_agent", None)
-    if _pending_review is not None:
-        try:
-            _pending_review.interrupt("superseded by a new live turn")
-        except Exception:
-            logger.debug(
-                "Failed to cancel in-flight background review for a new turn",
-                exc_info=True,
-            )
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -6798,13 +6783,48 @@ def run_conversation(
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
 
+                # Preserve the provider's own incomplete classification in
+                # the ordinary runtime log.  The normalized finish reason is
+                # necessarily coarser, and previously left no way to tell a
+                # provider-side output limit from a completed reasoning-only
+                # response after the turn failed its continuation budget.
+                logging.info(
+                    "%sCodex response incomplete "
+                    "(response.status=%s, incomplete_details.reason=%s, "
+                    "continuation=%d/3)",
+                    agent.log_prefix,
+                    status or "unknown",
+                    incomplete_reason or "unspecified",
+                    agent._codex_incomplete_retries,
+                )
+
+                last_msg = messages[-1] if messages else None
+                current_opaque_reasoning_only = (
+                    interim_has_codex_reasoning
+                    and not interim_has_content
+                    and not interim_has_reasoning
+                    and not interim_has_codex_message_items
+                )
+                previous_opaque_reasoning_only = (
+                    isinstance(last_msg, dict)
+                    and last_msg.get("role") == "assistant"
+                    and last_msg.get("finish_reason") == "incomplete"
+                    and bool(last_msg.get("codex_reasoning_items"))
+                    and not bool((last_msg.get("content") or "").strip())
+                    and not bool((last_msg.get("reasoning") or "").strip())
+                    and not bool(last_msg.get("codex_message_items"))
+                )
+                consecutive_opaque_reasoning_only = (
+                    current_opaque_reasoning_only
+                    and previous_opaque_reasoning_only
+                )
+
                 if (
                     interim_has_content
                     or interim_has_reasoning
                     or interim_has_codex_reasoning
                     or interim_has_codex_message_items
                 ):
-                    last_msg = messages[-1] if messages else None
                     # Duplicate detection: compare only visible content
                     # (content + reasoning).  Opaque provider state
                     # (encrypted reasoning items, message item ids/phases)
@@ -6879,7 +6899,12 @@ def run_conversation(
                         or interim_has_codex_reasoning
                         or interim_has_codex_message_items
                     )
-                    if not interim_replayable:
+                    # Encrypted reasoning is normally useful continuation
+                    # state, so replay it once without interference. If the
+                    # next response is still opaque reasoning only, the state
+                    # is no longer evidence of progress: add the existing
+                    # nudge before spending the final existing attempt.
+                    if not interim_replayable or consecutive_opaque_reasoning_only:
                         _last_msg = messages[-1] if messages else None
                         _already_nudged = (
                             isinstance(_last_msg, dict)

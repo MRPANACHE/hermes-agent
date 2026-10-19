@@ -174,6 +174,27 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_includes_nonblank_developer_instructions(self):
+        client = FakeClient()
+        s = make_session(client, developer_instructions="Hermes developer prompt")
+
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["developerInstructions"] == "Hermes developer prompt"
+
+    @pytest.mark.parametrize("developer_instructions", [None, "", " \n\t "])
+    def test_thread_start_omits_blank_developer_instructions(
+        self, developer_instructions
+    ):
+        client = FakeClient()
+        s = make_session(client, developer_instructions=developer_instructions)
+
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert "developerInstructions" not in params
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)

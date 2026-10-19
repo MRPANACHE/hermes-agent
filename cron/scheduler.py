@@ -358,11 +358,9 @@ class CronPromptInjectionBlocked(Exception):
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
-    Three toolsets are always disabled in cron context regardless of config:
+    Two toolsets are always disabled in cron context regardless of config:
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
-      - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
-        exposing this tool only gives the model an unbacked tool that fails
 
     ``cronjob`` is policy-denied by default (loop prevention, not a security
     boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
@@ -377,9 +375,9 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """
     cron_cfg = (cfg or {}).get("cron") or {}
     if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify", "memory"]
+        disabled = ["messaging", "clarify"]
     else:
-        disabled = ["cronjob", "messaging", "clarify", "memory"]
+        disabled = ["cronjob", "messaging", "clarify"]
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
@@ -453,6 +451,49 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
+    """Resolve the effective reasoning config for a cron run.
+
+    Precedence: per-job ``reasoning_effort`` pin (validated at the store
+    choke point, ``cron/jobs.py::_normalize_reasoning_effort``) wins outright
+    over config resolution — both the global ``agent.reasoning_effort`` and
+    per-model ``agent.reasoning_overrides``. The pin is model-independent by
+    design: it also governs an auth-fallback model swap, and capability
+    clamping for the model that actually runs stays owned by the provider
+    transports at send time (exactly like config-set effort).
+
+    A value that no longer parses (hand-edited jobs.json) logs a warning and
+    falls back to config resolution — a bad pin must degrade the run's
+    thinking level, never kill the tick.
+
+    Absent/None pin returns ``resolve_reasoning_config(cfg, model)``
+    byte-identical, preserving pre-feature behavior.
+    """
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    pinned = job.get("reasoning_effort")
+    if pinned is not None:
+        parsed = parse_reasoning_effort(pinned)
+        if parsed is not None:
+            logger.info(
+                "Job '%s': using per-job reasoning_effort '%s'",
+                job.get("id", "?"),
+                pinned,
+            )
+            return parsed
+        logger.warning(
+            "Job '%s': invalid stored reasoning_effort %r — ignoring the pin "
+            "and falling back to config resolution. Fix with `cronjob "
+            "action=update job_id=%s reasoning_effort=<level>` (valid: none, "
+            "minimal, low, medium, high, xhigh, max, ultra).",
+            job.get("id", "?"),
+            pinned,
+            job.get("id", "?"),
+        )
+    return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
+
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -3666,6 +3707,34 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+# hermes-cron-result-context-v1: archive prompts are not previous results.
+def _cron_result_marker():
+    if _get_hermes_home() == Path("/home/david/.hermes/profiles/pippa"):
+        return "<!-- hermes-cron-result-context-v1 -->\n"
+    return ""
+
+
+def _cron_result_context(archive):
+    """Read the outer result only; never feed archived prompts back into cron."""
+    marker = "<!-- hermes-cron-result-context-v1 -->"
+    if marker in archive:
+        result = archive.rsplit(marker, 1)[1].lstrip()
+        for heading in ("## Response\n\n", "## Error\n\n"):
+            if result.startswith(heading):
+                return result[len(heading):].strip()
+        return ""
+    # Legacy cron archives did not mark the outer boundary. The final result
+    # heading follows any previous archives embedded in the prompt.
+    if archive.startswith("# Cron Job:"):
+        response = archive.rfind("\n## Response\n\n")
+        error = archive.rfind("\n## Error\n\n")
+        boundary = max(response, error)
+        if boundary < 0:
+            return ""
+        return archive[boundary:].split("\n\n", 1)[1].strip()
+    return archive
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4052,6 +4121,8 @@ def _build_job_prompt(
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                if _get_hermes_home() == Path("/home/david/.hermes/profiles/pippa"):
+                    latest_output = _cron_result_context(latest_output)
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
@@ -5113,6 +5184,9 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if job.get('execution_id'):
+        from cron.executions import record_execution_evidence
+        record_execution_evidence(job['execution_id'], session_id=_cron_session_id)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -5385,7 +5459,8 @@ def run_job(
 
         # Reasoning config is resolved after provider authentication so an auth
         # fallback can first replace the primary model with its configured model.
-        from hermes_constants import resolve_reasoning_config
+        # Resolution itself happens via _resolve_job_reasoning_config below
+        # (per-job pin > agent.reasoning_overrides > agent.reasoning_effort).
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
@@ -5603,8 +5678,8 @@ def run_job(
             if runtime is None:
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
+        reasoning_config = _resolve_job_reasoning_config(
+            job, _cfg if isinstance(_cfg, dict) else {}, str(model)
         )
 
         # Provider/model-drift fail-closed guard (#44585).
@@ -5770,7 +5845,11 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Memory is enabled for cron agents like any other agent run:
+            # MEMORY.md / USER.md load into the system prompt and the memory
+            # tool follows normal toolset resolution, so jobs benefit from
+            # (and can update) the user's persistent memory.
+            skip_memory=False,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
@@ -6010,7 +6089,7 @@ def run_job(
 
 {prompt}
 
-## Response
+{_cron_result_marker()}## Response
 
 {logged_response}
 """
@@ -6067,7 +6146,7 @@ def run_job(
 
 {prompt}
 
-## Error
+{_cron_result_marker()}## Error
 
 ```
 {error_msg}
@@ -6327,6 +6406,30 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+def _run_admitted_scheduled_recoveries(*, adapters=None, loop=None, verbose=False):
+    """Drain explicit recovery admissions through this owner's existing tick.
+
+    This is not automatic failure retry: a trusted ingress must bind one exact
+    failure first. The ledger tombstone is never reset by ticks or restarts.
+    """
+    from cron.executions import admitted_scheduled_recoveries, claim_scheduled_recovery
+    if not (load_config() or {}).get("cron", {}).get("scheduled_recovery", False):
+        return 0
+    processed = 0
+    for failure_id in admitted_scheduled_recoveries():
+        try:
+            claimed = claim_scheduled_recovery(failure_id)
+            if claimed:
+                job, extra_prompt = claimed
+                run_one_job(job, adapters=adapters, loop=loop, verbose=verbose,
+                            extra_prompt=extra_prompt,
+                            preserve_next_run_at=job.get("next_run_at"))
+                processed += 1
+        except Exception as exc:
+            logger.warning("Scheduled recovery %s not dispatched: %s", failure_id, exc)
+    return processed
+
+
 def run_one_job(
     job: dict,
     *,
@@ -6334,6 +6437,7 @@ def run_one_job(
     loop=None,
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
+    preserve_next_run_at: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
@@ -6373,6 +6477,7 @@ def run_one_job(
                 loop=loop,
                 verbose=verbose,
                 extra_prompt=extra_prompt,
+                preserve_next_run_at=preserve_next_run_at,
                 fire_claim_lost=(
                     _CombinedCancelEvent(lost_ownership, cancel_event)
                     if cancel_event is not None
@@ -6397,6 +6502,7 @@ def _run_one_job_body(
     loop=None,
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
+    preserve_next_run_at: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
@@ -6526,6 +6632,7 @@ def _run_one_job_body(
                     False,
                     "Interrupted by shutdown before terminal completion.",
                     expected_fire_owner=fire_owner,
+                    preserve_next_run_at=preserve_next_run_at,
                 )
                 finish_execution(
                     execution_id,
@@ -6553,6 +6660,8 @@ def _run_one_job_body(
                 if not owns_output:
                     raise _FireClaimLostDuringSideEffect
                 output_file = save_job_output(job["id"], output)
+                from cron.executions import record_execution_evidence
+                record_execution_evidence(execution_id, output_path=output_file)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -6692,6 +6801,7 @@ def _run_one_job_body(
                     False,
                     "Interrupted by shutdown before terminal completion.",
                     expected_fire_owner=fire_owner,
+                    preserve_next_run_at=preserve_next_run_at,
                 )
                 finish_execution(
                     execution_id,
@@ -6744,6 +6854,8 @@ def _run_one_job_body(
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
             mark_kwargs["status"] = "blocked_config"
+        if preserve_next_run_at is not None:
+            mark_kwargs["preserve_next_run_at"] = preserve_next_run_at
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
         if fire_owner is not None and not marked:
             finish_execution(
@@ -6823,6 +6935,8 @@ def _run_one_job_body(
                 mark_kwargs = {}
                 if fire_owner is not None:
                     mark_kwargs["expected_fire_owner"] = fire_owner
+                if preserve_next_run_at is not None:
+                    mark_kwargs["preserve_next_run_at"] = preserve_next_run_at
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
                 mark_job_run(job["id"], False, _err_text, **mark_kwargs)
@@ -7037,6 +7151,7 @@ def tick(
             except Exception as _reap_exc:
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
+        _run_admitted_scheduled_recoveries(adapters=adapters, loop=loop, verbose=verbose)
         due_jobs = get_due_jobs()
 
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
@@ -7215,7 +7330,18 @@ def tick(
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             try:
-                execution = create_execution(job_id, source="builtin")
+                # Bind to the original due snapshot, captured BEFORE advance.
+                # Subsequent cadence advances (including advance -> crash before
+                # this row) must never extend an earlier failure's eligibility.
+                from cron.executions import recovery_job_scope
+                from cron.jobs import compute_next_run
+                expires = None
+                if job.get('schedule', {}).get('kind') == 'cron' and job.get('next_run_at'):
+                    expires = compute_next_run(job['schedule'], job['next_run_at'])
+                execution = create_execution(
+                    job_id, source="builtin", recovery_expires_at=expires,
+                    recovery_scope_hash=recovery_job_scope(job) if expires else None,
+                )
                 dispatched_job = dict(job, execution_id=execution["id"])
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:

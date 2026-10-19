@@ -86,6 +86,71 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_codex_app_server_runtime_uses_codex_cli_auth_without_hermes_credentials(
+    monkeypatch,
+):
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    def _unexpected_codex_auth_call(*args, **kwargs):
+        raise AssertionError("codex_app_server must not resolve Hermes Codex credentials")
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-luna",
+            "openai_runtime": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _NoPool())
+    monkeypatch.setattr(
+        rp,
+        "_resolve_named_custom_runtime",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _unexpected_codex_auth_call)
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["api_key"] == "no-key-required"
+
+
+def test_codex_responses_runtime_still_requires_hermes_credentials(monkeypatch):
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    def _hermes_auth_required(*args, **kwargs):
+        raise rp.AuthError("Hermes Codex credentials required")
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-luna",
+            "openai_runtime": "auto",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _NoPool())
+    monkeypatch.setattr(
+        rp,
+        "_resolve_named_custom_runtime",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _hermes_auth_required)
+
+    with pytest.raises(rp.AuthError, match="Hermes Codex credentials required"):
+        rp.resolve_runtime_provider()
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth
@@ -1622,3 +1687,58 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["source"] == "pool:lmstudio-pool"
     assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
+
+
+def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
+    """OpenCode Free is keyless: an exhausted credential pool must not raise
+    a missing-credential error. The provider resolves with the keyless
+    placeholder + empty-Authorization headers so the request goes out
+    anonymously."""
+    class _ExhaustedPool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return None
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "opencode-free", "default": "x-preview-f-free"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _ExhaustedPool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-free", target_model="x-preview-f-free"
+    )
+
+    assert resolved["provider"] == "opencode-free"
+    assert resolved["api_key"] == "opencode-zen-free-keyless"
+    assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["default_headers"]["Authorization"] == ""
+
+
+def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):
+    """OpenCode Free resolves keylessly with no env var configured at all —
+    the provider declares no credentials."""
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "opencode-free", "default": "x-preview-f-free"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _NoPool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-free", target_model="x-preview-f-free"
+    )
+
+    assert resolved["provider"] == "opencode-free"
+    assert resolved["api_key"] == "opencode-zen-free-keyless"
+    assert resolved["base_url"] == "https://opencode.ai/zen/v1"
