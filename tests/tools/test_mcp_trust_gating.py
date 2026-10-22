@@ -182,7 +182,72 @@ class TestTrustGateAtCallTime:
 
 
 class TestTrustGateApprovalRouting:
-    """MCP consent uses the API run's registered approval lifecycle only."""
+    """MCP consent uses the active surface's registered approval lifecycle."""
+
+    @pytest.mark.parametrize("choice,approved", [
+        ("once", True), ("deny", False), ("timeout", False), ("cancelled", False),
+    ])
+    def test_cli_callback_controls_each_write(self, fake_session, monkeypatch, choice, approved):
+        """The registered CLI panel answers every call before any write RPC fires."""
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.application.current import set_app
+        from prompt_toolkit.input import DummyInput
+        from prompt_toolkit.output import DummyOutput
+        from tools.terminal_tool import _get_approval_callback, set_approval_callback
+
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        _set_trust("srv", "untrusted")
+        handler = _mcp_handlers._make_tool_handler("srv", "write", 30.0)
+        prompts = []
+
+        def confirm(command, description, **kwargs):
+            # Each earlier accepted call has completed, but this call is still gated.
+            assert fake_session.call_tool.await_count == len(prompts) * int(approved)
+            prompts.append((command, description, kwargs))
+            return choice
+
+        previous = _get_approval_callback()
+        set_approval_callback(confirm)
+        try:
+            with set_app(Application(input=DummyInput(), output=DummyOutput())):
+                for _ in range(2):
+                    result = json.loads(handler({"task": "benign"}))
+                    assert ("error" not in result) is approved
+        finally:
+            set_approval_callback(previous)
+
+        assert len(prompts) == 2
+        assert all("write" in command and "srv" in command for command, _, _ in prompts)
+        assert all(kwargs["allow_permanent"] is False for _, _, kwargs in prompts)
+        assert all(kwargs["title"] == "MCP server 'srv' is asking" for _, _, kwargs in prompts)
+        assert fake_session.call_tool.await_count == 2 * int(approved)
+        assert mcp_tool._server_trust_levels["srv"] == "untrusted"
+
+    @pytest.mark.parametrize("callback_fails", [False, True])
+    def test_cli_unavailable_prompt_blocks_write(self, fake_session, monkeypatch, callback_fails):
+        """Missing and failed CLI panels cannot authorize a write."""
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.application.current import set_app
+        from prompt_toolkit.input import DummyInput
+        from prompt_toolkit.output import DummyOutput
+        from tools.terminal_tool import _get_approval_callback, set_approval_callback
+
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        _set_trust("srv", "untrusted")
+        handler = _mcp_handlers._make_tool_handler("srv", "write", 30.0)
+
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("CLI panel unavailable")
+
+        previous = _get_approval_callback()
+        set_approval_callback(unavailable if callback_fails else None)
+        try:
+            with set_app(Application(input=DummyInput(), output=DummyOutput())):
+                assert "error" in json.loads(handler({"task": "benign"}))
+        finally:
+            set_approval_callback(previous)
+
+        fake_session.call_tool.assert_not_awaited()
 
     def test_api_run_callback_can_resolve_mcp_trust_gate(self, monkeypatch):
         """An API run emits and resolves the exact per-call consent request."""
