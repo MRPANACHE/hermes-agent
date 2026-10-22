@@ -332,3 +332,41 @@ class TestAnnotationCaptureAtDiscovery:
         assert _mcp_registration._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+    @pytest.mark.parametrize("hint", [True, False, None])
+    def test_sdk_annotations_preserve_exact_read_only_hint(self, hint):
+        from mcp.types import Tool
+
+        tool = Tool.model_validate({
+            "name": "sdk_read", "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": hint},
+        })
+        assert _mcp_registration._annotation_read_only_hint(tool) is (hint is True)
+
+    def test_sdk_hints_survive_live_and_cached_trust_gating(self, fake_session):
+        from mcp.types import Tool
+        from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
+        from tools.registry import ToolRegistry
+
+        server = mcp_tool.MCPServerTask("srv")
+        server.session = fake_session
+        server._tools = [Tool.model_validate({
+            "name": name, "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": hint},
+        }) for name, hint in [("sdk_read", True), ("sdk_write", False)]]
+        config = {"trust": "untrusted", "tools": {"resources": False, "prompts": False}}
+        registry = ToolRegistry()
+        with patch("tools.registry.registry", registry), \
+             patch("tools.mcp_tool_registration._track_mcp_tool_server"):
+            _mcp_registration._register_server_tools("srv", server, config)
+            assert mcp_tool._tool_read_only_hints["srv"] == {"sdk_read": True, "sdk_write": False}
+            cached = get_cached_entry("srv", config_fingerprint(config))
+            assert cached is not None
+            _mcp_registration._record_tool_trust_metadata(
+                "srv", config, _mcp_registration._cached_tools(cached["tools"]))
+            with patch("tools.approval_prompt.request_elicitation_consent", return_value="decline") as consent:
+                assert json.loads(registry.dispatch("mcp__srv__sdk_read", {})) == {"result": "ok"}
+                consent.assert_not_called()
+                assert "error" in json.loads(registry.dispatch("mcp__srv__sdk_write", {}))
+                consent.assert_called_once()
+        fake_session.call_tool.assert_awaited_once()
