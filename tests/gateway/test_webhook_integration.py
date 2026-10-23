@@ -140,6 +140,8 @@ class TestGitHubPRWebhook:
         assert event.source.platform == Platform.WEBHOOK
         assert "github-pr" in event.source.chat_id
         assert event.message_id == "gh-delivery-001"
+        assert event.reply_expected is False
+        assert event.internal is False
 
 
 # ===================================================================
