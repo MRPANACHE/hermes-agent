@@ -63,6 +63,23 @@ def test_cron_tick_homes_include_active_named_host(tmp_path, monkeypatch):
     assert cron_by_name["host"] == default_home / "profiles" / "host"
 
 
+def test_standalone_cron_stays_in_own_profile_a_b_a(tmp_path, monkeypatch):
+    """An absent sibling gateway must not turn a private cron store into failover work."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    default_home = tmp_path / ".hermes"
+    other_home = default_home / "profiles" / "other"
+    other_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text("gateway:\n  multiplex_profiles: false\n")
+    (other_home / "config.yaml").write_text("gateway:\n  multiplex_profiles: false\n")
+
+    import gateway.run as gateway_run
+
+    config = GatewayConfig(multiplex_profiles=False)
+    for expected_name, home in (("default", default_home), ("other", other_home), ("default", default_home)):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert gateway_run._cron_tick_profile_homes(config) == [(expected_name, home)]
+
+
 class TestNamedProfileMultiplexerGuard:
     """_guard_named_profile_under_multiplexer is inert unless all conditions hold."""
 

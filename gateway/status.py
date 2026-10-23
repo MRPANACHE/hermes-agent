@@ -528,6 +528,52 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     return None
 
 
+def _read_process_argv(pid: int) -> Optional[list[str]]:
+    """Unambiguous argv for attesting the managed inline-source launcher.
+
+    The display cmdline joins NUL-separated arguments with spaces, so it cannot prove that the
+    whole bootstrap was passed as ONE ``-c`` argument. ``ps`` has the same ambiguity.
+    """
+    with contextlib.suppress(OSError):
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return [part.decode("utf-8", errors="replace") for part in raw.rstrip(b"\x00").split(b"\x00")]
+    with contextlib.suppress(Exception):
+        import psutil  # type: ignore
+        parts = psutil.Process(pid).cmdline()
+        if parts:
+            return parts
+    return None
+
+
+def _managed_launcher_gateway_command(pid: int) -> Optional[str]:
+    """Gateway command only when this PID runs this install's exact published ``hermes`` bootstrap.
+
+    The broad inline-source matcher must keep rejecting restart watchers and arbitrary ``python -c``
+    programs. The launcher itself passes its generated script as one argv element, followed by the
+    CLI arguments; only those trailing arguments describe the process's gateway role.
+    """
+    argv = _read_process_argv(pid)
+    if not argv or len(argv) < 5 or not re.fullmatch(
+        r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    ):
+        return None
+    if argv[1:3] != ["-I", "-c"]:
+        return None
+    from hermes_cli._launchers import _launcher_script
+
+    if argv[3] != _launcher_script("hermes", Path(__file__).resolve().parents[1], None):
+        return None
+    command = "hermes " + shlex.join(argv[4:])
+    return command if looks_like_gateway_runtime_command_line(command) else None
+
+
+def _live_gateway_command(pid: int, cmdline: str) -> Optional[str]:
+    if looks_like_gateway_runtime_command_line(cmdline):
+        return cmdline
+    return _managed_launcher_gateway_command(pid)
+
+
 
 def inline_source_flag_index(tokens: list[str]) -> int | None:
     """Index of the ``-c`` token when *tokens* is an interpreter running INLINE SOURCE, else None.
@@ -697,7 +743,10 @@ def looks_like_gateway_runtime_command_line(command: str | None) -> bool:
 def _looks_like_gateway_process(pid: int) -> bool:
     """True when the live PID still looks like the Hermes gateway."""
     cmdline = _read_process_cmdline(pid)
-    return bool(cmdline) and looks_like_gateway_command_line(cmdline)
+    if not cmdline:
+        return False
+    command = _live_gateway_command(pid, cmdline)
+    return bool(command) and looks_like_gateway_command_line(command)
 
 
 def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
@@ -800,11 +849,12 @@ def _record_matches_live_gateway_pid(
     live_cmdline = _read_process_cmdline(pid)
     if not live_cmdline:
         return _record_looks_like_gateway(record)
-    if not looks_like_gateway_runtime_command_line(live_cmdline):
+    gateway_command = _live_gateway_command(pid, live_cmdline)
+    if gateway_command is None:
         return False
     if expected_home is not None and _host_gateway_serves_home(pid, expected_home):
         return True
-    return expected_home is None or _command_line_belongs_to_profile(live_cmdline, expected_home)
+    return expected_home is None or _command_line_belongs_to_profile(gateway_command, expected_home)
 
 
 def _build_pid_record() -> dict:
