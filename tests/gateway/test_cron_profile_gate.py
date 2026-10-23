@@ -1,8 +1,8 @@
 """The gateway ticker stands down for a profile whose OWN gateway process ticks it.
 
-The tick set is every profile regardless of ``gateway.multiplex_profiles``, but that flag also
-selects the deployment where each profile runs its own gateway (the s6 per-profile services). With
-no gate, profile B's gateway and the launch gateway both tick B's store: the per-home
+An explicit multiplexer can tick several profiles while a profile also runs its own
+gateway (the s6 per-profile services). With no gate, profile B's gateway and the
+launch gateway both tick B's store: the per-home
 ``cron/.tick.lock`` stops a simultaneous double-run, but which process wins is a race, and when
 the launch gateway wins, B's delivery leaves through ``SharedRouteAdapters``/fail-closed instead
 of B's own live adapters.
