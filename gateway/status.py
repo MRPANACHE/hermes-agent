@@ -564,6 +564,10 @@ def _managed_launcher_gateway_command(pid: int) -> Optional[str]:
 
     if argv[3] != _launcher_script("hermes", Path(__file__).resolve().parents[1], None):
         return None
+    # These bootstrap modes exit before the Hermes CLI; their trailing arguments
+    # describe another command, never this process's gateway identity.
+    if argv[4] in {"--run-module", "--print-runtime-command"}:
+        return None
     command = "hermes " + shlex.join(argv[4:])
     return command if looks_like_gateway_runtime_command_line(command) else None
 

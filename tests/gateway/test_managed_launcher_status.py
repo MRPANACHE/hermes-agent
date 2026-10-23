@@ -57,6 +57,8 @@ def test_managed_launcher_rejects_unrelated_inline_source_and_recycled_pid(tmp_p
         [*real_argv[:3], real_argv[3] + "\n# altered", *real_argv[4:]],
         _launcher_argv("--profile", "milo", "gateway", "run"),
         _launcher_argv("--profile", "bram", "gateway", "status"),
+        _launcher_argv("--run-module", "some.worker", "--profile", "bram", "gateway", "run"),
+        _launcher_argv("--print-runtime-command", "--profile", "bram", "gateway", "run"),
     ):
         _live(monkeypatch, argv)
         assert status.get_runtime_status_running_pid(record, expected_home=home) is None
