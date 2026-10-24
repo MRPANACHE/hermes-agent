@@ -100,8 +100,22 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived", "cancelled"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+CONNECTION_LIFECYCLE_SCHEMA = "hermes.connection_lifecycle.v1"
+
+
+def set_connection_enabled(conn, *, binding, enabled, actor, request_id):
+    """Apply an authenticated owner connection change; never stop running work."""
+    from hermes_cli.kanban_connections import set_connection_enabled as apply
+    return apply(conn, binding=binding, enabled=enabled, actor=actor, request_id=request_id)
+
+
+def read_connection_lifecycle(conn, *, binding):
+    """Read durable admission, exact scope counts and the latest owner receipt."""
+    from hermes_cli.kanban_connections import read_connection_lifecycle as read
+    return read(conn, binding=binding)
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -4624,6 +4638,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    spawn_pending: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4634,6 +4649,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_connections import SCHEMA, task_admitted
+        if not task_admitted(conn, get_task(conn, task_id)):
+            return None
         # Dispatcher read and claim may race a new operator control. Revalidate
         # this typed admission under the ordinary claim lock, before any repair.
         budget = conn.execute("SELECT id FROM task_events WHERE task_id=? "
@@ -4752,6 +4770,8 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        if spawn_pending:
+            _append_event(conn, task_id, "spawn_pending", {"schema": SCHEMA}, run_id=run_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -4768,6 +4788,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    spawn_pending: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4784,6 +4805,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_connections import SCHEMA, task_admitted
+        if not task_admitted(conn, get_task(conn, task_id)):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4850,6 +4874,8 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
+        if spawn_pending:
+            _append_event(conn, task_id, "spawn_pending", {"schema": SCHEMA}, run_id=run_id)
         return get_task(conn, task_id)
 
 
@@ -9687,7 +9713,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
             (int(pid), task_id),
@@ -10834,7 +10860,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds, spawn_pending=True)
         if claimed is None:
             continue
         try:
@@ -10858,20 +10884,15 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            from hermes_cli.kanban_connections import spawn_claimed
+            launched = spawn_claimed(conn, claimed, str(workspace), _spawn, board)
+            if not launched["spawned"]:
+                if launched.get("stop_required"):
+                    spawned += 1
+                    if _per_profile_cap is not None and claimed.assignee:
+                        _per_profile_running[claimed.assignee] = _per_profile_running.get(claimed.assignee, 0) + 1
+                continue
+            pid = launched["pid"]
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10961,7 +10982,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds, spawn_pending=True)
         if claimed is None:
             continue
         try:
@@ -10988,22 +11009,17 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            from hermes_cli.kanban_connections import spawn_claimed
+            launched = spawn_claimed(conn, claimed, str(workspace), _spawn, board, extra_skills=("sdlc-review",))
+            if not launched["spawned"]:
+                if launched.get("stop_required"):
+                    spawned += 1
+                    if _per_profile_cap is not None and claimed.assignee:
+                        _per_profile_running[claimed.assignee] = _per_profile_running.get(claimed.assignee, 0) + 1
+                continue
+            pid = launched["pid"]
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
