@@ -856,12 +856,14 @@ def write_profile_meta(
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,
+    connection_setup: Optional[dict] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
     Only the explicitly passed fields are overwritten; unspecified
     fields preserve existing values. Creates the file if missing.
     Profile directory itself must exist.
+    ``connection_setup`` stores owner-side setup snapshots in this same metadata.
     """
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
@@ -886,6 +888,8 @@ def write_profile_meta(
             existing["display_name"] = display_name.strip()
         else:
             existing.pop("display_name", None)
+    if connection_setup is not None:
+        existing["connection_setup"] = connection_setup
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).
@@ -1080,6 +1084,7 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
+    connection_setup: Optional[dict] = None,
 ) -> Path:
     """Create a new profile directory.
 
@@ -1102,12 +1107,18 @@ def create_profile(
         a marker file so ``hermes update`` skips re-seeding this profile's
         skills. Mutually exclusive with ``clone_config``/``clone_all`` (those
         explicitly copy skills from the source).
+    connection_setup:
+        Optional owner-side setup metadata, recorded before bootstrap. Only
+        fresh creation or exact pending-owner bootstrap resumption is supported;
+        this never enables cloning credentials.
 
     Returns
     -------
     Path
         The newly created profile directory.
     """
+    if connection_setup is not None and (clone_from is not None or clone_config or clone_all):
+        raise ValueError("Managed connection creation cannot clone a profile")
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
@@ -1123,7 +1134,17 @@ def create_profile(
 
     profile_dir = get_profile_dir(canon)
     if profile_dir.exists():
-        raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
+        # Alleen dezelfde duurzaam vastgelegde eigenaar mag bootstrap hervatten.
+        import yaml
+        saved_owner = None
+        if connection_setup is not None and connection_setup.get("pending"):
+            metadata_path = _profile_yaml_path(profile_dir)
+            if metadata_path.is_file():
+                metadata = yaml.safe_load(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(metadata, dict):
+                    saved_owner = metadata.get("connection_setup")
+        if connection_setup is None or saved_owner != connection_setup:
+            raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
     # Resolve clone source
     source_dir = None
@@ -1155,6 +1176,9 @@ def create_profile(
     else:
         # Bootstrap directory structure
         profile_dir.mkdir(parents=True, exist_ok=True)
+        # Leg eigenaarschap vast voordat verdere bootstrap kan mislukken.
+        if connection_setup is not None:
+            write_profile_meta(profile_dir, connection_setup=connection_setup)
         for subdir in _PROFILE_DIRS:
             (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
 

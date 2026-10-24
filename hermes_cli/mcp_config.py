@@ -85,12 +85,13 @@ def _get_mcp_servers(config: Optional[dict] = None) -> Dict[str, dict]:
     return servers
 
 
-def _save_mcp_server(name: str, server_config: dict) -> bool:
+def _save_mcp_server(name: str, server_config: dict, *, preserve_templates: bool = False) -> bool:
     """Add or update a server entry in config.yaml.
 
     Returns False when a high-signal exfiltration-shaped stdio command is
     rejected. MCP stdio servers are user-chosen local commands, so this blocks
     shell+egress payloads rather than whitelisting command families.
+    ``preserve_templates`` keeps raw env references for reviewed owner writeback.
     """
     issues = validate_mcp_server_entry(name, server_config)
     if issues:
@@ -98,15 +99,23 @@ def _save_mcp_server(name: str, server_config: dict) -> bool:
             _warning(issue)
         _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
         return False
-    config = load_config()
+    if preserve_templates:
+        from hermes_cli.config import read_user_config_raw
+        config = read_user_config_raw()
+    else:
+        config = load_config()
     config.setdefault("mcp_servers", {})[name] = server_config
     save_config(config)
     return True
 
 
-def _remove_mcp_server(name: str) -> bool:
-    """Remove a server from config.yaml.  Returns True if it existed."""
-    config = load_config()
+def _remove_mcp_server(name: str, *, preserve_templates: bool = False) -> bool:
+    """Remove a server; optionally preserve raw templates in unrelated entries."""
+    if preserve_templates:
+        from hermes_cli.config import read_user_config_raw
+        config = read_user_config_raw()
+    else:
+        config = load_config()
     servers = config.get("mcp_servers", {})
     if name not in servers:
         return False
