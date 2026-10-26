@@ -571,6 +571,12 @@ def _portable_git_candidates() -> list:
     """
     from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
+    if sys.platform == "win32":
+        from pm import installed_package
+        selected = installed_package("git", allow_outdated=True)
+        if selected is not None:
+            candidates.extend(selected.path / arch / "libexec" / "git-core" / "git.exe"
+                              for arch in ("clangarm64", "mingw64", "mingw32"))
     with suppress(Exception):
         candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
     return candidates

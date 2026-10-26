@@ -59,14 +59,17 @@ def _local_target(claims: dict[str, Any] | None, _api_request_profile) -> tuple[
 
 def _local_room_catalog(self, profile: str, installation_id: str) -> tuple[dict, dict]:
     """Return ``(execution_policy, catalog)`` for this gateway's *profile*."""
-    from gateway.hosted_room_peer import PROTOCOL_VERSION, catalog_mapping
+    from gateway.hosted_room_peer import PROTOCOL_VERSION, catalog_mapping, local_room_link_endpoint
     from gateway.hosted_room_execution_policy import execution_policy_mapping
     with self._profile_scope(profile):
+        # Endpoint resolution loads gateway/plugin configuration. Resolve it
+        # before signing the policy, in the same served profile scope.
+        endpoint = local_room_link_endpoint()
         execution_policy = execution_policy_mapping(target_profile=profile)
     catalog = catalog_mapping(
         installation_id=installation_id, protocol_versions=(PROTOCOL_VERSION,), link_modes=("direct",),
         persistent_process=True, text=True, attachments=False, target_profile=profile,
-        execution_policy=execution_policy)
+        execution_policy=execution_policy, endpoint=endpoint)
     return execution_policy, catalog
 
 

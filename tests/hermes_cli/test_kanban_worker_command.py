@@ -77,10 +77,13 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
 ):
     root, workspace, captured = spawn_env
     monkeypatch.setenv("WORKER_COMMAND_SECRET", "host-secret-must-not-leak")
+    executable = workspace / "codex-sub"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
     _write_profile(
         root,
         "engine",
-        "worker:\n  command:\n    - /home/david/bin/codex-sub\n"
+        f"worker:\n  command:\n    - {json.dumps(str(executable))}\n"
         "    - luna\n    - --\n    - fixed instruction; read HERMES_KANBAN_TASK_ID\n",
     )
 
@@ -91,7 +94,7 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     assert captured["cmd"] == SUPERVISOR
     assert captured["kwargs"].get("shell", False) is False
     assert json.loads(captured["env"]["HERMES_KANBAN_WORKER_COMMAND"]) == [
-        "/home/david/bin/codex-sub",
+        str(executable),
         "luna",
         "--",
         "fixed instruction; read HERMES_KANBAN_TASK_ID",
