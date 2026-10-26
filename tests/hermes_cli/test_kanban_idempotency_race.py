@@ -51,7 +51,7 @@ def test_create_task_idempotency_key_is_race_safe(kanban_home, monkeypatch):
                 results[number] = kb.create_task(
                     conn, title=f"racer-{number}", idempotency_key=key
                 )
-        except Exception as exc:  # noqa: BLE001 - surfaced by assertions below
+        except Exception as exc:
             errors[number] = repr(exc)
 
     threads = [threading.Thread(target=worker, args=(number,)) for number in range(3)]

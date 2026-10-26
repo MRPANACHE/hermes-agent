@@ -6,6 +6,7 @@ AUTHOR_MAP dict in scripts/releases/authors_legacy.py is frozen; authors.py
 merges both at import time with the directory winning on duplicates.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -135,3 +136,50 @@ def test_case_collision_uses_casefold(emails_dir):
     (emails_dir / "strasse@example.com").write_text("someone\n")
     assert add_contributor("STRASSE@example.com", "someone") == 1
     assert add_contributor("straße@example.com", "someone") == 1
+
+
+@pytest.mark.platforms("linux")
+def test_attribution_workflow_uses_target_branch_and_still_rejects_new_unmapped_authors(tmp_path):
+    """Execute the real Ubuntu workflow command against diverging Git refs."""
+    from ruamel.yaml import YAML
+
+    workflow = YAML(typ="safe").load(
+        (REPO_ROOT / ".github/workflows/contributor-check.yml").read_text(encoding="utf-8-sig")
+    )
+    command = next(step["run"] for step in workflow["jobs"]["check-attribution"]["steps"]
+                   if step.get("id") == "check-emails")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
+           "GIT_AUTHOR_EMAIL": "1+fixture@users.noreply.github.com",
+           "GIT_COMMITTER_EMAIL": "1+fixture@users.noreply.github.com"}
+
+    def git(*args, **extra_env):
+        return subprocess.run(["git", *args], cwd=tmp_path, env={**env, **extra_env},
+                              text=True, capture_output=True, timeout=10, check=True).stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git("commit", "--allow-empty", "-m", "main baseline")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("commit", "--allow-empty", "-m", "retained historical source",
+        GIT_AUTHOR_EMAIL="historical-unmapped@example.org")
+    git("update-ref", "refs/remotes/origin/qualified/native", "HEAD")
+    git("commit", "--allow-empty", "-m", "scoped candidate")
+    output = tmp_path / "output"
+
+    def run(target):
+        return subprocess.run(["bash", "-e", "-c", command], cwd=tmp_path,
+                              env={**env, "BASE_REF": target, "GITHUB_OUTPUT": str(output)},
+                              text=True, capture_output=True, timeout=10, check=False)
+
+    qualified = run("qualified/native")
+    assert qualified.returncode == 0, qualified.stdout + qualified.stderr
+    assert "All contributor emails are mapped" in qualified.stdout
+    main = run("main")
+    assert main.returncode == 1
+    assert "historical-unmapped@example.org" in main.stdout
+
+    git("commit", "--allow-empty", "-m", "new unmapped candidate",
+        GIT_AUTHOR_EMAIL="new-unmapped@example.org")
+    unmapped = run("qualified/native")
+    assert unmapped.returncode == 1
+    assert "new-unmapped@example.org" in unmapped.stdout
+    assert "historical-unmapped@example.org" not in unmapped.stdout

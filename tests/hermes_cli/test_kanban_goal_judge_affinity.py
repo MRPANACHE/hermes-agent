@@ -93,7 +93,8 @@ def test_goal_loop_judge_binds_per_task_affinity_scope():
 
     seen = []
 
-    def fake_judge(goal, last_response):
+    def fake_judge(goal, last_response, *, exact_goal):
+        assert exact_goal is True
         seen.append(get_affinity_scope())
         return ("continue", "not yet", False, None, False)
 

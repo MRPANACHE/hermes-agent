@@ -2015,8 +2015,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     @staticmethod
     def _codex_quota_rank(
-        snapshot: Optional[Dict[str, Optional[float]]],
-    ) -> Optional[Tuple[int, float]]:
+        snapshot: Optional[dict[str, Optional[float]]],
+    ) -> Optional[tuple[int, float]]:
         """Rank a Codex quota snapshot without mistaking unknown for empty.
 
         Known usable quota outranks an indeterminate probe. A known fully-used
@@ -2070,7 +2070,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 self._log_no_available_entries()
             return None
 
-        probes: Dict[str, Tuple[str, Optional[Dict[str, Optional[float]]]]] = {}
+        probes: dict[str, tuple[str, Optional[dict[str, Optional[float]]]]] = {}
         for entry in available:
             try:
                 snapshot = auth_mod._probe_codex_quota_snapshot(
@@ -2092,7 +2092,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 refresh=False,
                 model=model,
             )
-            ranked: List[Tuple[int, float, int, PooledCredential]] = []
+            ranked: list[tuple[int, float, int, PooledCredential]] = []
             for entry in current:
                 probed_token, snapshot = probes.get(entry.id, ("", None))
                 if probed_token != entry.access_token:

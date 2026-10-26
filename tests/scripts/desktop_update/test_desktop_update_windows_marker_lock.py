@@ -24,6 +24,7 @@ from tests.scripts.desktop_update.windows_handoff_support import (
     _op,
     _HeldLock,
     _custodian,
+    _log,
 )
 
 
@@ -98,7 +99,13 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 # -- the update child is the delegate before it runs anything ------------------
 
 FIND_UPDATE_CHILD = r"""
-param([int]$Parent, [int]$Seconds)
+param([string]$Control, [int]$Seconds)
+# Cold PowerShell/CIM startup can exceed the production delegate lock's 10s
+# window. Finish observer startup before the fixture opens that window.
+$null = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+[IO.File]::WriteAllText((Join-Path $Control 'ready'), 'ready')
+while (-not [IO.File]::Exists((Join-Path $Control 'go'))) { Start-Sleep -Milliseconds 20 }
+$Parent = [int][IO.File]::ReadAllText((Join-Path $Control 'parent'))
 $deadline = (Get-Date).AddSeconds($Seconds)
 while ((Get-Date) -lt $deadline) {
     $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
@@ -109,6 +116,14 @@ while ((Get-Date) -lt $deadline) {
 exit 1
 """
 
+PROBE_GATED_CLI = HOLD_CLI.replace(
+    "        print('--keep-stash'); return 0",
+    """        Path(os.environ['HANDOFF_HELP_READY']).touch()
+        while not Path(os.environ['HANDOFF_HELP_RELEASE']).exists():
+            time.sleep(0.02)
+        print('--keep-stash'); return 0""",
+)
+
 
 @pytest.mark.platforms('windows')
 def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: Path) -> None:
@@ -117,27 +132,45 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
     Killed there, no update instruction may have run, and the custodian line 1 names releases
     the marker (nothing holds the checkout)."""
     install = tmp_path / 'checkout'
-    publish_fixture_launcher(install, HOLD_CLI)
+    publish_fixture_launcher(install, PROBE_GATED_CLI)
     home = tmp_path / 'home'; home.mkdir()
     hold = tmp_path / 'release-update'
     ran = Path(str(hold) + '.pid')
     marker = home / MARKER
     finder = tmp_path / 'find_child.ps1'
     finder.write_text(FIND_UPDATE_CHILD, encoding='utf-8')
-    script = _script(home, install=install, HANDOFF_HOLD=str(hold))
+    control = tmp_path / 'observer'; control.mkdir()
+    help_ready, help_release = control / 'help-ready', control / 'help-release'
+    observer = subprocess.Popen([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
+                                 '-Control', str(control), '-Seconds', '60'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    script = None
     lock = None
     try:
         deadline = time.monotonic() + 60
+        while not (control / 'ready').exists():
+            assert time.monotonic() < deadline and observer.poll() is None, 'CIM observer never became ready'
+            time.sleep(0.02)
+        script = _script(home, install=install, HANDOFF_HOLD=str(hold),
+                         HANDOFF_HELP_READY=str(help_ready), HANDOFF_HELP_RELEASE=str(help_release))
+        (control / 'parent').write_text(str(script.pid), encoding='utf-8')
+        deadline = time.monotonic() + 60
         while not (marker.exists() and _custodian(home, script.pid)
                    and marker.read_bytes().split(b'\n')[0] == _custodian(home, script.pid).encode()):
-            assert time.monotonic() < deadline and script.poll() is None, 'script never claimed'
+            assert time.monotonic() < deadline and script.poll() is None, (
+                'script never claimed', script.poll(),
+                _log(home))
+            time.sleep(0.02)
+        while not help_ready.exists():
+            assert time.monotonic() < deadline and script.poll() is None, ('help probe never became ready', _log(home))
             time.sleep(0.02)
         lock = _HeldLock(home)   # after the claim, before the delegate publication
-        child = subprocess.run([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
-                                '-Parent', str(script.pid), '-Seconds', '60'],
-                               capture_output=True, text=True, timeout=90, check=False)
-        assert child.returncode == 0, 'the update child never appeared'
-        child_pid = int(child.stdout)
+        (control / 'go').touch()
+        help_release.touch()
+        output, error = observer.communicate(timeout=90)
+        assert observer.returncode == 0, ('the update child never appeared', error, _log(home))
+        child_pid = int(output)
+        assert not ran.exists(), 'the update child ran before it was published as the delegate'
         subprocess.run(['taskkill', '/F', '/PID', str(script.pid)], capture_output=True, check=True)
         script.wait(timeout=30)
         time.sleep(3)
@@ -147,10 +180,13 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
         assert lines[0] == _custodian(home, script.pid), lines
         assert not any(line.startswith('delegate:') for line in lines), lines
     finally:
+        help_release.touch()
+        if observer.poll() is None:
+            observer.kill(); observer.wait()
         if lock:
             lock.release()
         hold.touch()
-        if script.poll() is None:
+        if script is not None and script.poll() is None:
             subprocess.run(['taskkill', '/T', '/F', '/PID', str(script.pid)], capture_output=True, check=False)
             script.wait()
     deadline = time.monotonic() + 60   # the custodian releases the marker once the lock is free

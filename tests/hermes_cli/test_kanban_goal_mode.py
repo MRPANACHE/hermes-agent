@@ -130,25 +130,27 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
 
 
 def test_loop_stops_on_judge_transport_failure(monkeypatch):
-    """Regression #91264: judge transport failure must stop the loop instead of
-    being coerced to continue via WAIT."""
+    """Judge failure retains the original goal without another worker turn."""
     def _failing_judge(*args, **kwargs):
         # 5-tuple: verdict, reason, parse_failed, wait, transport_failed
         return "wait", "judge transport unreachable", False, None, True
 
     monkeypatch.setattr(goals, "judge_goal", _failing_judge)
     turns = []
+    blocks = []
 
     res = goals.run_kanban_goal_loop(
         task_id="t1",
         goal_text="do the thing",
         run_turn=lambda p: turns.append(p) or "x",
         task_status_fn=lambda: "running",
-        block_fn=lambda r: pytest.fail("should not block"),
+        block_fn=blocks.append,
         first_response="first attempt",
     )
-    assert res["outcome"] == "stopped"
-    assert "judge transport failure" in res["reason"]
+    assert res["outcome"] == "blocked_judge_unavailable"
+    assert blocks == [res["reason"]]
+    assert "work and original goal retained" in res["reason"]
+    assert "judge transport unreachable" in res["reason"]
     assert turns == []
 
 

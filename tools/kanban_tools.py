@@ -1492,11 +1492,14 @@ def _goal_mode_handoff_rejection(
     verdict = "done"
     reason = ""
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _, _, transport_failed = judge_goal(
             goal=goal,
             last_response=handoff,
             exact_goal=True,
         )
+        if transport_failed:
+            logger.warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
+            return None
     except Exception as judge_exc:
         # Keep the existing fail-open semantics: an unavailable/broken
         # auxiliary judge must not permanently wedge goal-mode work.

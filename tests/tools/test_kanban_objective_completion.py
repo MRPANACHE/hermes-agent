@@ -186,7 +186,7 @@ def test_external_blocker_uses_existing_needs_input_route(worker, blocker):
 
 
 def test_userstop_no_continuation(worker, monkeypatch):
-    tid, run_id, _ = worker
+    tid, _run_id, _ = worker
     with kb.connect() as conn:
         assert kb.archive_task(conn, tid)
     out = goals.run_kanban_goal_loop(task_id=tid, goal_text="current goal",

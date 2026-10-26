@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -26,7 +26,7 @@ def home(tmp_path, monkeypatch):
 
 
 def at(timestamp):
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    return datetime.fromtimestamp(timestamp, UTC).isoformat()
 
 
 def tick(conn, **kwargs):
@@ -204,7 +204,7 @@ def test_real_cli_schedule_dispatch_receipt(home):
     env["PYTHONPATH"] = str(root)
     def run(*args):
         result = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", *args],
-                                cwd=root, env=env, capture_output=True, text=True, timeout=30)
+                                cwd=root, env=env, capture_output=True, text=True, timeout=30, check=False)
         assert result.returncode == 0, result.stderr
         return result.stdout
     task = json.loads(run("create", "real CLI timer", "--assignee", "otto", "--json"))["id"]

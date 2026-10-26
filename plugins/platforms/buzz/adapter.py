@@ -768,7 +768,7 @@ class BuzzAdapter(BasePlatformAdapter):
             sanitized.append(self._redact_event_value(native_tag))
         return sanitized
 
-    async def read_event(self, channel_id: str, event_id: str) -> Dict[str, Any]:
+    async def read_event(self, channel_id: str, event_id: str) -> dict[str, Any]:
         """Read one exact event from a watched channel without exposing auth.
 
         The Buzz CLI credential remains inside ``_run_cli``'s subprocess

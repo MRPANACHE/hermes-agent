@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from datetime import UTC
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +443,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
     from datetime import datetime, timezone
     import time
     wake_timestamp = int(time.time()) + 3600
-    wake_at = datetime.fromtimestamp(wake_timestamp, timezone.utc).isoformat()
+    wake_at = datetime.fromtimestamp(wake_timestamp, UTC).isoformat()
     reason = "waiting for reconnect"
     entry = registry.get_entry("kanban_schedule")
     assert entry is not None and entry.toolset == "kanban"

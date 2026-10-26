@@ -608,6 +608,8 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
 async def _send_live_buzz_media(adapter, chat_id, message, media_files, *, thread_id=None, metadata=None,
                                 force_document=False):
     """Keep every native Buzz event receipt, including sends preceding a partial failure."""
+    from gateway.platforms.base import BasePlatformAdapter
+
     message_ids = []
     image_only = not force_document and all(
         os.path.splitext(str(media[0] if isinstance(media, (tuple, list)) else media))[1].lower() in _IMAGE_EXTS
@@ -627,7 +629,11 @@ async def _send_live_buzz_media(adapter, chat_id, message, media_files, *, threa
         media_path = media[0] if isinstance(media, (tuple, list)) else media
         is_voice = isinstance(media, (tuple, list)) and len(media) > 1 and bool(media[1])
         ext = os.path.splitext(str(media_path))[1].lower()
-        method_name, _ = _adapter_media_method(ext, is_voice or ext in _AUDIO_EXTS, force_document)
+        method_name, media_kind = _adapter_media_method(ext, is_voice or ext in _AUDIO_EXTS, force_document)
+        adapter_method = getattr(adapter, method_name, None)
+        if adapter_method is None or getattr(adapter_method, "__func__", adapter_method) is getattr(BasePlatformAdapter, method_name):
+            return {"error": f"Live adapter does not implement native {media_kind} delivery; media file {index + 1}/{len(media_files)} was not sent",
+                    "sent_message_ids": message_ids}
         path_kwarg = {
             "send_image_file": "image_path", "send_video": "video_path",
             "send_voice": "audio_path", "send_document": "file_path",
