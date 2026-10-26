@@ -98,6 +98,7 @@ def test_live_buzz_single_image_uses_caption_without_duplicate_text(tmp_path) ->
     assert result == {
         "success": True,
         "message_id": "evt-image",
+        "message_ids": ["evt-image"],
         "media_delivered": True,
     }
     assert calls == [
@@ -173,6 +174,7 @@ def test_live_buzz_media_only_send_reaches_adapter(tmp_path) -> None:
     assert result == {
         "success": True,
         "message_id": "evt-document",
+        "message_ids": ["evt-document"],
         "media_delivered": True,
     }
     assert len(media_calls) == 1
@@ -209,6 +211,7 @@ def test_live_buzz_media_exception_reports_partial_delivery(tmp_path) -> None:
             )
         )
 
+    assert result["sent_message_ids"] == ["evt-text", "evt-first"]
     assert "after 1/2 files" in result["error"]
     assert "relay transport failed" in result["error"]
     assert "media_delivered" not in result
@@ -240,6 +243,7 @@ def test_live_adapter_inherited_media_fallback_is_not_claimed_as_delivery(tmp_pa
             )
         )
 
+    assert result["sent_message_ids"] == []
     assert "does not implement native document delivery" in result["error"]
     assert "media_delivered" not in result
 

@@ -207,8 +207,11 @@ def test_profile_without_command_keeps_native_agent_argv(spawn_env):
     kb._default_spawn(_make_task(), str(workspace))
 
     assert captured["cmd"] != SUPERVISOR
-    assert "chat" in captured["cmd"]
-    assert "work kanban task t_worker_cmd" in captured["cmd"]
+    # Agent workers now submit through the native owner-authority client;
+    # direct commands still use the separate command-worker supervisor.
+    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_worker_client"]
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_worker_cmd"
+    assert captured["env"]["HERMES_HOME"] == str(root / "profiles" / "engine")
 
 
 def test_profile_without_command_keeps_native_profile_scoped_environment(

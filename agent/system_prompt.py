@@ -119,7 +119,7 @@ def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
         return agent._plugin_system_prompt_sections_snapshot
     stored_prompt = getattr(agent, "_cached_system_prompt", None)
     if isinstance(stored_prompt, str) and stored_prompt:
-        rendered = _restore_plugin_prompt_sections(stored_prompt)
+        rendered = _restore_plugin_prompt_sections(stored_prompt, _active_profile_line(agent))
     else:
         try:
             from hermes_cli.plugins import render_system_prompt_sections
@@ -135,7 +135,7 @@ def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
     return rendered
 
 
-def _restore_plugin_prompt_sections(prompt: str) -> tuple:
+def _restore_plugin_prompt_sections(prompt: str, profile_line: str) -> tuple:
     """Recover frozen section bytes from the persisted full prompt.  Only the
     exact canonical container emitted by core is accepted — user/project text
     may resemble a frame."""
@@ -148,7 +148,8 @@ def _restore_plugin_prompt_sections(prompt: str) -> tuple:
     if end < 0:
         return ()
     after_end = end + len(PLUGIN_SECTIONS_END)
-    if not prompt[after_end:].startswith("\n\nConversation started:"):
+    suffix = prompt[after_end:]
+    if not suffix.startswith(("\n\nConversation started:", f"\n\n{profile_line}\n\nConversation started:")):
         return ()
     framed = prompt[start:after_end]
     restored = []
@@ -164,7 +165,7 @@ def _restore_plugin_prompt_sections(prompt: str) -> tuple:
 
 def restore_plugin_prompt_sections(agent: Any, prompt: str) -> None:
     """Seed a resumed agent's frozen snapshot from persisted prompt bytes."""
-    agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt)
+    agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt, _active_profile_line(agent))
 
 
 def _plugin_section_blocks(sections: tuple, position: str) -> list[str]:
@@ -417,6 +418,12 @@ def _default_platform_hint(platform_key: str) -> str:
         try:
             from gateway.platform_registry import platform_registry
             _entry = platform_registry.get(platform_key)
+            if _entry is None:
+                # A prompt can be built before anything ran plugin discovery (direct builders,
+                # one-shot callers); the hint lives on the plugin's entry, so discover (idempotent).
+                from hermes_cli.plugins import discover_plugins
+                discover_plugins()
+                _entry = platform_registry.get(platform_key)
             hint = (_entry and _entry.platform_hint) or ""
         except Exception:
             pass
@@ -528,7 +535,7 @@ def _memory_parts(agent: Any) -> list[str]:
     # configuration has already gated off (#81014).
     if agent._memory_manager:
         try:
-            from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
+            from agent.memory_manager_tools import memory_provider_tools_exposed as _mem_exposed
         except Exception:
             _mem_exposed = None
         if _mem_exposed is None or _mem_exposed(agent):

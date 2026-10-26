@@ -267,6 +267,9 @@ def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatc
     _claim_v2(marker, other_pid)
     base = marker.read_bytes()
     monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+    # The sleeper models an updater, not an unrelated descendant of the real
+    # gateway that may be running pytest. Isolate only this simulated boundary.
+    monkeypatch.setattr(update_lock, "_runtime_host_below", lambda pid: False)
 
     lock = UpdateLock(path=marker)
     assert lock.acquire() is True and lock.acquired is False
@@ -635,6 +638,8 @@ class TestHandoffFromOrchestratingUpdater:
         # other_pid stands in for the live parent updater.
         _claim(marker, other_pid)
         monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+        # Synthetic partner: this test is not an update launched by a gateway.
+        monkeypatch.setattr(update_lock, "_runtime_host_below", lambda pid: False)
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True
@@ -1003,3 +1008,14 @@ def test_whole_second_creation_time_in_our_own_second_is_us(marker):
     assert update_lock.judge_marker(marker.read_bytes())[0] == "ours"
     # A whole second from an EARLIER second is a killed update's pid reused: still not us.
     assert update_lock.incarnation_live(os.getpid(), float(math.floor(own)) - 1) is False
+
+
+def test_explicit_handoff_never_adopts_across_runtime_host(marker, monkeypatch, other_pid):
+    """A gateway-launched agent cannot adopt an unrelated updater's live claim."""
+    _claim_v2(marker, other_pid)
+    before = marker.read_bytes()
+    monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+    monkeypatch.setattr(update_lock, "_runtime_host_below", lambda pid: True)
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    assert marker.read_bytes() == before
