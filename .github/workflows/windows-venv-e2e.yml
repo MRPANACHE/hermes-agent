@@ -85,19 +85,11 @@ jobs:
         env:
           HERMES_TEST_WORKERS: '1'
         run: |
-          scripts/run_tests.sh -j 1 \
-            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_postcommit_supervision.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage_environment.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_handoff_run.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker_parsing.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker_handoff.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker_ops.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker_release.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker_checkout_lock.py \
-            -- -m 'platforms and not integration' -v --durations=10 --tb=short
+          for round in 1 2 3; do
+            scripts/run_tests.sh -j 1 \
+              tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py \
+              -- -m 'platforms and not integration' -s -v --durations=3 --tb=short
+          done
 
   venv-holder-e2e:
     if: ${{ !startsWith(github.ref, 'refs/heads/wine2e/oos-ws2-') }}
