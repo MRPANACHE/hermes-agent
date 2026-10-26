@@ -1,6 +1,6 @@
 """Drain/ESTOP keep running lifecycle maintenance, never admit new work."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 import signal
 
@@ -38,7 +38,7 @@ async def test_paused_gateway_maintains_workers_without_admission(tmp_path, monk
     # Only simulated fixture PIDs can be signalled. Production signal rules
     # themselves are exercised unchanged, including the normal TERM grace.
     monkeypatch.setattr(kbd, "_kill_fn", lambda _signal_fn: record_signal)
-    monkeypatch.setattr(kbd, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(kbd, "reap_worker_zombies", list)
     monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda value: value)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
         "kanban": {
@@ -82,7 +82,7 @@ async def test_paused_gateway_maintains_workers_without_admission(tmp_path, monk
         review = kb.create_task(conn, title="review", assignee="otto")
         kb.request_review(conn, review, summary="fixture")
         scheduled = kb.create_task(conn, title="due timer", assignee="otto")
-        kb.schedule_task(conn, scheduled, wake_at=datetime.fromtimestamp(now-1, timezone.utc).isoformat())
+        kb.schedule_task(conn, scheduled, wake_at=datetime.fromtimestamp(now-1, UTC).isoformat())
         before = {tid: kb.get_task(conn, tid) for tid in [live, remote, ready, review, scheduled]}
         spawn_events_before = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='spawned'").fetchone()[0]
 

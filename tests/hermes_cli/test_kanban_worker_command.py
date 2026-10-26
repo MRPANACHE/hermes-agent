@@ -385,6 +385,7 @@ def _run_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
 
 
@@ -419,6 +420,7 @@ def _run_supervisor_mode(
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
 
 

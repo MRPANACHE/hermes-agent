@@ -720,7 +720,7 @@ _codex_quota_probe_lock = threading.Lock()
 
 def _codex_quota_probe_cache_key(token: str, base_url: Optional[str] = None) -> str:
     usage_url = _codex_usage_probe_url(base_url)
-    return hashlib.sha256(f"{usage_url}\0{token}".encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(f"{usage_url}\0{token}".encode()).hexdigest()[:16]
 
 
 def _codex_usage_probe_url(base_url: Optional[str]) -> str:
@@ -738,7 +738,7 @@ def _codex_usage_probe_url(base_url: Optional[str]) -> str:
 
 def _probe_codex_quota_snapshot(
     access_token: Any, *, base_url: Optional[str] = None,
-    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[Dict[str, Optional[float]]]:
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[dict[str, Optional[float]]]:
     """Return Codex usage windows; unknown stays None, and HTTP 429 means fully used.
 
     Probe results are cached per access token and endpoint. Additional model-scoped limits
@@ -758,7 +758,7 @@ def _probe_codex_quota_snapshot(
             return cached[1]
         # Reserve the slot immediately so concurrent selectors don't stampede the endpoint.
         _codex_quota_probe_cache[cache_key] = (now, None)
-    result: Optional[Dict[str, Optional[float]]] = None
+    result: Optional[dict[str, Optional[float]]] = None
     try:
         # Account/residency headers from the JWT (required for some account shapes).
         from agent.codex_headers import codex_account_headers

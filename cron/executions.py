@@ -155,7 +155,7 @@ def recovery_job_scope(job):
                                     ensure_ascii=False).encode()).hexdigest()
 
 
-def recovery_lineage_snapshot(conn: sqlite3.Connection, task_id: str) -> Dict[str, Any]:
+def recovery_lineage_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """Return the canonical native blocked-request lineage for recovery.
 
     This is intentionally shared by ingress and the owner tick.  It only reads
@@ -324,7 +324,7 @@ def scheduled_recovery_status(failure_id):
         conn.close()
 
 
-def latest_scheduled_failure(job_id: str) -> Optional[Dict[str, Any]]:
+def latest_scheduled_failure(job_id: str) -> Optional[dict[str, Any]]:
     """Read the newest failed attempt, query-only and without schema init."""
     conn = _connect_readonly()
     if conn is None:
@@ -346,7 +346,7 @@ def latest_scheduled_failure(job_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
-def scheduled_recovery_by_ref(ref: str) -> Optional[Dict[str, Any]]:
+def scheduled_recovery_by_ref(ref: str) -> Optional[dict[str, Any]]:
     """Find a recovery by its canonical SHA-256 binding reference.
 
     The reference is recomputed from the decoded JSON, rather than trusting a

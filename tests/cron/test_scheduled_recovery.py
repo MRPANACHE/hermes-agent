@@ -1,6 +1,6 @@
 """Bounded recovery preserves owner, exact failure lineage, idempotency and cadence."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import hashlib
 import json
 import sqlite3
@@ -33,7 +33,7 @@ def recovery_case(tmp_path, monkeypatch):
     owner = tmp_path / "owner"
     owner.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(owner))
-    now = datetime(2026, 10, 11, 8, 30, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 11, 8, 30, tzinfo=UTC)
     monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
     monkeypatch.setattr(executions, "_hermes_now", lambda: now)
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
@@ -74,7 +74,7 @@ def test_storage_only_reads_do_not_create_or_change_profile(tmp_path, monkeypatc
 
 
 def test_recovery_claim_and_terminal_write_preserve_cadence_and_evidence(recovery_case):
-    owner, job, binding, _board = recovery_case
+    _owner, job, binding, _board = recovery_case
     executions.admit_scheduled_recovery(binding, "New verified evidence")
     claimed, prompt = executions.claim_scheduled_recovery(binding["failure_id"])
     assert prompt == "New verified evidence"

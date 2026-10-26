@@ -828,11 +828,11 @@ def terminate_process_tree(pid: int, *, force: bool = False) -> None:
 
     import signal
 
-    signum = signal.SIGKILL if force else signal.SIGTERM
+    signum = signal.SIGKILL if force else signal.SIGTERM  # windows-footgun: ok — Windows branch returned above
     try:
         pgid = os.getpgid(int(pid))
         if pgid == int(pid):
-            os.killpg(pgid, signum)
+            os.killpg(pgid, signum)  # windows-footgun: ok — Windows branch returned above
             return
     except Exception:
         pass

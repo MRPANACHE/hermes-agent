@@ -165,7 +165,7 @@ class TestRegister:
     ):
         secret = _strong_secret()
         monkeypatch.setenv("HERMES_DASHBOARD_DRAIN_SECRET", secret)
-        monkeypatch.setattr(drain, "_load_config_drain_auth_section", lambda: {})
+        monkeypatch.setattr(drain, "_load_config_drain_auth_section", dict)
 
         def fail_route_registration(*args, **kwargs):
             raise ValueError("route conflict")
