@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-latest]
+        runner: [windows-latest, windows-11-arm]
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
       - name: Set up native ARM64 build dependencies
@@ -85,24 +85,19 @@ jobs:
         env:
           HERMES_TEST_WORKERS: '1'
         run: |
-          probe_exit=0
           scripts/run_tests.sh -j 1 \
             tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            -- -m 'platforms and not integration' -s -v --durations=0 --tb=short || probe_exit=1
-          scripts/run_tests.sh -j 1 \
-            tests/hermes_cli/test_git_trampoline_windows_live.py -- -m 'platforms and not integration' -v --durations=10 --tb=short || probe_exit=1
-          scripts/run_tests.sh -j 1 \
-            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            -- -m 'platforms and not integration' -k test_hanging_update_help_probe_is_bounded -v --durations=10 --tb=short || probe_exit=1
-          scripts/run_tests.sh -j 1 \
-            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            -- -m 'platforms and not integration' -k 'not test_hanging_update_help_probe_is_bounded' -v --durations=12 --tb=short || probe_exit=1
-          scripts/run_tests.sh -j 1 \
+            tests/scripts/desktop_update/test_desktop_update_windows_postcommit_supervision.py \
             tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage_environment.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_run.py \
             tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py \
-            -- -m 'platforms and not integration' -v --tb=short || probe_exit=1
-          exit "$probe_exit"
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_parsing.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_handoff.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_ops.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_release.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_checkout_lock.py \
+            -- -m 'platforms and not integration' -v --durations=10 --tb=short
 
   venv-holder-e2e:
     if: ${{ !startsWith(github.ref, 'refs/heads/wine2e/oos-ws2-') }}
