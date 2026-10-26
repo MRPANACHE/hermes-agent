@@ -131,7 +131,9 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
         deadline = time.monotonic() + 60
         while not (marker.exists() and _custodian(home, script.pid)
                    and marker.read_bytes().split(b'\n')[0] == _custodian(home, script.pid).encode()):
-            assert time.monotonic() < deadline and script.poll() is None, 'script never claimed'
+            assert time.monotonic() < deadline and script.poll() is None, (
+                'script never claimed', script.poll(),
+                (home / 'logs/desktop-update-handoff.log').read_text(encoding='utf-8-sig'))
             time.sleep(0.02)
         lock = _HeldLock(home)   # after the claim, before the delegate publication
         # Runtime/help probes precede the update. Observe their completion before
