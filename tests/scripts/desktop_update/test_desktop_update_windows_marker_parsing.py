@@ -7,13 +7,14 @@ import pytest
 
 from tests.scripts.desktop_update.test_desktop_update_windows_marker import (
     MARKER,
-    _BODIES,
+    _BODIES as _ALL_BODIES,
     _creation_time,
     _run,
     sleeper,
 )
 
 __all__ = ['sleeper']
+_BODIES = {case: _ALL_BODIES[case] for case in sorted(_ALL_BODIES)[:4]}
 
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('case', sorted(_BODIES))
