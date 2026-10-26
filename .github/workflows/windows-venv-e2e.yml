@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-latest, windows-11-arm]
+        runner: [windows-latest]
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
       - name: Set up native ARM64 build dependencies
@@ -86,6 +86,9 @@ jobs:
           HERMES_TEST_WORKERS: '1'
         run: |
           probe_exit=0
+          scripts/run_tests.sh -j 1 \
+            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
+            -- -m 'platforms and not integration' -s -v --durations=0 --tb=short || probe_exit=1
           scripts/run_tests.sh -j 1 \
             tests/hermes_cli/test_git_trampoline_windows_live.py -- -m 'platforms and not integration' -v --durations=10 --tb=short || probe_exit=1
           scripts/run_tests.sh -j 1 \

@@ -75,6 +75,8 @@ if __name__ == '__main__':
 
 
 def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 150, prepare=None, **env: str):
+    trace_started = time.monotonic()
+    print('OOS_HANDOFF_START', tmp_path.name, trace_started, 'help_hang', bool(env.get('HANDOFF_HELP_HANG')), flush=True)
     install = tmp_path / 'checkout'
     publish_fixture_launcher(install, CLI)
     (install / 'hermes_cli/desktop_update_verify.py').write_text(verify, encoding='utf-8')
@@ -92,12 +94,15 @@ def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 
     try:
         out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        print('OOS_HANDOFF_OUTER_TIMEOUT', proc.pid, time.monotonic() - trace_started, flush=True)
         subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True, check=False)
+        print('OOS_HANDOFF_TASKKILL_RETURNED', proc.poll(), time.monotonic() - trace_started, flush=True)
         out, _ = proc.communicate()
         pytest.fail(f'hand-off did not finish within {timeout}s: {out}')
     argv = [json.loads(line) for line in calls.read_text(encoding='utf-8-sig').splitlines()] if calls.exists() else []
     result_path = home / '.hermes-update-result.json'
     result = json.loads(result_path.read_text(encoding='utf-8-sig')) if result_path.is_file() else None
+    print('OOS_HANDOFF_FINISH', tmp_path.name, time.monotonic() - trace_started, flush=True)
     return proc.returncode, out, argv, result, home
 
 
