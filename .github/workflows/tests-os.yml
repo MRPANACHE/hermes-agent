@@ -71,7 +71,7 @@ permissions:
 
 concurrency:
   group: tests-os-${{ (github.ref_type == 'tag' || inputs.commit != '') && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' && inputs.commit == '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.commit == '' }}
 
 jobs:
   os-tests:
@@ -192,7 +192,7 @@ jobs:
             -v --tb=short
         env:
           # Bound nested PowerShell trees to the standard public runner's cores.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '1' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
