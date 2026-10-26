@@ -85,19 +85,21 @@ jobs:
         env:
           HERMES_TEST_WORKERS: '1'
         run: |
+          probe_exit=0
           scripts/run_tests.sh -j 1 \
-            tests/hermes_cli/test_git_trampoline_windows_live.py -- -m 'platforms and not integration' -v --durations=10 --tb=short
-          scripts/run_tests.sh -j 1 \
-            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            -- -m 'platforms and not integration' -k test_hanging_update_help_probe_is_bounded -v --durations=10 --tb=short
+            tests/hermes_cli/test_git_trampoline_windows_live.py -- -m 'platforms and not integration' -v --durations=10 --tb=short || probe_exit=1
           scripts/run_tests.sh -j 1 \
             tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
-            -- -m 'platforms and not integration' -k 'not test_hanging_update_help_probe_is_bounded' -v --durations=12 --tb=short
+            -- -m 'platforms and not integration' -k test_hanging_update_help_probe_is_bounded -v --durations=10 --tb=short || probe_exit=1
+          scripts/run_tests.sh -j 1 \
+            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
+            -- -m 'platforms and not integration' -k 'not test_hanging_update_help_probe_is_bounded' -v --durations=12 --tb=short || probe_exit=1
           scripts/run_tests.sh -j 1 \
             tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py \
             tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
             tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py \
-            -- -m 'platforms and not integration' -v --tb=short
+            -- -m 'platforms and not integration' -v --tb=short || probe_exit=1
+          exit "$probe_exit"
 
   venv-holder-e2e:
     if: ${{ !startsWith(github.ref, 'refs/heads/wine2e/oos-ws2-') }}
