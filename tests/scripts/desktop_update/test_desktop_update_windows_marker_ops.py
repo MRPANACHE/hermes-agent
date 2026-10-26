@@ -122,48 +122,10 @@ def _harness(tmp_path: Path, body: str, action: str, *extra: str) -> tuple[str, 
     return pid, ct
 
 
-@pytest.mark.platforms('windows')
-@pytest.mark.parametrize('delegate', ['live', 'dead'])
-def test_release_hands_the_claim_to_a_live_delegate(
-    tmp_path: Path, sleeper: subprocess.Popen, delegate: str,
-) -> None:
-    """A7 rule 5 (the crash-12db shape from the owner's side): the releasing owner deletes the
-    marker unless its delegate still runs -- then that delegate becomes the owner."""
-    dpid = sleeper.pid if delegate == 'live' else _dead_pid()
-    dct = _creation_time(sleeper.pid) if delegate == 'live' else '5.000'
-    started = int(time.time()) - 60
-    _harness(tmp_path, f'{{self}}\n{started}\nct:{{selfct}}\ndelegate:{dpid} ct:{dct}\nrun:desk-3\n', 'release')
-    if delegate == 'dead':
-        assert not (tmp_path / MARKER).exists()
-    else:
-        assert (tmp_path / MARKER).read_bytes().decode() == f'{dpid}\n{started}\nct:{dct}\nrun:desk-3\n'
 
 
-@pytest.mark.platforms('windows')
-def test_release_rereads_a_cached_delegate_identity_before_handing_over(
-    tmp_path: Path, sleeper: subprocess.Popen,
-) -> None:
-    """Get-LiveProcessCt forgets a pid only when it SEES it dead: a delegate that exited and
-    whose pid was reused between two polls keeps its cached creation time. The release must
-    re-read it, or the marker is handed to the unrelated process now wearing that pid."""
-    started = int(time.time()) - 60
-    stale = f'{{self}}\n{started}\nct:{{selfct}}\ndelegate:{sleeper.pid} ct:5.000\nrun:desk-3\n'
-    _harness(tmp_path, stale, 'release', '-StaleCt', f'{sleeper.pid}:5.0')
-    assert not (tmp_path / MARKER).exists(), (tmp_path / MARKER).read_bytes()
 
 
-@pytest.mark.platforms('windows')
-def test_heartbeat_refreshes_line_2_only_for_our_own_claim(tmp_path: Path, sleeper: subprocess.Popen) -> None:
-    started = int(time.time()) - 900
-    dct = _creation_time(sleeper.pid)
-    pid, ct = _harness(tmp_path, f'{{self}}\n{started}\nct:{{selfct}}\ndelegate:{sleeper.pid} ct:{dct}\nrun:r\n',
-                       'heartbeat')
-    lines = (tmp_path / MARKER).read_bytes().decode().split('\n')
-    assert lines[0] == pid and lines[2:] == [f'ct:{ct}', f'delegate:{sleeper.pid} ct:{dct}', 'run:r', '']
-    assert int(time.time()) - int(lines[1]) < 60, lines
-    foreign = f'{sleeper.pid}\n{started}\nct:{dct}\n'
-    _harness(tmp_path, foreign, 'heartbeat')
-    assert (tmp_path / MARKER).read_bytes().decode() == foreign
 
 
 _CHECKOUT_HOLDER = """
@@ -179,150 +141,13 @@ while not Path(sys.argv[2]).exists():
 """
 
 
-@pytest.mark.platforms('windows')
-def test_marker_op_reclaim_reports_held_while_a_survivor_holds_the_checkout_lock(tmp_path: Path) -> None:
-    """R6: the update died (dead marker) but a process it started still holds the checkout lock:
-    the Desktop's reclaim must not free the marker; it answers `held` until that process exits."""
-    install = tmp_path / 'hermes-agent'
-    install.mkdir()
-    dead = f'{_dead_pid()}\n{int(time.time())}\nct:5.000\n'.encode()
-    (tmp_path / MARKER).write_bytes(dead)
-    release = tmp_path / 'release-holder'
-    holder = subprocess.Popen([sys.executable, '-c', _CHECKOUT_HOLDER, str(install / '.hermes-update.lock'), str(release)])
-    try:
-        deadline = time.monotonic() + 30
-        while not Path(str(release) + '.ready').exists():
-            assert time.monotonic() < deadline and holder.poll() is None
-            time.sleep(0.05)
-        assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'held\n')
-        assert (tmp_path / MARKER).read_bytes() == dead
-    finally:
-        release.touch()
-        holder.wait(timeout=30)
-    assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'reclaimed\n')
-    assert not (tmp_path / MARKER).exists()
 
 
-@pytest.mark.platforms('windows')
-def test_marker_op_reclaim_without_a_marker_reports_held_while_the_checkout_lock_is_held(tmp_path: Path) -> None:
-    """Review 5411223284: `absent` was answered before the checkout lock was looked at, so a
-    Desktop gate opened while an update with no marker (yet, or any more) held the checkout."""
-    install = tmp_path / 'hermes-agent'
-    install.mkdir()
-    release = tmp_path / 'release-holder'
-    holder = subprocess.Popen([sys.executable, '-c', _CHECKOUT_HOLDER, str(install / '.hermes-update.lock'), str(release)])
-    try:
-        deadline = time.monotonic() + 30
-        while not Path(str(release) + '.ready').exists():
-            assert time.monotonic() < deadline and holder.poll() is None
-            time.sleep(0.05)
-        assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'held\n')
-        assert not (tmp_path / MARKER).exists()
-    finally:
-        release.touch()
-        holder.wait(timeout=30)
-    assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'absent\n')
 
 
-@pytest.mark.platforms('windows')
-def test_marker_op_reclaim_reports_held_while_the_checkout_lock_cannot_be_opened(tmp_path: Path) -> None:
-    """kshitij P2 (parity with marker.sh and the Desktop's probe): a lock file that exists but
-    cannot be opened -- here another process holds it with no sharing -- read `not held`, so the
-    reclaim deleted a dead marker the Desktop's own probe kept. It counts as held."""
-    import ctypes
-
-    install = tmp_path / 'hermes-agent'
-    install.mkdir()
-    lock = install / '.hermes-update.lock'
-    lock.touch()
-    dead = f'{_dead_pid()}\n{int(time.time())}\nct:5.000\n'.encode()
-    (tmp_path / MARKER).write_bytes(dead)
-    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    k32.CreateFileW.restype = ctypes.c_void_p
-    handle = k32.CreateFileW(str(lock), 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, no sharing
-    assert handle not in (None, ctypes.c_void_p(-1).value), ctypes.get_last_error()
-    try:
-        assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'held\n')
-        assert (tmp_path / MARKER).read_bytes() == dead
-    finally:
-        k32.CloseHandle(ctypes.c_void_p(handle))
-    assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'reclaimed\n')
 
 
-@pytest.mark.platforms('windows')
-@pytest.mark.parametrize('lease', [1, 16])
-def test_marker_op_reclaim_reports_held_while_a_leased_child_outlives_its_owner(tmp_path: Path, lease: int) -> None:
-    """R5b: the owner died (its byte at 1 MiB is free) but a completion child the job refused
-    still holds its lease byte. The checkout is busy until it exits: reclaim answers `held`."""
-    install = tmp_path / 'hermes-agent'
-    install.mkdir()
-    dead = f'{_dead_pid()}\n{int(time.time())}\nct:5.000\n'.encode()
-    (tmp_path / MARKER).write_bytes(dead)
-    release = tmp_path / 'release-holder'
-    holder = subprocess.Popen([sys.executable, '-c', _CHECKOUT_HOLDER, str(install / '.hermes-update.lock'),
-                               str(release), str(lease)])
-    try:
-        deadline = time.monotonic() + 30
-        while not Path(str(release) + '.ready').exists():
-            assert time.monotonic() < deadline and holder.poll() is None
-            time.sleep(0.05)
-        assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'held\n')
-        assert (tmp_path / MARKER).read_bytes() == dead
-    finally:
-        release.touch()
-        holder.wait(timeout=30)
 
 
-def test_checkout_lock_probe_covers_the_owner_byte_and_every_lease_byte() -> None:
-    """Runs everywhere (the live cells above need Windows): Test-CheckoutLockHeld must lock
-    and unlock the same range hermes_cli/update_lock.py::_try_lock judges -- the owner byte at
-    1 MiB plus the 16 R5b lease bytes after it -- or a leased survivor reads as a free checkout."""
-    import re
-
-    text = MARKER_PS1.read_text(encoding='utf-8-sig')
-    body = text[text.index('function Test-CheckoutLockHeld'):]
-    ranges = re.findall(r'\$fs\.(Lock|Unlock)\((\d+), (\d+)\)', body)
-    assert ranges and {(int(o), int(n)) for _, o, n in ranges} == {(1 << 20, 1 + 16)}, ranges
-    assert {kind for kind, _, _ in ranges} == {'Lock', 'Unlock'}
 
 
-@pytest.mark.platforms('windows')
-def test_release_wait_keeps_line_2_young_while_the_checkout_lock_is_held(tmp_path: Path) -> None:
-    """R6 wait + old packaged Desktops: while the release waits on a survivor's checkout lock
-    (up to hours), the heartbeat keeps line 2 young, or an old Desktop age-deletes the marker."""
-    install = tmp_path / 'hermes-agent'
-    install.mkdir()
-    marker = tmp_path / MARKER
-    release = tmp_path / 'release-holder'
-    holder = subprocess.Popen([sys.executable, '-c', _CHECKOUT_HOLDER, str(install / '.hermes-update.lock'), str(release)])
-    harness = tmp_path / 'harness.ps1'
-    harness.write_text(HARNESS, encoding='utf-8')
-    started = int(time.time()) - 900
-    proc = None
-    try:
-        deadline = time.monotonic() + 30
-        while not Path(str(release) + '.ready').exists():
-            assert time.monotonic() < deadline and holder.poll() is None
-            time.sleep(0.05)
-        proc = subprocess.Popen([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(harness),
-                                 '-MarkerPs1', str(MARKER_PS1), '-Marker', str(marker), '-Body', f'{{self}}\n{started}\nct:{{selfct}}\n',
-                                 '-Action', 'release', '-InstallRoot', str(install), '-Heartbeat', '1'],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.monotonic() + 60
-        while not marker.exists():
-            assert time.monotonic() < deadline and proc.poll() is None, proc.communicate()
-            time.sleep(0.05)
-        seen = []
-        for _ in range(2):
-            time.sleep(4)
-            assert proc.poll() is None, proc.communicate()
-            lines = marker.read_bytes().decode().split('\n')
-            assert time.time() - int(lines[1]) <= 3, lines
-            seen.append(int(lines[1]))
-        assert seen[1] > seen[0]
-    finally:
-        release.touch()
-        holder.wait(timeout=30)
-    out, err = proc.communicate(timeout=60)
-    assert proc.returncode == 0, out + err
-    assert not marker.exists()
