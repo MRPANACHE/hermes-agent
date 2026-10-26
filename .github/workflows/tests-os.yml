@@ -19,9 +19,8 @@ name: OS-specific tests
 # platforms`` expression selects "this host's own marked tests" on either
 # lane — the helper narrows WHICH FILES get imported first.)
 #
-# Deliberately NOT sliced. The marked set is small (tens of tests, not
-# thousands), so one plain ``pytest`` process per OS is both faster and far
-# less machinery than the per-file parallel runner the Linux lane uses.
+# Uses the canonical deterministic file slices. Windows runs one worker per
+# slice: nested PowerShell trees become unreliable with competing workers.
 # Each lane FAILS when it selects zero tests (pytest exit code 5) — a
 # renamed marker or bad selector can never report a green job that ran
 # nothing.
@@ -92,12 +91,33 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
-          - name: Windows-only tests
+          # One x64 worker reached 62% at the unchanged 30-minute limit.
+          # Keep every marked file and distribute it through the native slicer.
+          - name: Windows-only tests (1/4)
             runner: windows-latest
             marker: windows
-          - name: Windows-only tests (arm64)
+            slice: 1/4
+          - name: Windows-only tests (2/4)
+            runner: windows-latest
+            marker: windows
+            slice: 2/4
+          - name: Windows-only tests (3/4)
+            runner: windows-latest
+            marker: windows
+            slice: 3/4
+          - name: Windows-only tests (4/4)
+            runner: windows-latest
+            marker: windows
+            slice: 4/4
+          - name: Windows-only tests (arm64, 1/2)
             runner: windows-11-arm
             marker: windows
+            slice: 1/2
+            timeout: 60
+          - name: Windows-only tests (arm64, 2/2)
+            runner: windows-11-arm
+            marker: windows
+            slice: 2/2
             timeout: 60
     steps:
       - name: Checkout code
