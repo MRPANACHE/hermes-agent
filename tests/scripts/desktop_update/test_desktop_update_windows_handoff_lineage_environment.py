@@ -19,6 +19,8 @@ from tests.scripts.desktop_update.test_desktop_update_windows_handoff_lineage im
     sleeper,
 )
 
+__all__ = ['sleeper']
+
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('env_matches', [True, False], ids=['env-matches', 'env-differs'])
 def test_r4_live_wrapper_not_the_desktops_child_is_adopted_only_with_the_handoff_started_at(

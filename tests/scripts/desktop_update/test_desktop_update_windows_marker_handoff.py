@@ -24,6 +24,8 @@ from tests.scripts.desktop_update.test_desktop_update_windows_marker import (
     sleeper,
 )
 
+__all__ = ['sleeper']
+
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('bridge', ['absent', 'someone-else'])
 def test_desktop_started_handoff_only_adopts_its_bridge(

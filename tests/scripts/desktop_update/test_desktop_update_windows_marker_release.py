@@ -15,6 +15,8 @@ from tests.scripts.desktop_update.test_desktop_update_windows_marker_ops import 
     sleeper,
 )
 
+__all__ = ['sleeper']
+
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('delegate', ['live', 'dead'])
 def test_release_hands_the_claim_to_a_live_delegate(

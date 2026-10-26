@@ -13,6 +13,8 @@ from tests.scripts.desktop_update.test_desktop_update_windows_marker import (
     sleeper,
 )
 
+__all__ = ['sleeper']
+
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('case', sorted(_BODIES))
 def test_marker_bodies_are_parsed_positionally_like_every_other_reader(

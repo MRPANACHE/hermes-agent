@@ -15,6 +15,8 @@ from tests.scripts.desktop_update.test_desktop_update_windows_handoff_lineage im
     sleeper,
 )
 
+__all__ = ['sleeper']
+
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('bridge', ['ok', 'other-run', 'stale-ct', 'v1'])
 def test_handoff_run_adopts_only_the_desktop_bridge_for_that_run(
