@@ -14,7 +14,6 @@ from tests.scripts.desktop_update.windows_handoff_support import (
     MARKER_PS1,
     MARKER,
     POWERSHELL,
-    _creation_time,
     _dead_pid,
     _op,
     _HeldLock,
@@ -31,20 +30,6 @@ def sleeper():
 
 # -- helper ops ---------------------------------------------------------------
 
-@pytest.mark.platforms('windows')
-def test_marker_op_reclaim(tmp_path: Path, sleeper: subprocess.Popen) -> None:
-    marker = tmp_path / MARKER
-    assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'absent\n')
-    marker.write_bytes(f'{_dead_pid()}\n{int(time.time())}\nct:5.000\n'.encode())
-    assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, 'reclaimed\n')
-    assert not marker.exists()
-    live = f'{sleeper.pid}\n{int(time.time())}\nct:{_creation_time(sleeper.pid)}\n'.encode()
-    marker.write_bytes(live)
-    assert _op(tmp_path, '-MarkerOp', 'reclaim')[:2] == (0, f'live {sleeper.pid}\n')
-    assert marker.read_bytes() == live
-    assert (tmp_path / (MARKER + '.lock')).exists()   # the sidecar is never deleted
-    assert _op(tmp_path, '-MarkerOp', 'nonsense')[0] == 64
-    assert _op(tmp_path, '-MarkerOp', 'withdraw')[0] == 64
 
 
 @pytest.mark.platforms('windows')
@@ -59,32 +44,6 @@ def test_marker_op_reports_busy_while_the_lock_is_held(tmp_path: Path) -> None:
     assert (tmp_path / MARKER).read_bytes() == dead
 
 
-@pytest.mark.platforms('windows')
-def test_marker_op_withdraw(tmp_path: Path, sleeper: subprocess.Popen) -> None:
-    marker = tmp_path / MARKER
-    other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
-    try:
-        args = ('-MarkerOp', 'withdraw', '-DesktopPid', str(sleeper.pid), '-HandoffRun', 'desk-9')
-        now = int(time.time())
-        assert _op(tmp_path, *args)[:2] == (0, 'absent\n')
-        # A late adoption: a live, non-Desktop owner carries our run -> taken.
-        taken = f'{other.pid}\n{now}\nct:{_creation_time(other.pid)}\nrun:desk-9\n'.encode()
-        marker.write_bytes(taken)
-        assert _op(tmp_path, *args)[:2] == (0, f'taken {other.pid}\n')
-        assert marker.read_bytes() == taken
-        # Someone else's run (or a dead adopter) is foreign and kept.
-        for body in (f'{other.pid}\n{now}\nct:{_creation_time(other.pid)}\nrun:desk-8\n',
-                     f'{_dead_pid()}\n{now}\nct:5.000\nrun:desk-9\n'):
-            marker.write_bytes(body.encode())
-            assert _op(tmp_path, *args)[:2] == (0, 'foreign\n')
-            assert marker.read_bytes() == body.encode()
-        # Our own bridge is withdrawn.
-        marker.write_bytes(f'{sleeper.pid}\n{now}\nct:{_creation_time(sleeper.pid)}\nrun:desk-9\n'.encode())
-        code, out, err = _op(tmp_path, *args)
-        assert (code, out) == (0, 'withdrawn\n'), err
-        assert not marker.exists()
-    finally:
-        other.kill(); other.wait()
 
 
 # -- release / heartbeat (production functions in a real PowerShell process) ---
