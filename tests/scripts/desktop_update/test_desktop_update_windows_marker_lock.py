@@ -24,6 +24,7 @@ from tests.scripts.desktop_update.windows_handoff_support import (
     _op,
     _HeldLock,
     _custodian,
+    _wait_for_log,
 )
 
 
@@ -98,12 +99,12 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 # -- the update child is the delegate before it runs anything ------------------
 
 FIND_UPDATE_CHILD = r"""
-param([int]$Parent, [int]$Seconds)
+param([int]$Parent, [int]$Seconds, [string]$ImageName)
 $deadline = (Get-Date).AddSeconds($Seconds)
 while ((Get-Date) -lt $deadline) {
     $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent")
     $row = $children |
-        Where-Object { $_.CommandLine -match '--yes' } | Select-Object -First 1
+        Where-Object { $_.Name -eq $ImageName } | Select-Object -First 1
     if ($row) { [Console]::Out.Write($row.ProcessId); exit 0 }
     Start-Sleep -Milliseconds 100
 }
@@ -135,12 +136,21 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
             assert time.monotonic() < deadline and script.poll() is None, 'script never claimed'
             time.sleep(0.02)
         lock = _HeldLock(home)   # after the claim, before the delegate publication
+        # Runtime/help probes precede the update. Observe their completion before
+        # selecting the sole Python child by parent + image. The update is still
+        # CREATE_SUSPENDED: its user-space CommandLine is not our synchronization
+        # boundary. Keep the original total 60-second child-discovery budget.
+        deadline = time.monotonic() + 60
+        _wait_for_log(home, 'running: python ', timeout=60)
+        remaining = max(1, int(deadline - time.monotonic()))
         child = subprocess.run([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
-                                '-Parent', str(script.pid), '-Seconds', '60'],
+                                '-Parent', str(script.pid), '-Seconds', str(remaining),
+                                '-ImageName', Path(sys.executable).name],
                                capture_output=True, text=True, timeout=90, check=False)
         assert child.returncode == 0, ('the update child never appeared', child.stderr,
                                       (home / 'logs/desktop-update-handoff.log').read_text(encoding='utf-8-sig'))
         child_pid = int(child.stdout)
+        assert not ran.exists(), 'the update child ran before it was published as the delegate'
         subprocess.run(['taskkill', '/F', '/PID', str(script.pid)], capture_output=True, check=True)
         script.wait(timeout=30)
         time.sleep(3)
