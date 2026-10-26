@@ -40,7 +40,61 @@ concurrency:
   cancel-in-progress: ${{ inputs.release != true }}
 
 jobs:
+  qualification-diagnostics:
+    if: startsWith(github.ref, 'refs/heads/wine2e/oos-ws2-')
+    name: Existing updater diagnostics (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Set up native ARM64 build dependencies
+        if: runner.arch == 'ARM64'
+        uses: ./.github/actions/setup-windows-build-deps
+      - uses: ./.github/actions/setup-pm
+        with:
+          packages: git,ripgrep
+          extras: '["messaging"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Read Git installation and exact git-core probes
+        shell: bash
+        run: |
+          where.exe git
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import pm
+          from hermes_cli.update_cmd_git import _probe_fork_bomb
+          git = pm.installed_package('git')
+          print('PM selected Git:', git, flush=True)
+          roots = [Path('C:/Program Files/Git'), Path('C:/Program Files (x86)/Git')]
+          if git is not None:
+              roots.append(git.path)
+          for root in roots:
+              for arch in ('clangarm64', 'mingw64', 'mingw32'):
+                  candidate = root / arch / 'libexec/git-core/git.exe'
+                  print(str(candidate), 'exists=', candidate.is_file(),
+                        'probe=', _probe_fork_bomb([str(candidate)]) if candidate.is_file() else None, flush=True)
+          PY
+      - name: Reproduce only the reported native Windows failures
+        shell: bash
+        env:
+          HERMES_TEST_WORKERS: '1'
+        run: |
+          scripts/run_tests.sh -j 1 \
+            tests/hermes_cli/test_git_trampoline_windows_live.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_commit_outcome.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py \
+            -- -m 'platforms and not integration' -v --tb=short
+
   venv-holder-e2e:
+    if: ${{ !startsWith(github.ref, 'refs/heads/wine2e/oos-ws2-') }}
     name: venv-holder live E2E (windows-latest)
     runs-on: windows-latest-32-core
     timeout-minutes: 25
