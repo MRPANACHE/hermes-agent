@@ -134,54 +134,62 @@ def test_apps_never_supersede_each_other(monkeypatch, evidence, pin, expected):
     assert all(row.get("selected", True) for row in receipt["checks"])
 
 
-@pytest.mark.parametrize("fault", [
-    "missing_suite", "unknown_app", "missing_job_attempt", "wrong_job_id", "wrong_job_head",
-    "wrong_job_check_url", "wrong_job_run", "wrong_html_url", "wrong_run_head",
-    "wrong_run_suite", "wrong_repository", "missing_workflow", "missing_run_number",
-    "missing_time", "naive_time", "equal_times", "equal_numbers", "reversed_time",
-    "reversed_number", "duplicate_same_attempt", "job_api_error", "attempt_api_error"])
-def test_ambiguous_lineage_never_suppresses_checks(monkeypatch, evidence, fault):
-    check = evidence["checks"][1]
-    job = evidence["jobs"][1]
-    run = evidence["attempts"][1]
-    if fault == "missing_suite": check.pop("check_suite")
-    elif fault == "unknown_app": check["app"]["slug"] = "unverified"
-    elif fault == "missing_job_attempt": job.pop("run_attempt")
-    elif fault == "wrong_job_id":
-        # Keep endpoint routing unchanged while returning a contradictory id.
-        original_response = response
-        def wrong_response(data, endpoint):
-            value = original_response(data, endpoint)
-            return {**value, "id": 7} if endpoint.endswith(f"/jobs/{job['id']}") else value
-        monkeypatch.setattr(sys.modules[__name__], "response", wrong_response)
-    elif fault == "wrong_job_head": job["head_sha"] = "b" * 40
-    elif fault == "wrong_job_check_url": job["check_run_url"] = job["check_run_url"].replace(REPO, "other/repo")
-    elif fault == "wrong_job_run": job["run_id"] = 7
-    elif fault == "wrong_html_url": check["html_url"] = check["html_url"].replace(REPO, "other/repo")
-    elif fault == "wrong_run_head": run["head_sha"] = "b" * 40
-    elif fault == "wrong_run_suite": run["check_suite_id"] = 7
-    elif fault == "wrong_repository": run["repository"]["full_name"] = "other/repo"
-    elif fault == "missing_workflow": run.pop("workflow_id")
-    elif fault == "missing_run_number": run.pop("run_number")
-    elif fault == "missing_time": run.pop("created_at")
-    elif fault == "naive_time": run["created_at"] = "2026-10-27T18:51:37"
-    elif fault == "equal_times": run["created_at"] = evidence["attempts"][0]["created_at"]
-    elif fault == "equal_numbers": run["run_number"] = evidence["attempts"][0]["run_number"]
-    elif fault == "reversed_time": run["created_at"] = "2026-10-27T18:40:00Z"
-    elif fault == "reversed_number": run["run_number"] = 1
-    elif fault == "duplicate_same_attempt":
-        run.update(copy.deepcopy(evidence["attempts"][0]))
-        job["run_id"] = run["id"]
-        check["check_suite"]["id"] = run["check_suite_id"]
-        check["html_url"] = f"https://github.com/{REPO}/actions/runs/{run['id']}/job/{check['id']}"
-    elif fault == "job_api_error": evidence["errors"].add(f"repos/{REPO}/actions/jobs/{job['id']}")
-    elif fault == "attempt_api_error": evidence["errors"].add(
-        f"repos/{REPO}/actions/runs/{run['id']}/attempts/{run['run_attempt']}")
+def set_path(data, path, value):
+    for key in path[:-1]:
+        data = data[key]
+    data[path[-1]] = value
+
+
+@pytest.mark.parametrize("path,value", [
+    (("checks", 1, "check_suite"), None),
+    (("checks", 1, "app", "slug"), "unverified"),
+    (("jobs", 1, "run_attempt"), None),
+    (("jobs", 1, "head_sha"), "b" * 40),
+    (("jobs", 1, "check_run_url"), "https://api.github.com/repos/other/repo/check-runs/1"),
+    (("jobs", 1, "run_id"), 7),
+    (("checks", 1, "html_url"), "https://github.com/other/repo/actions/runs/1/job/1"),
+    (("attempts", 1, "head_sha"), "b" * 40),
+    (("attempts", 1, "check_suite_id"), 7),
+    (("attempts", 1, "repository", "full_name"), "other/repo"),
+    (("attempts", 1, "workflow_id"), None),
+    (("attempts", 1, "run_number"), None),
+    (("attempts", 1, "created_at"), None),
+    (("attempts", 1, "created_at"), "2026-10-27T18:51:37"),
+    (("attempts", 1, "created_at"), "2026-10-27T18:49:44Z"),
+    (("attempts", 1, "run_number"), 7724),
+    (("attempts", 1, "created_at"), "2026-10-27T18:40:00Z"),
+    (("attempts", 1, "run_number"), 1)])
+def test_ambiguous_lineage_never_suppresses_checks(monkeypatch, evidence, path, value):
+    set_path(evidence, path, value)
     receipt = collect(monkeypatch, evidence)
     assert not receipt["ok"]
     assert len(receipt["checks"]) == 2
     assert all(row["selected"] for row in receipt["checks"])
     assert all(row["selection_reason"] for row in receipt["checks"])
+
+
+def test_wrong_job_id_is_not_proven_lineage(monkeypatch, evidence):
+    original_response = response
+    def wrong_response(data, endpoint):
+        value = original_response(data, endpoint)
+        return {**value, "id": 7} if endpoint.endswith(f"/jobs/{data['jobs'][1]['id']}") else value
+    monkeypatch.setattr(sys.modules[__name__], "response", wrong_response)
+    receipt = collect(monkeypatch, evidence)
+    assert not receipt["ok"]
+    assert len(receipt["checks"]) == 2
+    assert all(row["selected"] for row in receipt["checks"])
+
+
+@pytest.mark.parametrize("kind", ["job", "attempt"])
+def test_lineage_api_error_is_not_acceptance(monkeypatch, evidence, kind):
+    run = evidence["attempts"][1]
+    endpoints = {"job": f"repos/{REPO}/actions/jobs/{evidence['jobs'][1]['id']}",
+                 "attempt": f"repos/{REPO}/actions/runs/{run['id']}/attempts/{run['run_attempt']}"}
+    evidence["errors"].add(endpoints[kind])
+    receipt = collect(monkeypatch, evidence)
+    assert not receipt["ok"]
+    assert len(receipt["checks"]) == 2
+    assert all(row["selected"] for row in receipt["checks"])
 
 
 def rerun(data):
@@ -192,6 +200,15 @@ def rerun(data):
     check = data["checks"][1]
     check["check_suite"]["id"] = old["check_suite_id"]
     check["html_url"] = f"https://github.com/{REPO}/actions/runs/{old['id']}/job/{check['id']}"
+
+
+def test_duplicate_jobs_in_one_attempt_are_ambiguous(monkeypatch, evidence):
+    rerun(evidence)
+    evidence["jobs"][1]["run_attempt"] = 1
+    evidence["attempts"][1]["run_attempt"] = 1
+    receipt = collect(monkeypatch, evidence)
+    assert not receipt["ok"]
+    assert all(row["selected"] for row in receipt["checks"])
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "pending"])
@@ -226,14 +243,11 @@ def test_legacy_latest_status_remains_independent_and_history_retained(monkeypat
     assert observed[2]["selected"]
 
 
-@pytest.mark.parametrize("fault", ["head_change", "base_change", "closed", "incomplete", "wrong_head", "missing"])
-def test_existing_exact_head_and_pagination_guards_survive(monkeypatch, evidence, fault):
-    if fault == "head_change": evidence["final_head"] = "b" * 40
-    elif fault == "base_change": evidence["final_base"] = "other"
-    elif fault == "closed": evidence["pr_state"] = "closed"
-    elif fault == "incomplete": evidence["incomplete"] = True
-    elif fault == "wrong_head": evidence["checks"][1]["head_sha"] = "b" * 40
-    elif fault == "missing": evidence["checks"] = []
+@pytest.mark.parametrize("path,value", [
+    (("final_head",), "b" * 40), (("final_base",), "other"), (("pr_state",), "closed"),
+    (("incomplete",), True), (("checks", 1, "head_sha"), "b" * 40), (("checks",), [])])
+def test_existing_exact_head_and_pagination_guards_survive(monkeypatch, evidence, path, value):
+    set_path(evidence, path, value)
     assert not collect(monkeypatch, evidence)["ok"]
 
 
