@@ -1,0 +1,97 @@
+{
+  "provenance": {
+    "task": "t_83a80ac9",
+    "gate_event_id": 23413,
+    "source": "Retained GitHub API GET readbacks from t_2a8ae247/run855; job and attempt endpoints read again in t_6f4cbad3/run858; field projection only, no outcome edits."
+  },
+  "checks": [
+    {
+      "id": 122399767311,
+      "name": "commit-knowledge-contract",
+      "head_sha": "cb9aaadc5b9a7d31cc6efa57268917c816e725a8",
+      "app": {
+        "id": 15368,
+        "slug": "github-actions"
+      },
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/MRPANACHE/bol-bidbot/actions/runs/40563860795/job/122399767311",
+      "details_url": "https://github.com/MRPANACHE/bol-bidbot/actions/runs/40563860795/job/122399767311",
+      "check_suite": {
+        "id": 109948126277
+      },
+      "started_at": "2026-10-27T18:51:40Z",
+      "completed_at": "2026-10-27T18:55:30Z"
+    },
+    {
+      "id": 122398757311,
+      "name": "commit-knowledge-contract",
+      "head_sha": "cb9aaadc5b9a7d31cc6efa57268917c816e725a8",
+      "app": {
+        "id": 15368,
+        "slug": "github-actions"
+      },
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/MRPANACHE/bol-bidbot/actions/runs/40563572999/job/122398757311",
+      "details_url": "https://github.com/MRPANACHE/bol-bidbot/actions/runs/40563572999/job/122398757311",
+      "check_suite": {
+        "id": 109947324142
+      },
+      "started_at": "2026-10-27T18:49:46Z",
+      "completed_at": "2026-10-27T18:50:28Z"
+    }
+  ],
+  "jobs": [
+    {
+      "id": 122398757311,
+      "run_id": 40563572999,
+      "run_attempt": 1,
+      "head_sha": "cb9aaadc5b9a7d31cc6efa57268917c816e725a8",
+      "html_url": "https://github.com/MRPANACHE/bol-bidbot/actions/runs/40563572999/job/122398757311",
+      "name": "commit-knowledge-contract",
+      "check_run_url": "https://api.github.com/repos/MRPANACHE/bol-bidbot/check-runs/122398757311"
+    },
+    {
+      "id": 122399767311,
+      "run_id": 40563860795,
+      "run_attempt": 1,
+      "head_sha": "cb9aaadc5b9a7d31cc6efa57268917c816e725a8",
+      "html_url": "https://github.com/MRPANACHE/bol-bidbot/actions/runs/40563860795/job/122399767311",
+      "name": "commit-knowledge-contract",
+      "check_run_url": "https://api.github.com/repos/MRPANACHE/bol-bidbot/check-runs/122399767311"
+    }
+  ],
+  "attempts": [
+    {
+      "id": 40563572999,
+      "head_branch": "otto/t_83a80ac9-scrape-measured-only",
+      "head_sha": "cb9aaadc5b9a7d31cc6efa57268917c816e725a8",
+      "path": ".github/workflows/ci.yml",
+      "run_number": 7724,
+      "event": "pull_request",
+      "workflow_id": 235269881,
+      "check_suite_id": 109947324142,
+      "created_at": "2026-10-27T18:49:44Z",
+      "run_attempt": 1,
+      "repository": {
+        "full_name": "MRPANACHE/bol-bidbot"
+      }
+    },
+    {
+      "id": 40563860795,
+      "head_branch": "otto/t_83a80ac9-scrape-measured-only",
+      "head_sha": "cb9aaadc5b9a7d31cc6efa57268917c816e725a8",
+      "path": ".github/workflows/ci.yml",
+      "run_number": 7725,
+      "event": "pull_request",
+      "workflow_id": 235269881,
+      "check_suite_id": 109948126277,
+      "created_at": "2026-10-27T18:51:37Z",
+      "run_attempt": 1,
+      "repository": {
+        "full_name": "MRPANACHE/bol-bidbot"
+      }
+    }
+  ]
+}

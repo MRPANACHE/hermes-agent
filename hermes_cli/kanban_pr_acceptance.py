@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from datetime import datetime
+from itertools import combinations
 from pathlib import Path
 from urllib.parse import quote
 
@@ -157,19 +159,30 @@ def collect_acceptance(contract: str, published_pr: str | None,
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+            selected = _check_attempts(matching, repo, sha, profile_home)
+            latest_legacy = max((s["id"] for s in legacy), default=None)
+            selected += [(s, {"selected": s["id"] == latest_legacy,
+                              "selection": "selected" if s["id"] == latest_legacy else "historical",
+                              "selection_reason": "existing_legacy_latest_id",
+                              "superseded_by": None if s["id"] == latest_legacy else latest_legacy})
+                         for s in legacy]
             if not selected:
                 outcomes.append("missing")
-                receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
-            for check in selected:
+                receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha,
+                                          "selected": True, "selection": "selected",
+                                          "selection_reason": "missing_required_check"})
+            for check, selection in selected:
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
-                outcomes.append(classification)
+                if selection["selected"]:
+                    outcomes.append(selection.get("lineage_error") or classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                    "classification": classification, "conclusion": outcome,
+                    "app_id": (check.get("app") or {}).get("id"),
+                    "check_suite_id": (check.get("check_suite") or {}).get("id"), **selection})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
@@ -188,6 +201,111 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
+
+
+def _positive_id(value) -> bool:
+    return type(value) is int and value > 0
+
+
+def _created_at(value: str) -> datetime:
+    stamp = datetime.fromisoformat(value)
+    if stamp.tzinfo is None:
+        raise ValueError("Workflow creation time has no timezone")
+    return stamp
+
+
+def _actions_lineage(check: dict, repo: str, sha: str, read) -> dict:
+    """Prove check -> Actions job -> exact run attempt; URLs alone are not proof."""
+    if check["app"].get("id") != 15368 or check["app"].get("slug") != "github-actions":
+        raise ValueError("No supported producer lineage")
+    url = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)",
+                       check.get("html_url", ""))
+    if not url or int(url[2]) != check["id"] or check["head_sha"] != sha:
+        raise ValueError("Check/job identity differs")
+    job = read(f"repos/{repo}/actions/jobs/{check['id']}")
+    if (not _positive_id(check["id"]) or not _positive_id(job["id"]) or not _positive_id(job["run_id"])
+            or job["id"] != check["id"] or job["run_id"] != int(url[1]) or job["head_sha"] != sha
+            or job["check_run_url"] != f"https://api.github.com/repos/{repo}/check-runs/{check['id']}"
+            or not _positive_id(job["run_attempt"])):
+        raise ValueError("Job does not prove this check's attempt")
+    run = read(f"repos/{repo}/actions/runs/{job['run_id']}/attempts/{job['run_attempt']}")
+    if (run["id"] != job["run_id"] or run["run_attempt"] != job["run_attempt"]
+            or run["head_sha"] != sha or run["check_suite_id"] != check["check_suite"]["id"]
+            or run["repository"]["full_name"] != repo
+            or not all(_positive_id(run[k]) for k in ("id", "run_attempt", "check_suite_id", "workflow_id", "run_number"))
+            or not all(isinstance(run[k], str) and run[k] for k in ("path", "event", "head_branch"))):
+        raise ValueError("Run does not prove this producer/head/suite")
+    _created_at(run["created_at"])
+    return {k: run[k] for k in ("id", "run_attempt", "workflow_id", "path", "event", "head_branch",
+                                "run_number", "created_at", "head_sha", "check_suite_id")}
+
+
+def _later_attempt(a: dict, b: dict) -> bool:
+    """Creation time orders new runs, attempt number orders reruns, never job ID/end time."""
+    if a["id"] == b["id"]:
+        return (a["run_number"] == b["run_number"] and _created_at(a["created_at"]) == _created_at(b["created_at"])
+                and a["run_attempt"] > b["run_attempt"])
+    return a["run_number"] > b["run_number"] and _created_at(a["created_at"]) > _created_at(b["created_at"])
+
+
+def _check_attempts(checks: list[dict], repo: str, sha: str, profile_home: str | None) -> list[tuple[dict, dict]]:
+    """Keep every observation; suppress only a totally ordered proven producer lineage.
+
+    Different apps/workflows remain independent requirements. Missing/contradictory
+    lineage stays selected and fails closed, even if all ambiguous records are green.
+    The extra GETs apply only to duplicate context/app/head observations and always
+    use the existing assignee identity. No endpoint chosen from untrusted URLs runs.
+    """
+    entries = [(check, {"selected": True, "selection": "selected",
+                        "selection_reason": "independent_check", "superseded_by": None}) for check in checks]
+    buckets = {}
+    for check, selection in entries:
+        buckets.setdefault(((check.get("app") or {}).get("id"), check.get("head_sha")), []).append((check, selection))
+    cache = {}
+    def read(endpoint):
+        if endpoint not in cache:
+            cache[endpoint] = _api(endpoint, profile_home=profile_home)
+        return cache[endpoint]
+
+    for bucket in buckets.values():
+        if len(bucket) < 2:
+            continue
+        groups = {}
+        run_identities = {}
+        try:
+            for check, selection in bucket:
+                lineage = _actions_lineage(check, repo, sha, read)
+                selection["lineage"] = lineage
+                # One run cannot silently change producer/suite/creation identity on a rerun.
+                identity = tuple(lineage[k] for k in ("workflow_id", "path", "event", "head_branch",
+                                                      "run_number", "head_sha", "check_suite_id")) + (_created_at(lineage["created_at"]),)
+                if run_identities.setdefault(lineage["id"], identity) != identity:
+                    raise ValueError("Contradictory identity for one workflow run")
+                key = tuple(lineage[k] for k in ("workflow_id", "path", "event", "head_branch"))
+                groups.setdefault(key, []).append((check, selection))
+        except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError) as exc:
+            for _, selection in bucket:
+                selection.update(selection_reason="unproven_producer_lineage",
+                                 lineage_error="auth" if isinstance(exc, _GateAuthError) else "infra")
+            continue
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            if not all(_later_attempt(a[1]["lineage"], b[1]["lineage"])
+                       or _later_attempt(b[1]["lineage"], a[1]["lineage"])
+                       for a, b in combinations(group, 2)):
+                for _, selection in group:
+                    selection.update(selection_reason="ambiguous_attempt_order", lineage_error="infra")
+                continue
+            newest = next(item for item in group if all(
+                item is other or _later_attempt(item[1]["lineage"], other[1]["lineage"]) for other in group))
+            for check, selection in group:
+                if check is newest[0]:
+                    selection["selection_reason"] = "latest_proven_workflow_attempt"
+                else:
+                    selection.update(selected=False, selection="historical",
+                                     selection_reason="proven_later_workflow_attempt", superseded_by=newest[0]["id"])
+    return entries
 
 
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
