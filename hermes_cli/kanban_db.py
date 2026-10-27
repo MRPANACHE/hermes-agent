@@ -2198,6 +2198,7 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    pr_evidence: Optional[dict] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2208,21 +2209,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        budget = conn.execute("SELECT id FROM task_events WHERE task_id=? "
-                              "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-        if budget and not conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
-                                       "AND kind='claimed' AND id>?", (task_id, budget["id"])).fetchone():
-            if not goal_budget_admitted(conn, task_id):
-                return None
-        admission = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
-                                 "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-        if admission:
-            typed = _json_dict(admission["payload"])
-            if "ready_admission" in typed:
-                consumed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
-                                        "AND kind='claimed' AND id>? LIMIT 1", (task_id, admission["id"])).fetchone()
-                if not consumed and (not ready_resume_admitted(conn, task_id) or check_respawn_guard(conn, task_id)):
-                    return None
+        from hermes_cli.kanban_db_continuation import ready_claim_admitted
+        if not ready_claim_admitted(conn, task_id, pr_evidence=pr_evidence):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.

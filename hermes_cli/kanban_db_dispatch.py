@@ -1569,6 +1569,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+    pr_states: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1664,10 +1665,10 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(
-        conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-        cols=", body, author, id", unreadable=now)  # duplicate-PR risk: fail closed
-        if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")
+    from hermes_cli.kanban_pr_guard import pr_comments
+    pr_times = [t for t, c in pr_comments(conn, task_id, now)
+        if any((pr_states or {}).get(url) not in {"MERGED", "CLOSED"}
+               for url in _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or ""))
         and not _kb._initial_parent_pr_reference(conn, task_id, c)]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
@@ -1676,40 +1677,9 @@ def check_respawn_guard(
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
                 cols=", kind, payload", strict=True)):
             return None
-        # Dependency completion continues the original task, not a new PR.
-        # Bind the promotion to its latest ended worker and dependency wait;
-        # a claimed/newer run or changed owner cannot reuse that continuation.
-        continuation = conn.execute(
-            "SELECT 1 FROM tasks t JOIN task_runs r ON r.task_id = t.id "
-            "JOIN task_events w ON w.task_id = t.id AND w.run_id = r.id "
-            "JOIN task_events p ON p.task_id = t.id AND p.id > w.id "
-            "WHERE t.id = ? AND t.status = 'ready' "
-            "AND t.block_kind = 'dependency' AND t.current_run_id IS NULL "
-            "AND t.claim_lock IS NULL AND t.worker_pid IS NULL "
-            "AND NOT EXISTS (SELECT 1 FROM task_runs active "
-            "WHERE active.task_id = t.id AND active.ended_at IS NULL) "
-            "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id) "
-            "AND r.profile = t.assignee AND r.outcome = 'blocked' "
-            "AND r.ended_at IS NOT NULL AND w.kind = 'dependency_wait' "
-            "AND json_valid(w.payload) "
-            "AND json_extract(w.payload, '$.kind') = 'dependency' "
-            "AND json_extract(w.payload, '$.source_status') = 'ready' "
-            "AND p.kind = 'promoted' "
-            "AND w.id > COALESCE((SELECT MAX(id) FROM task_events "
-            "WHERE task_id = t.id AND kind = 'commented'), 0) "
-            "AND p.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id "
-            "AND kind IN ('promoted', 'dependency_wait', 'claimed', 'status', "
-            "'unblocked', 'reclaimed', 'blocked', 'changes_requested')) "
-            "AND EXISTS (SELECT 1 FROM task_links WHERE child_id = t.id) "
-            "AND NOT EXISTS (SELECT 1 FROM task_links l "
-            "LEFT JOIN tasks parent ON parent.id = l.parent_id "
-            "WHERE l.child_id = t.id "
-            "AND (parent.id IS NULL OR parent.status NOT IN ('done', 'archived'))) "
-            "LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if continuation:
-            return None
+        # A dependency is not permission to duplicate an independent own PR.
+        # Terminal PR evidence above survives routine handoff/readback comments;
+        # open/unknown references require an existing explicit admission below.
         # A canonical reviewer return authorizes correction on this task,
         # not another PR. Never carry that permission past a newer run or
         # owner change; auth, cooldown and recent-success guards stay above.
@@ -2166,6 +2136,7 @@ def _dispatch_lane_task(
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
+    from hermes_cli.kanban_pr_guard import resolve_guard, record_guard
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
@@ -2195,7 +2166,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_reason, pr_evidence = resolve_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2206,8 +2177,7 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            record_guard(conn, task_id, guard_reason, pr_evidence)
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2221,7 +2191,10 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claim_kwargs: dict[str, Any] = {"ttl_seconds": ttl_seconds}
+    if pr_evidence is not None and lane == "ready":
+        claim_kwargs["pr_evidence"] = pr_evidence
+    claimed = claim(conn, task_id, **claim_kwargs)
     if claimed is None:
         return False
     try:
