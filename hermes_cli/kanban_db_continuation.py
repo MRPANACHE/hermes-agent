@@ -554,3 +554,28 @@ def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
     from hermes_cli.kanban_db import _resolve_worker_config
     config = _resolve_worker_config(hermes_home)
     return list(config.command) if config is not None else None
+
+
+def ready_claim_admitted(conn, task_id, *, pr_evidence=None):
+    """Recheck source-bound ready admissions under the caller's claim lock."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_pr_guard import evidence_current
+    if pr_evidence is not None and (
+            not evidence_current(conn, task_id, pr_evidence)
+            or kb.check_respawn_guard(conn, task_id, pr_states=pr_evidence["states"])):
+        return False
+    budget = conn.execute("SELECT id FROM task_events WHERE task_id=? "
+                          "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if budget and not conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                   "AND kind='claimed' AND id>?", (task_id, budget["id"])).fetchone():
+        if not kb.goal_budget_admitted(conn, task_id):
+            return False
+    admission = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                             "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if admission and "ready_admission" in kb._json_dict(admission["payload"]):
+        consumed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                "AND kind='claimed' AND id>? LIMIT 1", (task_id, admission["id"])).fetchone()
+        if not consumed and (not kb.ready_resume_admitted(conn, task_id) or kb.check_respawn_guard(
+                conn, task_id, pr_states=pr_evidence["states"] if pr_evidence else None)):
+            return False
+    return True
