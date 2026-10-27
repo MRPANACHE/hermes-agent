@@ -133,21 +133,28 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
-def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
+@pytest.mark.parametrize("failed", [False, True])
+def test_quiet_single_query_main_keeps_stdout_final_only_and_finalizes(monkeypatch, capsys, failed):
     calls = []
 
     import cli as cli_mod
 
     def run_conversation(*, user_message, conversation_history):
         calls.append(("run", user_message, conversation_history))
+        for name in ("stream_delta_callback", "tool_gen_callback", "reasoning_callback"):
+            callback = getattr(fake_cli.agent, name)
+            if callback is not None:
+                callback("synthetic display output")
         return {
-            "final_response": "",
-            "error": "provider failed",
-            "failed": True,
+            "final_response": "" if failed else "**Antwoord**\nBrongegevens blijven onbekend.",
+            "error": "provider failed" if failed else None,
+            "failed": failed,
         }
 
     class FakeCLI:
         def __init__(self, **_kwargs):
+            nonlocal fake_cli
+            fake_cli = self
             self.provider = "test-provider"
             self.model = "test-model"
             self.session_id = "quiet-session"
@@ -158,8 +165,9 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
                 platform="cli",
                 quiet_mode=False,
                 suppress_status_output=False,
-                stream_delta_callback=object(),
-                tool_gen_callback=object(),
+                stream_delta_callback=print,
+                tool_gen_callback=print,
+                reasoning_callback=print,
                 run_conversation=run_conversation,
             )
 
@@ -184,6 +192,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             calls.append(("init", kwargs))
             return True
 
+    fake_cli = None
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
@@ -197,7 +206,11 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main(query="hello", quiet=True, toolsets="terminal")
 
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == int(failed)
+    captured = capsys.readouterr()
+    assert captured.out == ("" if failed else "**Antwoord**\nBrongegevens blijven onbekend.\n")
+    assert "session_id: quiet-session" in captured.err
+    assert ("provider failed" in captured.err) is failed
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")

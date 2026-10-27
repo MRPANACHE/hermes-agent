@@ -21348,6 +21348,7 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        cli.agent.reasoning_callback = None
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
