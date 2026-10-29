@@ -666,6 +666,37 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+#### Correcting skills on an existing idle card
+
+An orchestrator can replace an incorrect launcher binding on the same card:
+
+```bash
+hermes kanban set-skills t_abcd --clear --reason "Remove an unavailable extra skill"
+hermes kanban set-skills t_abcd --skill translation --skill github-code-review \
+    --reason "Replace specialist context for the next launch"
+```
+
+Provide either repeatable `--skill` names or `--clear`, and a non-empty reason.
+The same normalization and toolset-name validation as task creation apply; this
+does not install skills or verify availability in another profile. Check the
+assignee's installed skills before adding names.
+
+The kernel rejects calls from workers (including workers targeting another card)
+and delegated descendants of the board. Only `todo`, `ready`, `blocked`, or
+`triage` cards with no remaining claim, PID, start fingerprint, current run, or
+open run are editable. Validation and the write share one immediate transaction
+with dispatcher claims; no force/reclaim option exists. The `skills_updated`
+event records exact before/after values, actor and reason in that transaction.
+An identical replacement is a no-op without a duplicate event.
+
+This changes only skills, not the owner, task body, dependencies, status, failure
+counters, worktree, run history or claim fences. A blocked card stays blocked.
+After readback, an authorized orchestrator may use the separate ordinary unblock
+route; only a new claimed/spawned run and fresh heartbeat prove resumption.
+Workers must hand this correction to their orchestrator rather than unset their
+worker environment. Restoring prior skills uses the same audited command while
+idle; it never rewinds a database or deletes history.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:
