@@ -2709,11 +2709,11 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``running|ready|blocked|review|scheduled -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
-    proof of ownership (``expected_run_id``) or ``force=True`` (explicit
+    approval; timed ``scheduled`` waits are nonterminal. Live ``running`` claims
+    need ownership (``expected_run_id``) or ``force=True`` (explicit
     operator override) — otherwise :class:`LiveClaimError`, the same fence
     :func:`request_review` applies. With no active run the handoff fields survive via
     :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
@@ -2775,7 +2775,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'scheduled')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
