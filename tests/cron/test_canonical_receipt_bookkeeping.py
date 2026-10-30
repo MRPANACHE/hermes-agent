@@ -13,7 +13,7 @@ def peer(monkeypatch, call):
         async def rpc(self, method, **params):
             return call(method, params)
     @asynccontextmanager
-    async def connected():
+    async def connected(*, wait_for_drain=False):
         yield Peer()
     monkeypatch.setattr(gateway_client, 'connect_gateway', connected)
 

@@ -99,6 +99,12 @@ def _tick_admitted(
     executed (0 if another tick holds the lock)."""
     from cron import scheduler as _sched
 
+    # The durable marker precedes the gateway poller's _draining transition.
+    # Do not advance schedules or acquire ownership in that admission gap.
+    from gateway.drain_control import drain_requested
+    if drain_requested():
+        return 0
+
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
     # serves mixed sys.modules (jobs die on ImportErrors); if a fresher gateway holds the runtime
     # lock, ITS ticker dispatches. With no fresh holder (desktop-standalone) the tick proceeds.

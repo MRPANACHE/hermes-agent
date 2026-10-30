@@ -125,7 +125,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             delay = min(delay * 2, 2.0)
 
     async def remote():
-        async with connect_gateway() as client:
+        async with connect_gateway(wait_for_drain=True) as client:
             return await observe(lambda op, data: client.rpc('cron.' + op, **data))
 
     try:
