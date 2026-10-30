@@ -703,6 +703,16 @@ def _mcp_registry_scope() -> Optional[str]:
     return registry.current_scope_key()
 
 
+def serve_pax_recovery_reads(fd: int) -> None:
+    """Dedicated native-host composition, no model registration or plugin permission grant.
+
+    No activation call site is installed by this preparation patch. A separately
+    admitted host must own the inherited socket and the existing Pax connection.
+    """
+    from tools.mcp_tool_pax_recovery import serve_fd
+    serve_fd(fd)
+
+
 def _server_registry_scope(key) -> Optional[str]:
     """Scope owning the connection under *key*'s tools: the one captured at adoption (teardown
     runs on the MCP loop without the discovering profile's context), else the current one."""

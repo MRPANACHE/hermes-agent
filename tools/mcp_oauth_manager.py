@@ -239,6 +239,22 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
             f"client_secret), then run `hermes mcp login {name}`.")
 
     async def async_auth_flow(self, request):  # type: ignore[override]
+        frozen = getattr(self, "_pax_frozen_read", None)
+        from tools.mcp_tool_pax_recovery import marked_request
+        if frozen is None and marked_request(request):
+            raise RuntimeError("pax_native_read_no_active_host")
+        if frozen is not None:
+            flow = frozen.auth_flow(request)
+            try:
+                outgoing = await flow.__anext__()
+                incoming = yield outgoing
+                try:
+                    await flow.asend(incoming)
+                except StopAsyncIteration:
+                    return
+                raise RuntimeError("pax_native_read_unexpected_auth_replay")
+            finally:
+                await flow.aclose()
         try:  # pre-flow hook: reload from disk if it changed (non-fatal on error)
             await get_manager().invalidate_if_disk_changed(self._hermes_server_name, hermes_home=self._hermes_home)
         except Exception as exc:  # pragma: no cover — defensive
@@ -334,6 +350,12 @@ class MCPOAuthManager:
                 if entry.provider is not None:
                     entry.provider._hermes_home = key[0]
             return entry.provider
+
+    def get_existing_provider(self, server_name: str, server_url: str):
+        """Read existing in-memory owner binding only; never build, load, refresh or adopt."""
+        with self._entries_lock:
+            entry = self._entries.get(self._key(server_name))
+            return entry.provider if entry is not None and entry.server_url == server_url else None
 
     @staticmethod
     def _key(server_name: str, hermes_home: str | Path | None = None) -> tuple[str, str]:

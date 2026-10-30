@@ -575,11 +575,35 @@ class MCPServerTransportMixin:
                                **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
                                           auth=oauth_auth)}
 
+        if oauth_auth is not None:
+            async def _pax_request_guard(request):
+                from tools.mcp_tool_pax_recovery import marked_request
+                frozen = getattr(oauth_auth, "_pax_frozen_read", None)
+                if frozen is None and marked_request(request):
+                    raise RuntimeError("pax_native_read_no_active_host")
+                if frozen is not None:
+                    await frozen.guard_request(request)
+
+            async def _pax_response_guard(response):
+                frozen = response.request.extensions.get("pax_recovery_guard")
+                if frozen is not None and not 200 <= response.status_code < 300:
+                    frozen.failed = True
+                    raise RuntimeError("pax_native_read_transport_status")
+
+            client_kwargs["event_hooks"]["request"] = [_pax_request_guard]
+            client_kwargs["event_hooks"]["response"].insert(0, _pax_response_guard)
+
         @asynccontextmanager
         async def _owned_client_streams():  # the SDK skips cleanup when http_client is provided
             async with _build_client(**client_kwargs) as http_client:
-                async with _core.streamable_http_client(url, http_client=http_client) as streams:
-                    yield streams
+                if oauth_auth is not None:
+                    oauth_auth._pax_wire_guard_installed = True
+                try:
+                    async with _core.streamable_http_client(url, http_client=http_client) as streams:
+                        yield streams
+                finally:
+                    if oauth_auth is not None:
+                        oauth_auth._pax_wire_guard_installed = False
         return _owned_client_streams()
 
     async def _run_http(self, config: dict):
