@@ -56,8 +56,11 @@ class DependencyContinuation(unittest.TestCase):
         tid, _, old_run = self.resolved()
         comments = [(c.id, c.body) for c in kb.list_comments(self.conn, tid)]
         events = self.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
-        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
-        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
+        # Dependency satisfaction alone cannot vouch for this independent PR.
+        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+        states = {"https://github.com/example/repo/pull/2370": "MERGED"}
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid, pr_states=states))
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid, pr_states=states))
         self.assertEqual(events, self.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0])
         claimed = kb.claim_task(self.conn, tid)
         self.assertIsNotNone(claimed)

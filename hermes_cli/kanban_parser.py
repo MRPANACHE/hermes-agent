@@ -257,6 +257,13 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-skills", [
+        _TASK_ID,
+        _arg("--skill", action="append", dest="skills", metavar="NAME",
+             help="Replace force-loaded skills (repeat for each name)"),
+        _arg("--clear", action="store_true", help="Remove all extra force-loaded skills"),
+        _arg("--reason", required=True, help="Reason recorded with the before/after skills audit"),
+    ], help="Replace skills on an idle card without resuming it (orchestrator-only)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

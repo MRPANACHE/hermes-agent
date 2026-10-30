@@ -10,7 +10,7 @@ def test_agent_cron_is_transport_only_and_refuses_without_owner(monkeypatch):
     calls = []
 
     @asynccontextmanager
-    async def unavailable():
+    async def unavailable(*, wait_for_drain=False):
         calls.append('connect')
         raise gateway_client.GatewayClientError('owner_unavailable')
         yield
@@ -68,7 +68,7 @@ def test_lost_cron_ack_retains_identity_instead_of_reporting_failure(tmp_path, m
             raise gateway_client.GatewayClientError('Gateway disconnected')
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, wait_for_drain=False):
         yield Peer()
 
     monkeypatch.setattr(gateway_client, 'connect_gateway', connected)

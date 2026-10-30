@@ -259,7 +259,7 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
 
 
 @asynccontextmanager
-async def connect_gateway(endpoint=None, subject=None):
+async def connect_gateway(endpoint=None, subject=None, *, wait_for_drain=False):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
     (maintenance that must never start a gateway); default ensures one, starting it if needed.
     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
@@ -285,7 +285,10 @@ async def connect_gateway(endpoint=None, subject=None):
         home = gateway_profile_home(get_hermes_home())
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
+        # Scheduled work retains its original fire/heartbeat while the existing ensure loop
+        # awaits maintenance. No RPC has been submitted and no execution is retried.
+        options = {'wait_for_drain': True, 'timeout': 300.0} if wait_for_drain else {}
+        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, **options)
         if not attachable(result):
             detail = getattr(result, "detail", None)
             if result.reason_code == "runtime_exited" and detail:

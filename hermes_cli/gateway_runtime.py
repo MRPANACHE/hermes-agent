@@ -388,7 +388,7 @@ def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -
 
 
 def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT_ENSURE_TIMEOUT,
-                           idle_exit: bool = False) -> GatewayDiscovery:
+                           idle_exit: bool = False, wait_for_drain: bool = False) -> GatewayDiscovery:
     """Ensure once; pending remains pending at deadline.
 
     Never installs anything. The one owner it replaces is a gateway an older Hermes left running on
@@ -426,8 +426,19 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     try:
         while True:
             # The install-root marker also covers profiles.
+            if remaining(deadline) <= 0:
+                return GatewayDiscovery("starting", reason_code="deadline")
+            if wait_for_drain:
+                from gateway.drain_control import drain_requested
+                if drain_requested(home=home):
+                    time.sleep(min(0.1, remaining(deadline)))
+                    continue
             if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
-                return _fenced_verdict(home, remaining(deadline))
+                if not wait_for_drain:
+                    return _fenced_verdict(home, remaining(deadline))
+                # Await maintenance, never start or replace an owner behind its fence.
+                time.sleep(min(0.1, remaining(deadline)))
+                continue
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
@@ -436,6 +447,9 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 return GatewayDiscovery("starting", reason_code="deadline")
             if observed.state == "draining" and observed.reason_code in _RETIRING:
                 retiring, requested, child = True, False, None
+                time.sleep(min(0.1, remaining(deadline)))
+                continue
+            if wait_for_drain and observed.state == "draining":
                 time.sleep(min(0.1, remaining(deadline)))
                 continue
             if observed.state not in {"absent", "starting"}:
