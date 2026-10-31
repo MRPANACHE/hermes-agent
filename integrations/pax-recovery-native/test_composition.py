@@ -36,7 +36,7 @@ class Backend:
         self.session = NS(call_tool=self.call_tool,
                           _tool_output_schemas={'curation_history':None, 'list_facts':None})
         self.server = NS(session=self.session, _rpc_lock=asyncio.Lock(), _auth_type='oauth',
-                         _config={'url':r.ENDPOINT}, _is_http=lambda:True)
+                         _config={'url':r.ENDPOINT}, _is_http=lambda:True, _shutdown_event=asyncio.Event())
         if scenario == 'unauthorized-reader': self.context.client_info.client_id = 'other-reader'
         if scenario == 'expired-auth': self.context.is_token_valid = lambda: False
 
@@ -176,10 +176,10 @@ class Composition(unittest.TestCase):
             provider=object.__new__(HermesMCPOAuthProvider)
             provider.context=b.context
             provider._add_auth_header=lambda request: None
-            provider._pax_frozen_read=r.FrozenPaxAuth(provider,'curation_history',{'request_id':r.REQUEST,'limit':100})
             request=NS(content=b'{}')
             with patch('tools.mcp_oauth_manager.get_manager',side_effect=AssertionError('auth load prohibited')):
                 for status in [200,401,403,302,500]:
+                    provider._pax_frozen_read=r.FrozenPaxAuth(provider,'curation_history',{'request_id':r.REQUEST,'limit':100})
                     flow=provider.async_auth_flow(request)
                     self.assertIs(await flow.__anext__(),request)
                     with self.assertRaises(StopAsyncIteration if status==200 else r.RecoveryReadError):

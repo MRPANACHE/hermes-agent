@@ -580,6 +580,7 @@ class MCPServerTransportMixin:
                 from tools.mcp_tool_pax_recovery import marked_request
                 frozen = getattr(oauth_auth, "_pax_frozen_read", None)
                 if frozen is None and marked_request(request):
+                    self._shutdown_event.set()
                     raise RuntimeError("pax_native_read_no_active_host")
                 if frozen is not None:
                     await frozen.guard_request(request)
@@ -587,7 +588,8 @@ class MCPServerTransportMixin:
             async def _pax_response_guard(response):
                 frozen = response.request.extensions.get("pax_recovery_guard")
                 if frozen is not None and not 200 <= response.status_code < 300:
-                    frozen.failed = True
+                    self._shutdown_event.set()
+                    frozen.fail()
                     raise RuntimeError("pax_native_read_transport_status")
 
             client_kwargs["event_hooks"]["request"] = [_pax_request_guard]
@@ -598,12 +600,14 @@ class MCPServerTransportMixin:
             async with _build_client(**client_kwargs) as http_client:
                 if oauth_auth is not None:
                     oauth_auth._pax_wire_guard_installed = True
+                    oauth_auth._pax_native_stop = self._shutdown_event.set
                 try:
                     async with _core.streamable_http_client(url, http_client=http_client) as streams:
                         yield streams
                 finally:
                     if oauth_auth is not None:
                         oauth_auth._pax_wire_guard_installed = False
+                        oauth_auth._pax_native_stop = None
         return _owned_client_streams()
 
     async def _run_http(self, config: dict):

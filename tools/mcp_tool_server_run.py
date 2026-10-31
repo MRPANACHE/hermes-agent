@@ -336,7 +336,7 @@ class MCPServerRunMixin:
         self._reconnect_retries = 0
         budget = _RetryBudget()
         rebuild = False
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 if rebuild:
                     # Under the owner's FRESH scope: the run task's copied one is the connect-time

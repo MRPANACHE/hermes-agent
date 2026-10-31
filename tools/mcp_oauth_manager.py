@@ -242,6 +242,9 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         frozen = getattr(self, "_pax_frozen_read", None)
         from tools.mcp_tool_pax_recovery import marked_request
         if frozen is None and marked_request(request):
+            stop = getattr(self, "_pax_native_stop", None)
+            if stop is not None:
+                stop()
             raise RuntimeError("pax_native_read_no_active_host")
         if frozen is not None:
             flow = frozen.auth_flow(request)

@@ -36,7 +36,7 @@ class Wire(unittest.TestCase):
                 @asynccontextmanager
                 async def streams(url,http_client):
                     yield http_client
-                server=NS(name='brain',_http_rejection={})
+                server=NS(name='brain',_http_rejection={},_shutdown_event=asyncio.Event())
                 context=MCPServerTransportMixin._streamable_http_transport
                 with patch.object(core,'_MCP_NEW_HTTP',True),patch.object(core,'streamable_http_client',streams), \
                      patch('tools.mcp_tool_transport._make_redirect_header_stripper',return_value=factory), \

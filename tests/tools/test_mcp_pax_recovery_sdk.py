@@ -23,6 +23,9 @@ class Server(MCPServerTransportMixin):
     _sampling = _elicitation = None
     _config = {"url": recovery.ENDPOINT, "protocol": "legacy"}
 
+    def __init__(self):
+        self._shutdown_event = asyncio.Event()
+
 
 def _provider():
     import anyio

@@ -34,6 +34,9 @@ class SyntheticServer(MCPServerTransportMixin):
     _config = {"url": recovery.ENDPOINT, "protocol": "legacy"}
     _auth_type = "oauth"
 
+    def __init__(self):
+        self._shutdown_event = asyncio.Event()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", [

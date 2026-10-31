@@ -72,16 +72,29 @@ class FrozenPaxAuth:
     for redirects too; it prevents a second POST or any auth endpoint/refresh.
     Tokens remain inside the existing provider and are never returned/exported.
     """
-    def __init__(self, provider, tool, arguments, owner_check=None):
+    def __init__(self, provider, tool, arguments, owner_check=None, on_failure=None):
         self.provider = provider
         self.tool = tool
         self.arguments = arguments
         self.owner_check = owner_check
+        self.on_failure = on_failure
         self.sent = False
         self.failed = False
         self.check_identity()
 
     def check_identity(self):
+        try:
+            self._check_identity()
+        except BaseException:
+            self.fail()
+            raise
+
+    def fail(self):
+        self.failed = True
+        if self.on_failure is not None:
+            self.on_failure()
+
+    def _check_identity(self):
         if self.owner_check is not None:
             self.owner_check()
         ctx = self.provider.context
@@ -105,16 +118,20 @@ class FrozenPaxAuth:
             self.sent = True
             request.extensions["pax_recovery_guard"] = self
         except BaseException:
-            self.failed = True
+            self.fail()
             raise
 
     async def auth_flow(self, request):
-        self.check_identity()
-        require(not self.failed, "transport_failed")
-        # Supported SDK provider method; no token extraction and no SDK auth ladder.
-        self.provider._add_auth_header(request)
-        response = yield request
-        require(200 <= response.status_code < 300, "transport_status")
+        try:
+            self.check_identity()
+            require(not self.failed, "transport_failed")
+            # Supported SDK provider method; no token extraction and no SDK auth ladder.
+            self.provider._add_auth_header(request)
+            response = yield request
+            require(200 <= response.status_code < 300, "transport_status")
+        except BaseException:
+            self.fail()
+            raise
 
 
 class PaxRecoveryReads:
@@ -137,9 +154,17 @@ class PaxRecoveryReads:
         if self.owner_check is not None:
             self.owner_check()
 
+    def stop(self):
+        # Latch on the native server, not the temporary auth guard. SDK taskgroup
+        # unwinding can race reader cleanup; neither may re-enable reconnect.
+        self.stopped = True
+        self.server._shutdown_event.set()
+
     async def close(self):
         self.stopped = True
         tasks = list(self.active - {asyncio.current_task()})
+        if tasks:
+            self.stop()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -157,7 +182,8 @@ class PaxRecoveryReads:
             # cause discovery itself, including after an external cache reset.
             require(tool in getattr(self.session, "_tool_output_schemas", {}), "discovery_not_current")
             require(getattr(self.provider, "_pax_frozen_read", None) is None, "concurrent_read")
-            guard = FrozenPaxAuth(self.provider, tool, arguments, owner_check=self.check_owner)
+            guard = FrozenPaxAuth(self.provider, tool, arguments,
+                                  owner_check=self.check_owner, on_failure=self.stop)
             self.provider._pax_frozen_read = guard
             try:
                 async with _track_inflight_rpc(self.server, "brain", tool, retry_safe=False):
@@ -173,7 +199,7 @@ class PaxRecoveryReads:
     async def exchange(self, message):
         task = asyncio.current_task()
         if self.busy:
-            self.stopped = True
+            self.stop()
             raise RecoveryReadError("pax_native_read_concurrent_exchange")
         self.busy = True
         self.active.add(task)
@@ -221,7 +247,7 @@ class PaxRecoveryReads:
             self.pending.remove(index)
             return value
         except BaseException:
-            self.stopped = True
+            self.stop()
             raise
 
 
