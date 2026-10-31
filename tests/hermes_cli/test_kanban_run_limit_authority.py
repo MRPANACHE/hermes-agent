@@ -3,7 +3,10 @@ import pytest
 from unittest.mock import patch
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_run_limits import task_series, validate_supervisor_decision
-from tests.hermes_cli.test_kanban_hard_run_limits import board, card, attempt, hits, disposition, deliver
+from tests.hermes_cli import test_kanban_hard_run_limits as limit_fixtures
+from tests.hermes_cli.test_kanban_hard_run_limits import card, attempt, hits, disposition, deliver
+
+board = limit_fixtures.board
 
 
 def twenty_hours(conn):
