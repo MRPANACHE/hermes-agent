@@ -37,18 +37,7 @@ _log = logging.getLogger(__name__)
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
 
-def _lossy_text(value: Any) -> Any:
-    """``bytes`` -> ``str`` with U+FFFD for undecodable sequences; anything else passes through.
-
-    Installed as every board connection's ``text_factory`` (a TEXT cell holding
-    invalid UTF-8 otherwise aborts the whole ``fetchall`` with "Could not decode
-    to UTF-8") and applied to BLOB-typed cells in the ``from_row`` constructors
-    (task, comment, event, run), so one
-    corrupt row degrades to replacement characters instead of taking the board
-    listing down."""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
+from hermes_cli.kanban_db_connect import _lossy_text
 
 
 def _row_get(row: Any, col: str, default: Any = None) -> Any:
