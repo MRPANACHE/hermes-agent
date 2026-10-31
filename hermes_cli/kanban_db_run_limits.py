@@ -29,11 +29,58 @@ def execution_runs(conn, *, task_id=None, after_event_id=0):
     ).fetchall()
 
 
+def _runtime_seconds(conn, now, window):
+    return sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now)
+                   - max(window["start"], row["started_at"])) for row in execution_runs(conn))
+
+
 def daily_usage(conn, now: int) -> dict:
+    """Fleet total over the native shared-board registry, not the caller's pin.
+
+    Open other boards read-only: a worker's HERMES_KANBAN_DB/current-board
+    binding must neither hide those boards nor cause the same DB to count twice.
+    Retained archived boards still spent runtime today. Unreadable accounting
+    raises before admission rather than silently granting an incomplete budget.
+    """
+    import os
+    import sqlite3
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+
     window = day_window(now)
-    seconds = sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now)
-                      - max(window["start"], row["started_at"])) for row in execution_runs(conn))
-    return {**window, "runtime_seconds": seconds, "hours": seconds / 3600}
+    own = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+    seen = set()
+    if own:
+        info = Path(own).stat()
+        seen.add((info.st_dev, info.st_ino))
+    seconds = _runtime_seconds(conn, now, window)
+    accounted = [own or ":memory:"]
+    paths = [kb.kanban_home() / "kanban.db"]
+    pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if pin:
+        paths.append(Path(pin).expanduser())
+    paths.extend(kb.boards_root() / entry["slug"] / "kanban.db"
+                 for entry in kb.list_boards(include_archived=True) if entry["slug"] != kb.DEFAULT_BOARD)
+    archive = kb.boards_root() / "_archived"
+    if archive.exists():
+        paths.extend(sorted(archive.glob("*/kanban.db")))
+    for path in paths:
+        if not path.exists():
+            continue
+        info = path.stat()
+        identity = (info.st_dev, info.st_ino)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        other = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        other.row_factory = sqlite3.Row
+        try:
+            seconds += _runtime_seconds(other, now, window)
+            accounted.append(str(path.resolve()))
+        finally:
+            other.close()
+    return {**window, "runtime_seconds": seconds, "hours": seconds / 3600,
+            "accounting_scope": "shared_boards", "accounted_boards": accounted}
 
 
 def _payload(raw):
@@ -92,7 +139,7 @@ def validate_supervisor_decision(conn, task_id, decision, *, before_event_id=Non
     return decision
 
 
-def supervisor_decisions(conn, task_id):
+def _oos_supervisor_decisions(conn, task_id):
     """Only consume grant-checked OOS decisions, not comments/actor strings alone."""
     for row in conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind IN "
                             "('mrpanache_clarified','mrpanache_resumed') ORDER BY id", (task_id,)):
@@ -123,6 +170,34 @@ def supervisor_decisions(conn, task_id):
         except ValueError:
             continue
         yield row["id"], d
+
+
+def supervisor_decisions(conn, task_id):
+    """Two existing authority surfaces, one typed policy: OOS or native Mara.
+
+    Plain comments/claimed actor strings do not grant authority. The native
+    kanban_comment handler stamps a separate event only after checking its
+    persisted runtime identity; require its exact comment row and assessment.
+    This also covers coordinator-created cards with no MCP ingress metadata.
+    """
+    decisions = list(_oos_supervisor_decisions(conn, task_id))
+    rows = conn.execute(
+        "SELECT e.id,e.payload,c.body,c.author FROM task_events e "
+        "JOIN task_comments c ON c.task_id=e.task_id "
+        "AND c.id=json_extract(e.payload,'$.comment_id') "
+        "WHERE e.task_id=? AND e.kind='run_limit_decision' ORDER BY e.id", (task_id,))
+    for row in rows:
+        payload = _payload(row["payload"])
+        decision = payload.get("decision")
+        if (row["author"] != "mara" or payload.get("author") != "mara"
+                or payload.get("via") != "kanban_comment" or _payload(row["body"]) != decision):
+            continue
+        try:
+            validate_supervisor_decision(conn, task_id, decision, before_event_id=row["id"])
+        except ValueError:
+            continue
+        decisions.append((row["id"], decision))
+    yield from sorted(decisions, key=lambda item: item[0])
 
 
 def task_series(conn, task_id: str) -> dict:
@@ -184,6 +259,7 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
         exception = _exception(conn, task_id)
         daily = {"limit_key": "daily_run_hours", "observed": usage["hours"], "threshold": 20, "unit": "hours",
                  **{k: usage[k] for k in ("timezone", "local_date", "window_start", "window_end")},
+                 "accounting_scope": usage["accounting_scope"], "board_count": len(usage["accounted_boards"]),
                  "episode_key": f"day:{usage['local_date']}:{task_id}:" + str(exception["event_id"] if exception else 0)}
         if exception and not hits:
             _record_hit(conn, task_id, {**daily, "action": "exception_allowed", "enforced": True,
