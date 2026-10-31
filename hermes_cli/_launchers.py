@@ -37,7 +37,7 @@ def _inline_string_literal(value: str) -> str:
 
 def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main",
                     code: str | None = None, python: str | Path | None = None,
-                    home: str | Path | None = None) -> list[str]:
+                    home: str | Path | None = None, retained: dict | None = None) -> list[str]:
     """An installation-bound command, safe to persist across dependency GC.
 
     Store Python owns the ABI; bootstrap selects and leases dependencies at
@@ -45,7 +45,15 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
     No selected generation or ambient PYTHONPATH is captured in the command.
     """
     root = Path(repo_root).resolve()
-    python = python or resolve_store_python(root) or Path(sys.executable)
+    if retained is not None:
+        if (not isinstance(retained, dict) or set(retained) != {"owner_home", "source_commit"}
+                or not isinstance(retained["owner_home"], str) or home is None or python is not None):
+            raise ValueError("retained runtime needs one exact owner binding and disposable home")
+        python = _store_python(Path(retained["owner_home"]) / "tools")
+        if python is None:
+            raise RuntimeError("retained store interpreter is unavailable; no interpreter fallback")
+    else:
+        python = python or resolve_store_python(root) or Path(sys.executable)
     entry = f"exec({_inline_string_literal(code)})" if code is not None else (
         f"runpy.run_module({_inline_string_literal(module)}, run_name='__main__', alter_sys=True)")
     # A literal home is pinned up front; the default one needs ``hermes_constants`` from the
@@ -64,6 +72,8 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
         "os.environ.pop('VIRTUAL_ENV', None); "
         f"sys.path.insert(0, {_inline_string_literal(str(root))}); "
         + pin
+        + (f"sys._hermes_retained_launch = {retained!r}; sys.dont_write_bytecode = True; "
+           if retained is not None else "")
         + "import hermes_bootstrap; "
         + settle
         + entry

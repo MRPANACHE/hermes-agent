@@ -136,11 +136,17 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   e2e:
-    # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
-    # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+    # Partition every file; one process tree per standard runner at a time.
+    name: e2e (${{ matrix.slice }}/16)
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    # Up to seven files x 900s plus setup; individual test deadlines stay.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        slice: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -213,7 +219,8 @@ jobs:
           # across unrelated SQLite, tenancy, provider and terminal suites.
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
           # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/16
+          HERMES_TEST_WORKERS: "1"
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
@@ -262,9 +269,10 @@ jobs:
           shards=$(python3 - <<'PY'
           import json, pathlib
           root = pathlib.Path("tests/e2e/core/upgrade")
-          shards = ["core"] if any(root.glob("test_*.py")) else []
-          shards += sorted(d.name for d in root.iterdir()
-                           if d.is_dir() and not d.name.startswith(("_", ".")) and any(d.rglob("test_*.py")))
+          # One long install/update file per runner, including future suites.
+          shards = sorted(str(p.relative_to(root)) for p in root.rglob("test_*.py"))
+          if not shards or len(shards) > 256:
+              raise SystemExit("upgrade inventory must fit one complete GitHub matrix")
           print(json.dumps(shards))
           PY
           )
@@ -283,13 +291,14 @@ jobs:
     # entrypoint smoke, the config round-trip property matrix, and the lane
     # suites below it (pm: PM environment lifecycle across updates, ...).
     # Its own job: it needs full history + tags, bubblewrap, and one file
-    # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
+    # runs ~5-15 min. One complete file per standard runner.
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.e2e-upgrade-plan.outputs.shards) }}
     steps:
@@ -383,22 +392,18 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          if [ "$SHARD" = core ]; then
-            mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort)
-          else
-            mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort)
-          fi
+          files=("tests/e2e/core/upgrade/$SHARD")
           # A shard that collects nothing is a wiring bug, not a pass.
-          [ "${#files[@]}" -gt 0 ] || { echo "no test files for shard $SHARD" >&2; exit 1; }
+          [ -f "${files[0]}" ] || { echo "no test file for shard $SHARD" >&2; exit 1; }
           printf 'shard %s: %s\n' "$SHARD" "${files[*]}"
           scripts/run_tests.sh --include-integration "${files[@]}"
         env:
           SHARD: ${{ matrix.shard }}
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           # Each file drives real installs/updaters (process trees plus uv and
-          # git I/O); cpu_count of them at once starves their deadlines. A
-          # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
+          # git I/O); no competing journey shares this runner.
+          HERMES_TEST_WORKERS: "1"
+          HERMES_TEST_FILE_RETRIES: "0"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

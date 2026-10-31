@@ -294,8 +294,9 @@ def committed_venv(project_root: Path) -> Path | None:
     return _recorded_venv(project_root) or payload_venv(project_root)
 
 
-def _recorded_venv(project_root: Path) -> Path | None:
-    path = runtime_facts_path(project_root)
+def _recorded_venv(project_root: Path, *, state: Path | None = None) -> Path | None:
+    state = install_state_dir(project_root) if state is None else state
+    path = state / "facts.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
@@ -312,7 +313,7 @@ def _recorded_venv(project_root: Path) -> Path | None:
     if not isinstance(value, str):
         raise RuntimeError("invalid dependency environment path")
     environment = Path(value).resolve()
-    generations = install_state_dir(project_root) / "environments"
+    generations = state / "environments"
     if not environment.is_relative_to(generations.resolve()) or not (environment / "pyvenv.cfg").is_file():
         raise RuntimeError(f"dependency environment is missing or outside this install: {environment}")
     return environment
@@ -454,6 +455,12 @@ def activate_dependencies(project_root: Path) -> None:
     """
     import sys
 
+    retained = getattr(sys, "_hermes_retained_runtime", None)
+    if retained is not None:
+        from pm.retained import RetainedRuntime
+        if not isinstance(retained, RetainedRuntime) or retained.closed or retained.root != project_root.resolve():
+            raise RuntimeError("retained dependency binding does not identify this source")
+        return _activate_environment(project_root, retained.environment)
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
@@ -484,6 +491,14 @@ def activate_dependencies(project_root: Path) -> None:
         selected = site_packages(environment)
         if not selected.is_dir():
             return  # External/Nix interpreter owns its original sys.path.
+    _activate_environment(project_root, environment)
+
+
+def _activate_environment(project_root: Path, environment: Path) -> None:
+    """Attach one already-selected generation; custody stays with its selection caller."""
+    import sys
+
+    selected = site_packages(environment)
     if not selected.is_dir():
         raise RuntimeError(f"dependency environment has no site-packages: {selected}")
     import site

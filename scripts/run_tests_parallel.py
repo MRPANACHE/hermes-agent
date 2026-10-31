@@ -64,6 +64,45 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
 
+_SCRATCH_BINDING = None
+
+
+def _configure_bound_scratch(args, parser, repo_root):
+    global _SCRATCH_BINDING
+    marker = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "runner-binding.json"
+    if args.scratch_binding is not None or marker.exists() or marker.is_symlink():
+        from scripts.run_tests_scratch import configure
+        try:
+            _SCRATCH_BINDING = configure(args.scratch_binding, repo_root)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        _SCRATCH_BINDING = None
+    if args.check_scratch_binding:
+        if _SCRATCH_BINDING is None:
+            parser.error("scratch binding: validation requires --scratch-binding")
+        raise SystemExit(0)
+
+
+def _new_run_root():
+    if _SCRATCH_BINDING is not None:
+        return _SCRATCH_BINDING.new_attempt()
+    return tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+
+
+def _cleanup_run_root(root):
+    if _SCRATCH_BINDING is not None:
+        _SCRATCH_BINDING.cleanup(root, _kill_detached_leftovers)
+    else:
+        _kill_detached_leftovers(root)
+        _rmtree_force(root)
+
+
+def _sweep_runner_roots():
+    if _SCRATCH_BINDING is None:
+        _sweep_killed_run_roots(_runner_scratch_root())
+    # Bound attempts have individual custody. Never sweep other runs/siblings.
+
 
 def _sweep_killed_run_roots(root: str) -> None:
     """Remove per-file temp roots older runs left behind. Each attempt deletes its own root
@@ -641,7 +680,7 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    temproot = _new_run_root()
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
@@ -700,12 +739,11 @@ def _run_one_file_once(
 
         output +=  "\n"
     finally:
-        _kill_detached_leftovers(temproot)
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite. Permission fixtures leave read-only dirs
         # behind; make them writable and retry instead of skipping them.
-        _rmtree_force(temproot)
+        _cleanup_run_root(temproot)
 
     if rc not in (0, 5) and not output.strip():
         output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
@@ -1283,10 +1321,12 @@ def main() -> int:
     # clobber discovery. We peel the following token along with such flags so
     # it never reaches our positional ``paths``. ``=``-joined forms
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
+    parser.add_argument("--scratch-binding", help="Updater-owned disposable qualification binding.")
+    parser.add_argument("--check-scratch-binding", action="store_true", help=argparse.SUPPRESS)
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from", "--fail-on-skip",
+        "--files-from", "--fail-on-skip", "--scratch-binding", "--check-scratch-binding",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1335,6 +1375,8 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+    repo_root = Path(__file__).resolve().parent.parent
+    _configure_bound_scratch(args, parser, repo_root)
 
     # Bare tokens are validated against pytest's option set so a typo fails
     # here with usage instead of once per discovered file. Anything after a
@@ -1403,8 +1445,6 @@ def main() -> int:
         except (ValueError, AttributeError):
             print(f"error: --slice must be I/N (e.g. 1/4), got: {slice_raw!r}", file=sys.stderr)
             sys.exit(2)
-
-    repo_root = Path(__file__).resolve().parent.parent
 
     files, roots = _select_files(args, pytest_passthrough, repo_root)
 
@@ -1531,7 +1571,7 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    _sweep_runner_roots()
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get

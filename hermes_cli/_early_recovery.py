@@ -931,7 +931,16 @@ def write_durable_text(path: Path, text: str) -> None:
         raise
 
 
-def restore_interrupted_pull(project_root: Path | None = None, *, after_failure: bool = False) -> bool:
+def require_settled_checkout(root: Path) -> None:
+    """Retained launches cannot finish even a stale or corrupt recovery journal."""
+    markers = (interrupted_pull_marker(root), root / ZIP_SWAP_JOURNAL)
+    if (any(path.exists() or path.is_symlink() for path in markers)
+            or git_operation_in_progress(root)):
+        raise RuntimeError("checkout recovery or Git operation is pending")
+
+
+def restore_interrupted_pull(project_root: Path | None = None, *, after_failure: bool = False,
+                             read_only: bool = False) -> bool:
     """Put back the files a killed ``hermes update`` had half-moved to the new commit.
 
     ``after_failure``: the updater itself calls this when git exited non-zero mid-move (a locked or
@@ -955,6 +964,9 @@ def restore_interrupted_pull(project_root: Path | None = None, *, after_failure:
     looks exactly like git's own half-written file and is restored too, as is a user edit to a
     conflicted path or, on git < 2.38, to a path both sides of a custom-branch merge changed.
     """
+    if read_only:
+        require_settled_checkout(_project_root() if project_root is None else Path(project_root))
+        return False
     try:
         root = _project_root() if project_root is None else project_root
         marker = interrupted_pull_marker(root)
@@ -1388,6 +1400,10 @@ def _count_failed_attempt(marker: Path) -> None:
         marker.write_text(body, encoding="utf-8")
 
 
+def dependency_repair_markers(root: Path, state: Path) -> tuple[Path, ...]:
+    return (root / ".update-incomplete", root / ".lazy-refresh-incomplete", state / ".repair-incomplete")
+
+
 def recover_if_needed(project_root: Path | None = None, argv: list[str] | None = None, *, explicit: bool = False) -> bool:
     """Ask PM to restore dependencies before activation; leave failed requests retryable."""
     global _UPDATE_RETRY_RECOVERED
@@ -1403,7 +1419,7 @@ def recover_if_needed(project_root: Path | None = None, argv: list[str] | None =
     from pm.environments import install_state_dir
 
     missing_marker = install_state_dir(root) / ".repair-incomplete"
-    marker_paths = (root / ".update-incomplete", root / ".lazy-refresh-incomplete", missing_marker)
+    marker_paths = dependency_repair_markers(root, install_state_dir(root))
     markers = [path for path in marker_paths if path.is_file()]
 
     if not (root / "pyproject.toml").is_file() or not (explicit or markers or _missing_environment(root)):

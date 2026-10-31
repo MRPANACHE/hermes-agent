@@ -6,6 +6,7 @@ with argv receipts. No setup actions, installs, E2E tests or native hosts run he
 from __future__ import annotations
 
 import fnmatch
+
 import json
 import os
 import subprocess
@@ -155,4 +156,11 @@ def selected_files(step: dict, ctx: dict, repo: Path) -> set[str]:
                 assert candidate.stat().st_size > 0, f"empty test file: {name}"
                 files.add(name)
     assert files, "test command selected no files"
+    slice_value = gha.render(step.get("env", {}).get("HERMES_TEST_SLICE", ""), ctx)
+    if command == "pytest" and slice_value:
+        index, count = map(int, str(slice_value).split("/"))
+        from scripts import run_tests_parallel as runner
+        files = {p.relative_to(repo).as_posix() for p in runner._slice_files(
+            [repo / p for p in sorted(files)], index, count, {}, repo)}
+        assert files, "test slice selected no files"
     return files

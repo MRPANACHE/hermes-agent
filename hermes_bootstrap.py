@@ -508,6 +508,16 @@ def _legacy_post_swap_invocation(argv: list[str]) -> tuple[Path, list[str]] | No
 harden_import_path(str(_root))
 
 
+_retained_intent = getattr(sys, "_hermes_retained_launch", None)
+if _retained_intent is not None:
+    from pm.retained import retain_for_launch
+
+    try:
+        sys._hermes_retained_runtime = retain_for_launch(_root, _retained_intent)
+    except Exception as exc:
+        raise SystemExit(f"hermes: retained launch deferred: {exc}") from None
+
+
 def _settle_interrupted_update() -> None:
     """Put back the tree a killed ``hermes update`` left half-moved, before PM, launch preparation or
     any Hermes package imports from it (``hermes_cli._early_recovery``; ``hermes_cli.main`` repeats the
@@ -537,7 +547,9 @@ def _settle_interrupted_update() -> None:
             for name in [n for n in sys.modules if n == "hermes_cli" or n.startswith("hermes_cli.")]:
                 del sys.modules[name]
         return
-    if recovery.restore_interrupted_pull(_root):
+    if _retained_intent is not None:
+        recovery.require_settled_checkout(_root)
+    elif recovery.restore_interrupted_pull(_root):
         recovery.relaunch_after_restore()
 
 
@@ -581,7 +593,9 @@ from hermes_cli._parser import command_argv
 
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
 _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
-if not _pm_repair:
+if _retained_intent is not None:
+    activate_dependencies(_root)
+elif not _pm_repair:
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:

@@ -37,16 +37,19 @@ INSTALL_LOCK_TIMEOUT_SECONDS = 10.0
 # A lease file younger than this is never a prune candidate: its creator may still sit between
 # ``O_CREAT|O_EXCL`` and ``flock`` (two syscalls; the window is microseconds, the margin generous).
 @contextmanager
-def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_SECONDS):
+def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_SECONDS,
+                 state: Path | None = None, read_only: bool = False, custody: list[int] | None = None):
     """Hold the per-install dependency lock; yields True when held, False when the wait expired.
 
     Callers decide what a lost race means: readers skip the work the lock guards and carry on
     (``activate_dependencies`` still selects and leases the committed generation), writers that
     cannot be skipped pass ``timeout=None`` — an install the user asked for is theirs to wait on.
     """
-    state = install_state_dir(project)
-    state.mkdir(parents=True, exist_ok=True)
-    fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    state = install_state_dir(project) if state is None else Path(state)
+    if not read_only:
+        state.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) if read_only else os.O_CREAT | os.O_RDWR
+    fd = os.open(state / ".install.lock", flags, 0o600)
     try:
         if not _lock(fd, wait=True, timeout=timeout):
             LOG.warning(
@@ -54,6 +57,8 @@ def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_
                 timeout, state / ".install.lock")
             yield False
             return
+        if custody is not None:
+            custody.append(fd)
         yield True
     finally:
         os.close(fd)
@@ -91,12 +96,16 @@ def _recover_plugin_publication(project: Path, row: dict, journal: Path) -> None
     journal.unlink()
 
 
-def recover_publication(project: Path) -> None:
+def recover_publication(project: Path, *, state: Path | None = None, read_only: bool = False) -> None:
     """Recover while holding runtime_lock, before activation or another write."""
-    journal = install_state_dir(project) / "publication.json"
+    journal = (install_state_dir(project) if state is None else state) / "publication.json"
+    if read_only and (journal.exists() or journal.is_symlink()):
+        raise RuntimeError("dependency publication recovery is pending")
     data = _bytes(journal)
     if data is None:
         return
+    if read_only:
+        raise RuntimeError("dependency publication recovery is pending")
     try:
         row = json.loads(data)
         if row.get("kind") == "plugin":

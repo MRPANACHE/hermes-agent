@@ -37,6 +37,33 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Qualification must not re-exec an installer or precompile before admission.
+SCRATCH_BINDING=""
+_args=("$@")
+for ((_i=0; _i<${#_args[@]}; _i++)); do
+  case "${_args[_i]}" in
+    --) break ;;
+    --scratch-binding|--scratch-binding=*)
+      if [ -n "$SCRATCH_BINDING" ]; then
+        echo "error: scratch binding: duplicate binding" >&2; exit 2
+      fi
+      if [ "${_args[_i]}" = --scratch-binding ]; then
+        ((_i+=1))
+        SCRATCH_BINDING="${_args[_i]:-}"
+      else
+        SCRATCH_BINDING="${_args[_i]#*=}"
+      fi
+      [ -n "$SCRATCH_BINDING" ] || { echo "error: scratch binding: missing value" >&2; exit 2; }
+      ;;
+  esac
+done
+_marker="${HERMES_HOME:-$HOME/.hermes}/runner-binding.json"
+if { [ -e "$_marker" ] || [ -L "$_marker" ]; } && [ -z "$SCRATCH_BINDING" ]; then
+  echo "error: scratch binding: qualification requires explicit --scratch-binding" >&2
+  exit 2
+fi
+SCRATCH_ENV=()
+
 # ── Locate python ───────────────────────────────────────────────────────────
 # The suite runs under the checkout's isolated test environment (pm.testenv),
 # and only there: unless the inherited environment is current for this
@@ -50,10 +77,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # the Nix devShell's editable venv and CI's minimal installer lanes provide
 # one on purpose. The import check matters: a wrapped `hermes` binary exports
 # HERMES_PYTHON pointing at a release venv without pytest.
-_has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/null; }
+_has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -B -c 'import pytest' 2>/dev/null; }
 # shellcheck source=scripts/_activation.sh
 . "$SCRIPT_DIR/_activation.sh"
-if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
+if [ -n "$SCRATCH_BINDING" ]; then
+  PYTHON="${HERMES_PYTHON:-${__HERMES_TEST_PYTHON:-}}"
+  if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+    echo "error: scratch binding: explicit test interpreter required; no provisioning fallback" >&2
+    exit 2
+  fi
+  export PYTHONDONTWRITEBYTECODE=1
+  "$PYTHON" -B "$SCRIPT_DIR/run_tests_parallel.py" --scratch-binding "$SCRATCH_BINDING" --check-scratch-binding
+  _has_pytest "$PYTHON" || { echo "error: scratch binding: test interpreter has no pytest" >&2; exit 2; }
+  SCRATCH_ENV=("HERMES_HOME=$HERMES_HOME" "TMPDIR=$TMPDIR" "PYTHONDONTWRITEBYTECODE=1")
+elif [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
 else
@@ -183,8 +220,10 @@ cd "$REPO_ROOT"
 # Pre-building the bytecode cache once here (instead of each subprocess
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
-echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+if [ -z "$SCRATCH_BINDING" ]; then
+  echo "▶ pre-compiling bytecode cache"
+  "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+fi
 
 echo "▶ launching test runner"
 exec env -i \
@@ -192,6 +231,7 @@ exec env -i \
   HOME="$HOME" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
+  ${SCRATCH_ENV[@]+"${SCRATCH_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

@@ -161,10 +161,10 @@ def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | 
             if not gha.condition(cond, ctx):
                 continue
             entry: dict[str, Any] = {"ctx": ctx, "body": body}
-            if name == "e2e-upgrade-plan":
+            if body.get("outputs") and any(s.get("id") == "plan" for s in body.get("steps", [])):
                 plan = next(s for s in body["steps"] if s.get("id") == "plan")
                 entry["outputs"] = workflow_steps.outputs(plan, ctx, _REPO)
-                assert json.loads(entry["outputs"]["shards"]), "upgrade plan selected no shards"
+                assert all(json.loads(v) for v in entry["outputs"].values()), "plan selected no files"
             uses = body.get("uses")
             if isinstance(uses, str) and uses.startswith("./.github/workflows/"):
                 called = uses[2:]
@@ -196,6 +196,10 @@ def _selected_test_files(node: dict, name: str, *, windows_only: bool = False) -
     matrix = body.get("strategy", {}).get("matrix", {})
     if "shard" in matrix:
         cells = [{"shard": s} for s in gha.render(matrix["shard"], ctx)]
+    elif "file" in matrix:
+        cells = [{"file": f} for f in gha.render(matrix["file"], ctx)]
+    elif "slice" in matrix:
+        cells = [{"slice": s} for s in matrix["slice"]]
     else:
         cells = matrix.get("include", [{}])
     if windows_only:
@@ -532,7 +536,7 @@ def test_selection_receipt_does_not_require_the_native_jobs_venv(tmp_path):
     test_file = tmp_path / rel
     test_file.parent.mkdir(parents=True)
     test_file.write_text("def test_owned(): pass\n", encoding="utf-8")
-    ctx = {"matrix": {"shard": "core"}, "inputs": {}}
+    ctx = {"matrix": {"shard": "test_owned.py"}, "inputs": {}}
     assert workflow_steps.selected_files(step, ctx, tmp_path) == {rel}
 
 

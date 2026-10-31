@@ -1088,7 +1088,7 @@ def _open_lock_file(path: Path) -> tuple[int | None, object]:
         return None, denied.strerror or denied
 
 
-def _acquire_checkout(install_root: Path) -> UpdateHolder | None:
+def _acquire_checkout(install_root: Path, *, read_only: bool = False) -> UpdateHolder | None:
     """Take (or join, when inherited) the checkout lock; the refusal holder, else ``None``."""
     global _HELD
     path = checkout_lock_path(install_root)
@@ -1099,7 +1099,16 @@ def _acquire_checkout(install_root: Path) -> UpdateHolder | None:
     if inherited is not None:
         _HELD = {"path": str(path), "fd": inherited, "owned": False, "depth": 1}
         return None
-    fd, writable = _open_lock_file(path)
+    if read_only:
+        try:
+            if sys.platform == "win32":
+                raise OSError("retained checkout custody requires inherited POSIX descriptors")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            writable = False
+        except OSError as exc:
+            return UpdateHolder(pid=0, age_seconds=0.0, reason=f"retained checkout lock unavailable: {exc}")
+    else:
+        fd, writable = _open_lock_file(path)
     if fd is None:
         return UpdateHolder(pid=0, age_seconds=0.0, reason=f"{path} is not writable ({writable}); the update "
                             "locks the checkout there, in its git directory, which git must write too")
@@ -1110,7 +1119,7 @@ def _acquire_checkout(install_root: Path) -> UpdateHolder | None:
         os.close(fd)
         return UpdateHolder(pid=0, age_seconds=0.0, reason=f"{path} is not a regular single-link file; delete it")
     try:
-        if not _lock_with_contention_wait(fd, path):
+        if not (_try_lock(fd) if read_only else _lock_with_contention_wait(fd, path)):
             if _held_by_our_windows_ancestor(path):
                 # Windows has no fd inheritance: the update tree's children run in the lock
                 # owner's kill-on-close job (bind_child_to_update_tree) and die with it. One the
