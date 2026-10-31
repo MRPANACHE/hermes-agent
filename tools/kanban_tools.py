@@ -954,8 +954,24 @@ def _handle_comment(args: dict, **kw) -> str:
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
+    decision = None
+    try:
+        candidate = json.loads(body)
+    except ValueError:
+        candidate = None
+    if isinstance(candidate, dict) and candidate.get("schema") == "mrpanache.run-limit-decision.v1":
+        _check(author == "mara", "run_limit_supervisor_required")
+        decision = candidate
     with _board(args.get("board")) as (kb, conn):
-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        if decision is None:
+            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        else:
+            from hermes_cli.kanban_db_run_limits import validate_supervisor_decision
+            with kb.write_txn(conn, allow_nested=True):
+                validate_supervisor_decision(conn, tid, decision)
+                cid = kb.add_comment(conn, tid, author=author, body=str(body))
+                kb._append_event(conn, tid, "run_limit_decision", {
+                    "author": author, "via": "kanban_comment", "comment_id": cid, "decision": decision})
         return _ok(task_id=tid, comment_id=cid)
 
 
