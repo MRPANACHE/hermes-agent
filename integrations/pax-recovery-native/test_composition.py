@@ -33,7 +33,8 @@ class Backend:
         self.context = NS(server_url=r.ENDPOINT, client_info=NS(client_id=r.CLIENT),
                           current_tokens=NS(scope='read write'), is_token_valid=lambda: True)
         self.provider = NS(context=self.context, _pax_wire_guard_installed=True)
-        self.session = NS(call_tool=self.call_tool)
+        self.session = NS(call_tool=self.call_tool,
+                          _tool_output_schemas={'curation_history':None, 'list_facts':None})
         self.server = NS(session=self.session, _rpc_lock=asyncio.Lock(), _auth_type='oauth',
                          _config={'url':r.ENDPOINT}, _is_http=lambda:True)
         if scenario == 'unauthorized-reader': self.context.client_info.client_id = 'other-reader'

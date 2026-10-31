@@ -72,15 +72,18 @@ class FrozenPaxAuth:
     for redirects too; it prevents a second POST or any auth endpoint/refresh.
     Tokens remain inside the existing provider and are never returned/exported.
     """
-    def __init__(self, provider, tool, arguments):
+    def __init__(self, provider, tool, arguments, owner_check=None):
         self.provider = provider
         self.tool = tool
         self.arguments = arguments
+        self.owner_check = owner_check
         self.sent = False
         self.failed = False
         self.check_identity()
 
     def check_identity(self):
+        if self.owner_check is not None:
+            self.owner_check()
         ctx = self.provider.context
         require(str(ctx.server_url) == ENDPOINT, "endpoint_mismatch")
         require(getattr(ctx.client_info, "client_id", None) == CLIENT, "unauthorized_reader")
@@ -116,7 +119,7 @@ class FrozenPaxAuth:
 
 class PaxRecoveryReads:
     """Typed history/fact exchange for the fixed consumer, at most two fresh rounds."""
-    def __init__(self, server, provider, connected):
+    def __init__(self, server, provider, connected, owner_check=None):
         self.server = server
         self.session = server.session
         self.provider = provider
@@ -125,14 +128,36 @@ class PaxRecoveryReads:
         self.rounds = 0
         self.pending = set()
         self.stopped = False
+        self.owner_check = owner_check
+        self.active = set()
+        self.busy = False
+
+    def check_owner(self):
+        require(not self.stopped, "stopped")
+        if self.owner_check is not None:
+            self.owner_check()
+
+    async def close(self):
+        self.stopped = True
+        tasks = list(self.active - {asyncio.current_task()})
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _read(self, tool, arguments):
         from tools.mcp_tool_handlers import _call_tool_racing_stdio_death, _track_inflight_rpc
+        self.check_owner()
         require(self.connected() is self.server and self.server.session is self.session, "connection_changed")
         async with self.server._rpc_lock:
-            require(self.server.session is self.session and not getattr(self.server, "_reconnecting", False), "connection_changed")
+            self.check_owner()
+            require(self.connected() is self.server and self.server.session is self.session
+                    and not getattr(self.server, "_reconnecting", False), "connection_changed")
+            # The real SDK otherwise sends tools/list while validating a result.
+            # Recovery may use the native connection's existing discovery, never
+            # cause discovery itself, including after an external cache reset.
+            require(tool in getattr(self.session, "_tool_output_schemas", {}), "discovery_not_current")
             require(getattr(self.provider, "_pax_frozen_read", None) is None, "concurrent_read")
-            guard = FrozenPaxAuth(self.provider, tool, arguments)
+            guard = FrozenPaxAuth(self.provider, tool, arguments, owner_check=self.check_owner)
             self.provider._pax_frozen_read = guard
             try:
                 async with _track_inflight_rpc(self.server, "brain", tool, retry_safe=False):
@@ -146,6 +171,19 @@ class PaxRecoveryReads:
                 self.provider._pax_frozen_read = None
 
     async def exchange(self, message):
+        task = asyncio.current_task()
+        if self.busy:
+            self.stopped = True
+            raise RecoveryReadError("pax_native_read_concurrent_exchange")
+        self.busy = True
+        self.active.add(task)
+        try:
+            return await self._exchange(message)
+        finally:
+            self.active.discard(task)
+            self.busy = False
+
+    async def _exchange(self, message):
         try:
             require(not self.stopped, "stopped")
             require(type(message) is dict, "input_invalid")
@@ -187,7 +225,7 @@ class PaxRecoveryReads:
             raise
 
 
-def open_reads():
+def open_reads(*, owner_check=None):
     """Called only by the runtime facade in the admitted Pax host; never by a plugin."""
     from hermes_constants import get_hermes_home
     from tools import mcp_tool as core
@@ -201,34 +239,44 @@ def open_reads():
             return core._servers.get(key)
     server = connected()
     require(server is not None and server.session is not None, "not_connected")
+    require({"curation_history", "list_facts"} <= getattr(server.session, "_tool_output_schemas", {}).keys(),
+            "discovery_not_current")
     require(server._auth_type == "oauth" and server._config.get("url") == ENDPOINT, "route_mismatch")
     provider = get_manager().get_existing_provider("brain", ENDPOINT)
     require(provider is not None and getattr(provider, "_pax_wire_guard_installed", False), "transport_not_qualified")
     FrozenPaxAuth(provider, "curation_history", {"request_id": REQUEST, "limit": 100})
-    return PaxRecoveryReads(server, provider, connected)
+    if owner_check is not None:
+        owner_check()
+    return PaxRecoveryReads(server, provider, connected, owner_check=owner_check)
 
 
 def serve_fd(fd):
     """Host-inherited socket only; no listener, path, process spawn, tool or CLI."""
     import socket
-    from tools.mcp_tool_loop import _run_on_mcp_loop
     with socket.socket(fileno=fd) as channel:
-        channel.settimeout(30)
         reader = open_reads()
-        with channel.makefile("rwb", buffering=0) as stream:
-            while True:
-                line = stream.readline(4097)
-                if not line:
-                    return
-                try:
-                    require(len(line) <= 4096 and line.endswith(b"\n"), "frame_invalid")
-                    message = json.loads(line)
-                    value = _run_on_mcp_loop(lambda: reader.exchange(message), timeout=TIMEOUT + 1)
-                    frame = {"ok": True, "value": value}
-                except BaseException:
-                    reader.stopped = True
-                    channel.sendall(b'{"ok":false,"error":"pax_native_read_stopped"}\n')
-                    raise
-                data = json.dumps(frame, ensure_ascii=False).encode() + b"\n"
-                require(len(data) <= MAX_BYTES + 1024, "frame_overflow")
-                channel.sendall(data)
+        serve_channel(channel, reader)
+
+
+def serve_channel(channel, reader):
+    """An owner-created channel and reader; no new connection or identity lookup."""
+    from tools.mcp_tool_loop import _run_on_mcp_loop
+    channel.settimeout(30)
+    with channel.makefile("rwb", buffering=0) as stream:
+        while True:
+            line = stream.readline(4097)
+            if not line:
+                return
+            try:
+                reader.check_owner()
+                require(len(line) <= 4096 and line.endswith(b"\n"), "frame_invalid")
+                message = json.loads(line)
+                value = _run_on_mcp_loop(lambda: reader.exchange(message), timeout=TIMEOUT + 1)
+                frame = {"ok": True, "value": value}
+            except BaseException:
+                reader.stopped = True
+                channel.sendall(b'{"ok":false,"error":"pax_native_read_stopped"}\n')
+                raise
+            data = json.dumps(frame, ensure_ascii=False).encode() + b"\n"
+            require(len(data) <= MAX_BYTES + 1024, "frame_overflow")
+            channel.sendall(data)

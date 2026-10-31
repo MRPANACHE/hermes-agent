@@ -1,0 +1,16 @@
+{
+  "source_revision": "3d2ce28882926b7cef2066bc0d04ce7768605496",
+  "release_seal_sha256": "9fe72068081804dd871c472e0733020773125dced2e9cf1b416b7bbe8f582765",
+  "files": {
+    "src/episode-ledger/hash.js": "6ffbec9eee392d20b38ba778c43c0b5d5a8ded3f46ae3a8dda4b3a9fd60a0e7d",
+    "src/pb/agent-registration.js": "b261b23b1a61b6f06454d20db4d73ca0aa2727d0efa226ef2fa179dbe48a36a2",
+    "src/pb/north-star.js": "44b64fd878928b584eead28aee5655fda0e8008e00d9785a6420be1bac965a36",
+    "src/transport/gbrain-bridge-audit.js": "6c0cf40ad5bfa549bd351e99cb913c9f329fb17410e0e56ed0a972eb70b8bd93",
+    "src/transport/gbrain-codex-subscription-extractor.js": "0f6de6bbb4367c06ef54990ba6cd9cf5aa42ba76d818bd0c29c4a4d8dbec3e4f",
+    "src/transport/gbrain-codex-subscription-provenance.js": "5141664cc0f70089aef6a7b53ff219ffe8980ce104e77dc2b9363b93b6c90ae3",
+    "src/transport/gbrain-codex-subscription-queue.js": "c11aaf7737126213b1285168bf234d52b3b707ba22e9873a79dbd0698f07f95a",
+    "src/transport/pax-historical-receipt.js": "0a6a23932d2cea8e5c1422687eefd1333efec6524d9b8535681484fb4ea5725c",
+    "src/transport/pb-agent-owner-recovery.js": "5ffa8e3dc8d43a14da3d6bdb6c0db77dcc43cc5eae2893306ec671ea99ddd7f2",
+    "src/transport/vnext/schemas/agent-mandate.v1.js": "4cfd2e5ccef9d5f9161124a076f36800cc8c49ea97be3df4f3acc16320e4f7b3"
+  }
+}

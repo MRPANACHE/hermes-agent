@@ -125,6 +125,15 @@ class DurableTurnLease:
         with self._lock:
             return self.turn_active
 
+    def run_pax_recovery_owner_action(self):
+        """Explicit trusted-host action, never an automatic lease/startup hook.
+
+        This new entry needs separate release admission; a turn lease is not
+        recovery authority. It accepts no model-controlled selection fields.
+        """
+        from agent.pax_recovery_owner import run_owner_action
+        return run_owner_action(self)
+
     def _interrupt_turn(self, message: str) -> None:
         """Lease-loss interrupts fire UNCONDITIONALLY (no generation claim): a lost lease means
         this process no longer owns the session. Only the watchdog's stalls can be spuriously stale."""

@@ -191,6 +191,12 @@ jobs:
         run: |
           "$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
+      - name: Install synthetic native-recovery consumer fixture
+        run: |
+          /usr/bin/node --version
+          # Match the fixed owner's child interpreter, not an unrelated PATH Node.
+          PATH="/usr/bin:/bin:$PATH" npm ci --prefix tests/e2e/pax_recovery/consumer --no-audit --no-fund --engine-strict
+
       - name: Run e2e tests
         # One subprocess per file, in parallel: the core suites spawn real
         # processes (serve, gateway, tui_gateway, MCP servers, SQLite writers)
