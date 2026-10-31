@@ -10,7 +10,10 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_run_limits import daily_usage, supervisor_decisions
 from tools import kanban_tools as kt
-from tests.hermes_cli.test_kanban_hard_run_limits import board, attempt, card, disposition, hits
+from tests.hermes_cli import test_kanban_hard_run_limits as limit_fixtures
+from tests.hermes_cli.test_kanban_hard_run_limits import attempt, card, disposition, hits
+
+board = limit_fixtures.board
 
 
 def now():
