@@ -57,10 +57,9 @@ def gh_reply(state="closed", merged=True, *, url=PARENT_PR):
     return subprocess.CompletedProcess([], 0, json.dumps({"html_url": url, "state": state, "merged": merged}), "")
 
 
-@pytest.mark.parametrize("merged", [True, False])
-def test_prior_run_parent_pr_and_later_comments_spawn_next_tick(board, merged):
+def test_prior_run_parent_pr_and_later_comments_spawn_next_tick(board):
     tid, _parent, old = resolved_parent(board)
-    with patch("subprocess.run", return_value=gh_reply(merged=merged)):
+    with patch("subprocess.run", return_value=gh_reply(merged=True)):
         result = tick(board, tid)
     assert [s[0] for s in result.spawned] == [tid]
     task = kb.get_task(board, tid)
@@ -71,11 +70,12 @@ def test_prior_run_parent_pr_and_later_comments_spawn_next_tick(board, merged):
     assert len(kb.list_comments(board, tid)) == 3
 
 
-@pytest.mark.parametrize("reply", ["open", "timeout", "network", "bad-json", "wrong-pr", "partial"])
+@pytest.mark.parametrize("reply", ["open", "closed-unmerged", "timeout", "network", "bad-json", "wrong-pr", "partial"])
 def test_open_unknown_or_network_never_spawns(board, reply):
     tid, _, _ = resolved_parent(board)
     kwargs = {
         "open": {"return_value": gh_reply("open", False)},
+        "closed-unmerged": {"return_value": gh_reply("closed", False)},
         "timeout": {"side_effect": subprocess.TimeoutExpired("gh", 3)},
         "network": {"side_effect": subprocess.CalledProcessError(1, "gh", stderr="secret")},
         "bad-json": {"return_value": subprocess.CompletedProcess([], 0, "invalid", "secret")},

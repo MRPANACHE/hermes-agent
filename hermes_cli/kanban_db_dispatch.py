@@ -1636,7 +1636,7 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     from hermes_cli.kanban_pr_guard import pr_comments
     pr_times = [t for t, c in pr_comments(conn, task_id, now)
-        if any((pr_states or {}).get(url) not in {"MERGED", "CLOSED"}
+        if any((pr_states or {}).get(url) != "MERGED"
                for url in _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or ""))
         and not _kb._initial_parent_pr_reference(conn, task_id, c)]
     if pr_times:
