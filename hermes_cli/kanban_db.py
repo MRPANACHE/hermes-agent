@@ -2154,6 +2154,9 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    from hermes_cli.kanban_db_run_limits import enforce_run_limits
+    if not enforce_run_limits(conn, task_id, source_status, now):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
