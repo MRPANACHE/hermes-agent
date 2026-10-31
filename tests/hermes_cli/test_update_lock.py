@@ -261,24 +261,52 @@ def test_v2_marker_whose_pid_was_reused_is_reclaimed(marker, other_pid):
     assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == os.getpid()
 
 
-def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatch, other_pid):
+def _run_handoff_child(marker, code, *, runtime_host=False):
+    # De markerhouder is de echte ouder, niet een kind dat voor ouder doorgaat.
+    bootstrap = (
+        "import os, sys, time\nfrom pathlib import Path\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        "from hermes_cli import update_lock\n"
+        "from hermes_cli.update_lock import UpdateLock, read_live_update\n"
+        f"marker = Path({str(marker)!r})\n"
+        f"DEAD_PID = {DEAD_PID}\n" + code
+    )
+    command = [sys.executable, "-I", "-B", "-c", bootstrap]
+    if runtime_host:
+        middle = (
+            "import subprocess, sys\n"
+            f"raise SystemExit(subprocess.run({command!r}, timeout=60).returncode)\n"
+        )
+        # Een gereapete stub met canonieke hostidentiteit, geen gateway-start.
+        host = marker.parent / "desktop-gateway.py"
+        host.write_text(middle, encoding="utf-8")
+        command = [sys.executable, "-I", "-B", str(host)]
+    result = subprocess.run(
+        command, env={**os.environ, HANDOFF_PID_ENV: str(os.getpid())},
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker):
     """Rule 6: `hermes update` adopting a hand-off claim names itself on line 4, restores
     lines 1-3 byte-identical on exit, and is what keeps the claim visible if the partner dies."""
-    _claim_v2(marker, other_pid)
+    _claim_v2(marker, os.getpid())
     base = marker.read_bytes()
-    monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
-
-    lock = UpdateLock(path=marker)
-    assert lock.acquire() is True and lock.acquired is False
-    lines = marker.read_text(encoding="utf-8-sig").splitlines()
-    assert marker.read_bytes().startswith(base) and lines[3].startswith(f"delegate:{os.getpid()} ct:")
-
-    dead_partner = f"{DEAD_PID}\n{int(time.time())}\nct:1.000\n{lines[3]}\n"
-    marker.write_text(dead_partner, encoding="utf-8", newline="")
-    holder = read_live_update(path=marker)
-    assert holder is not None and holder.pid == os.getpid(), "the running delegate keeps the update visible"
-    marker.write_bytes(base + f"{lines[3]}\n".encode())
-    lock.release()
+    _run_handoff_child(marker, '''
+base = marker.read_bytes()
+lock = UpdateLock(path=marker)
+assert lock.acquire() is True and lock.acquired is False
+lines = marker.read_text(encoding="utf-8-sig").splitlines()
+assert marker.read_bytes().startswith(base) and lines[3].startswith(f"delegate:{os.getpid()} ct:")
+dead_partner = f"{DEAD_PID}\\n{int(time.time())}\\nct:1.000\\n{lines[3]}\\n"
+marker.write_text(dead_partner, encoding="utf-8", newline="")
+holder = read_live_update(path=marker)
+assert holder is not None and holder.pid == os.getpid(), "the running delegate keeps the claim visible"
+marker.write_bytes(base + f"{lines[3]}\\n".encode())
+lock.release()
+assert marker.read_bytes() == base, "the live partner gets its own claim back, byte-identical"
+''')
     assert marker.read_bytes() == base, "the live partner gets its own claim back, byte-identical"
 
 
@@ -631,18 +659,38 @@ class TestHandoffFromOrchestratingUpdater:
     HANDOFF_PID_ENV; a live holder matching it is our own orchestrator.
     """
 
-    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch, other_pid):
-        # other_pid stands in for the live parent updater.
-        _claim(marker, other_pid)
-        monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
-
-        lock = UpdateLock(path=marker)
-        assert lock.acquire() is True
-        assert lock.acquired is False, "the parent's claim is not ours to own"
-
-        lock.release()
+    def test_child_runs_under_the_parents_live_claim(self, marker):
+        _claim(marker, os.getpid())
+        base = marker.read_bytes()
+        _run_handoff_child(marker, '''
+base = marker.read_bytes()
+lock = UpdateLock(path=marker)
+assert lock.acquire() is True
+assert lock.acquired is False, "the parent's claim is not ours to own"
+lock.release()
+assert marker.read_bytes() == base
+''')
         assert marker.exists(), "the parent still needs its marker after our stage ends"
-        assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == other_pid
+        assert marker.read_bytes() == base
+        assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == os.getpid()
+
+    @pytest.mark.spawns_gateway_lookalike
+    def test_gateway_between_holder_and_child_refuses_handoff(self, marker):
+        _claim_v2(marker, os.getpid())
+        base = marker.read_bytes()
+        _run_handoff_child(marker, '''
+parent = int(os.environ[update_lock.HANDOFF_PID_ENV])
+assert update_lock._is_ancestor_pid(parent)
+assert update_lock._runtime_host_below(parent)
+base = marker.read_bytes()
+lock = UpdateLock(path=marker)
+assert lock.acquire() is False
+assert lock.acquired is False
+assert lock.holder is not None and lock.holder.pid == parent
+lock.release()
+assert marker.read_bytes() == base
+''', runtime_host=True)
+        assert marker.read_bytes() == base
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(
         self, marker, monkeypatch, other_pid
