@@ -46,6 +46,20 @@ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
 
 
+def _lossy_text(value: Any) -> Any:
+    """``bytes`` -> ``str`` with U+FFFD for undecodable sequences; anything else passes through.
+
+    Installed as every board connection's ``text_factory`` (a TEXT cell holding
+    invalid UTF-8 otherwise aborts the whole ``fetchall`` with "Could not decode
+    to UTF-8") and applied to BLOB-typed cells in the ``from_row`` constructors
+    (task, comment, event, run), so one
+    corrupt row degrades to replacement characters instead of taking the board
+    listing down."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections. Kanban is the
     shared cross-profile dispatch bus, so worker stampedes are expected; a
