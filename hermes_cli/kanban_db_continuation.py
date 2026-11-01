@@ -409,57 +409,6 @@ def ready_resume_admitted(conn, task_id):
         return False
 
 
-def _initial_parent_pr_reference(
-    conn: sqlite3.Connection, task_id: str, comment: sqlite3.Row,
-) -> bool:
-    """Recognize an ended parent's delivery, never a child's existing PR.
-
-    Only a pristine, parent-created child qualifies. Every URL must be bound
-    to a linked parent's latest completed run, by its original owner, before
-    completion. No state is changed; the ordinary claim still owns admission.
-    """
-    from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
-    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if (not task or task["status"] != "ready" or task["started_at"] is not None
-            or task["claim_lock"] is not None or task["current_run_id"] is not None
-            or task["worker_pid"] is not None or comment["author"] != task["created_by"]
-            or comment["author"] == task["assignee"]
-            or conn.execute("SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (task_id,)).fetchone()):
-        return False
-    created = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    try:
-        original = json.loads(created["payload"]) if created else None
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(original, dict) or original.get("assignee") != task["assignee"]:
-        return False
-    parents = conn.execute(
-        "SELECT p.status,p.assignee,r.profile,r.outcome,r.ended_at,r.metadata "
-        "FROM task_links l JOIN tasks p ON p.id=l.parent_id "
-        "LEFT JOIN task_runs r ON r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=p.id) "
-        "WHERE l.child_id=?", (task_id,),
-    ).fetchall()
-    if not parents or any(p["status"] not in ("done", "archived") for p in parents):
-        return False
-    delivered = set()
-    for parent in parents:
-        if (parent["assignee"] != comment["author"] or parent["profile"] != comment["author"]
-                or parent["outcome"] != "completed" or parent["ended_at"] is None
-                or comment["created_at"] > parent["ended_at"]):
-            continue
-        try:
-            metadata = json.loads(parent["metadata"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        if isinstance(metadata, dict) and isinstance(metadata.get("pr_url"), str):
-            delivered.add(metadata["pr_url"])
-    urls = set(_RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or ""))
-    return bool(urls) and urls.issubset(delivered)
-
-
 @dataclass(frozen=True)
 class WorkerCommandConfig:
     command: tuple[str, ...]
@@ -556,26 +505,15 @@ def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
     return list(config.command) if config is not None else None
 
 
-def ready_claim_admitted(conn, task_id, *, pr_evidence=None):
-    """Recheck source-bound ready admissions under the caller's claim lock."""
+def ready_claim_admitted(conn, task_id):
+    """Recheck execution cooldowns and budget authority under the claim lock."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_pr_guard import evidence_current
-    if pr_evidence is not None and (
-            not evidence_current(conn, task_id, pr_evidence)
-            or kb.check_respawn_guard(conn, task_id, pr_states=pr_evidence["states"])):
+    if kb.check_respawn_guard(conn, task_id):
         return False
     budget = conn.execute("SELECT id FROM task_events WHERE task_id=? "
                           "AND kind='budget_continued' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
     if budget and not conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
                                    "AND kind='claimed' AND id>?", (task_id, budget["id"])).fetchone():
         if not kb.goal_budget_admitted(conn, task_id):
-            return False
-    admission = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? "
-                             "AND kind='mrpanache_resumed' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-    if admission and "ready_admission" in kb._json_dict(admission["payload"]):
-        consumed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
-                                "AND kind='claimed' AND id>? LIMIT 1", (task_id, admission["id"])).fetchone()
-        if not consumed and (not kb.ready_resume_admitted(conn, task_id) or kb.check_respawn_guard(
-                conn, task_id, pr_states=pr_evidence["states"] if pr_evidence else None)):
             return False
     return True

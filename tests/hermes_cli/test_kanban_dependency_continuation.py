@@ -56,11 +56,10 @@ class DependencyContinuation(unittest.TestCase):
         tid, _, old_run = self.resolved()
         comments = [(c.id, c.body) for c in kb.list_comments(self.conn, tid)]
         events = self.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
-        # Dependency satisfaction alone cannot vouch for this independent PR.
-        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
-        states = {"https://github.com/example/repo/pull/2370": "MERGED"}
-        self.assertIsNone(kb.check_respawn_guard(self.conn, tid, pr_states=states))
-        self.assertIsNone(kb.check_respawn_guard(self.conn, tid, pr_states=states))
+        # Parent completion permits the original owner to continue the existing PR.
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
         self.assertEqual(events, self.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0])
         claimed = kb.claim_task(self.conn, tid)
         self.assertIsNotNone(claimed)
@@ -71,56 +70,50 @@ class DependencyContinuation(unittest.TestCase):
         self.assertEqual(comments, [(c.id, c.body) for c in kb.list_comments(self.conn, tid)])
         self.assertEqual(self.conn.execute("SELECT outcome FROM task_runs WHERE id=?", (old_run,)).fetchone()[0], "blocked")
 
-    def test_plain_duplicate_pr_stays_guarded(self):
+    def test_existing_pr_remains_context(self):
         tid = kb.create_task(self.conn, title="fixture duplicate", assignee="builder")
         kb.add_comment(self.conn, tid, author="builder", body="https://github.com/example/repo/pull/2370")
-        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
 
-    def test_unresolved_dependency_cannot_bypass_pr_or_claim(self):
+    def test_unresolved_dependency_cannot_be_claimed(self):
         tid, _, _ = self.waiting()
-        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
         self.assertIsNone(kb.claim_task(self.conn, tid))
 
     def test_reopened_parent_revokes_continuation(self):
         tid, parent, _ = self.resolved()
         self.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         self.conn.commit()
-        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
         self.assertIsNone(kb.claim_task(self.conn, tid))
 
     def test_active_claim_never_gets_dependency_exception(self):
         tid, _, _ = self.resolved()
         self.assertIsNotNone(kb.claim_task(self.conn, tid))
-        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
         self.assertIsNone(kb.claim_task(self.conn, tid))
 
-    def test_stale_or_invalid_dependency_sources_stay_guarded(self):
-        for mutation in ("wrong_run", "wrong_owner", "missing_promote", "promote_before_wait", "bad_payload", "wrong_kind", "no_parent", "active_lock", "active_pid", "active_pointer", "active_run", "new_comment"):
+    def test_dependency_metadata_does_not_create_a_pr_stop(self):
+        mutations = {
+            "wrong_run": "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='dependency_wait'",
+            "wrong_owner": "UPDATE tasks SET assignee='other' WHERE id=?",
+            "missing_promote": "DELETE FROM task_events WHERE task_id=? AND kind='promoted'",
+            "promote_before_wait": "UPDATE task_events SET kind=CASE kind WHEN 'promoted' THEN 'dependency_wait' ELSE 'promoted' END WHERE task_id=? AND kind IN ('promoted','dependency_wait')",
+            "bad_payload": "UPDATE task_events SET payload='invalid' WHERE task_id=? AND kind='dependency_wait'",
+            "wrong_kind": "UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='dependency_wait'",
+            "no_parent": "DELETE FROM task_links WHERE child_id=?",
+            "active_run": "UPDATE task_runs SET ended_at=NULL WHERE task_id=?",
+            "new_comment": "INSERT INTO task_comments (task_id,author,body,created_at) VALUES (?,'owner','new source after promotion',1)",
+            "active_lock": "UPDATE tasks SET claim_lock='fixture' WHERE id=?",
+            "active_pid": "UPDATE tasks SET worker_pid=12345 WHERE id=?",
+            "active_pointer": "UPDATE tasks SET current_run_id=12345 WHERE id=?",
+        }
+        for mutation, sql in mutations.items():
             with self.subTest(mutation=mutation):
                 tid, _, _ = self.resolved()
-                if mutation == "wrong_run":
-                    self.conn.execute("UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='dependency_wait'", (tid,))
-                elif mutation == "wrong_owner":
-                    self.conn.execute("UPDATE tasks SET assignee='other' WHERE id=?", (tid,))
-                elif mutation == "missing_promote":
-                    self.conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='promoted'", (tid,))
-                elif mutation == "promote_before_wait":
-                    self.conn.execute("UPDATE task_events SET kind=CASE kind WHEN 'promoted' THEN 'dependency_wait' ELSE 'promoted' END WHERE task_id=? AND kind IN ('promoted','dependency_wait')", (tid,))
-                elif mutation == "bad_payload":
-                    self.conn.execute("UPDATE task_events SET payload='invalid' WHERE task_id=? AND kind='dependency_wait'", (tid,))
-                elif mutation == "wrong_kind":
-                    self.conn.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='dependency_wait'", (tid,))
-                elif mutation == "no_parent":
-                    self.conn.execute("DELETE FROM task_links WHERE child_id=?", (tid,))
-                elif mutation == "active_run":
-                    self.conn.execute("UPDATE task_runs SET ended_at=NULL WHERE task_id=?", (tid,))
-                elif mutation == "new_comment":
-                    kb.add_comment(self.conn, tid, author="owner", body="new source after promotion")
-                else:
-                    column, value = {"active_lock": ("claim_lock", "fixture"), "active_pid": ("worker_pid", 12345), "active_pointer": ("current_run_id", 12345)}[mutation]
-                    self.conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, tid))
+                self.conn.execute(sql, (tid,))
                 self.conn.commit()
-                self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+                self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
 
     def test_newer_run_consumes_old_continuation(self):
         tid, _, _ = self.resolved()
@@ -128,7 +121,7 @@ class DependencyContinuation(unittest.TestCase):
         self.assertTrue(kb.block_task(self.conn, tid, reason="fixture other blocker", kind="transient", expected_run_id=claimed.current_run_id))
         self.assertTrue(kb.unblock_task(self.conn, tid))
         kb.add_comment(self.conn, tid, author="owner", body="fixture later receipt")
-        self.assertEqual(kb.check_respawn_guard(self.conn, tid), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
 
     def test_auth_and_cooldown_still_precede_continuation(self):
         tid, _, run = self.resolved()
