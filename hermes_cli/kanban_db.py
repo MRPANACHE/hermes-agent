@@ -37,18 +37,7 @@ _log = logging.getLogger(__name__)
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
 
-def _lossy_text(value: Any) -> Any:
-    """``bytes`` -> ``str`` with U+FFFD for undecodable sequences; anything else passes through.
-
-    Installed as every board connection's ``text_factory`` (a TEXT cell holding
-    invalid UTF-8 otherwise aborts the whole ``fetchall`` with "Could not decode
-    to UTF-8") and applied to BLOB-typed cells in the ``from_row`` constructors
-    (task, comment, event, run), so one
-    corrupt row degrades to replacement characters instead of taking the board
-    listing down."""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
+from hermes_cli.kanban_db_connect import _lossy_text
 
 
 def _row_get(row: Any, col: str, default: Any = None) -> Any:
@@ -2182,6 +2171,9 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    from hermes_cli.kanban_db_run_limits import enforce_run_limits
+    if not enforce_run_limits(conn, task_id, source_status, now):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks

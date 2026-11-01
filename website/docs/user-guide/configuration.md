@@ -16,6 +16,17 @@ All settings are stored in the `~/.hermes/` directory for easy access.
 Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](../integrations/nous-portal.md).
 :::
 
+## Kanban hard run limits
+
+`kanban.hard_run_limits` defaults to `false`. When enabled on the claiming
+runtime, admission stops after five spawned runs without a measured outcome,
+and after twenty run-hours across boards per Europe/Amsterdam calendar day.
+Administrative schedule rows do not count as attempts; running workers finish.
+Native, source-bound Mara decisions can authorize incident or Noor daily-work
+exceptions and at most one additional five-run series. An ordinary unblock is
+not an override. Native `limit_hit` events distinguish refused claims from
+authorized exceptions for the daily brief.
+
 ## Directory Structure
 
 ```text
