@@ -1519,7 +1519,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
-        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
+        # a no-op re-assign or an unassign in the assignment audit trail.
         _append_event(
             conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
         )
@@ -2218,7 +2218,6 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
-    pr_evidence: Optional[dict] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2230,7 +2229,7 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         from hermes_cli.kanban_db_continuation import ready_claim_admitted
-        if not ready_claim_admitted(conn, task_id, pr_evidence=pr_evidence):
+        if not ready_claim_admitted(conn, task_id):
             return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
@@ -4634,7 +4633,6 @@ from hermes_cli.kanban_db_continuation import (
     wake_scheduled_tasks,
     ready_resume_binding,
     ready_resume_admitted,
-    _initial_parent_pr_reference,
     WorkerCommandConfig,
     _resolve_worker_config,
     _resolve_worker_command,

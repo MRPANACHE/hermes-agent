@@ -50,23 +50,23 @@ class InitialParentPR(unittest.TestCase):
         self.assertEqual(claimed.id, self.child)
         self.assertEqual(claimed.assignee, "child-owner")
         self.assertIsNone(kb.claim_task(self.conn, self.child))
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
 
-    def test_unbound_pr_stays_guarded(self):
+    def test_unbound_pr_remains_context(self):
         kb.add_comment(self.conn, self.child, author="parent-owner",
                        body="Other https://github.com/example/parent-repo/pull/2471")
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
 
-    def test_owner_pr_stays_guarded_even_when_same_url(self):
+    def test_owner_pr_remains_context_even_when_same_url(self):
         kb.add_comment(self.conn, self.child, author="child-owner", body=self.url)
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
 
-    def test_mixed_bound_and_unbound_urls_stay_guarded(self):
+    def test_mixed_bound_and_unbound_urls_remain_context(self):
         kb.add_comment(self.conn, self.child, author="parent-owner",
                        body=self.url + " https://github.com/example/repo/pull/8")
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
 
-    def test_changed_or_missing_native_binding_denies(self):
+    def test_parent_pr_metadata_is_not_claim_authority(self):
         for mutation in ("owner", "creator", "parent_owner", "parent_status", "parent_run",
                          "parent_outcome", "metadata", "url", "no_parent", "prior_run", "pointer", "lock", "pid", "started", "late_comment"):
             with self.subTest(mutation=mutation):
@@ -97,7 +97,7 @@ class InitialParentPR(unittest.TestCase):
                     column, value = {"pointer": ("current_run_id", 99), "lock": ("claim_lock", "fixture"),
                                      "pid": ("worker_pid", 999999), "started": ("started_at", 1)}[mutation]
                     self.conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, self.child))
-                self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "active_pr")
+                self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
                 self.conn.execute("ROLLBACK TO negative")
                 self.conn.execute("RELEASE negative")
 
@@ -105,11 +105,11 @@ class InitialParentPR(unittest.TestCase):
         self.conn.execute("UPDATE tasks SET last_failure_error='authentication failed' WHERE id=?", (self.child,))
         self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "blocker_auth")
 
-    def test_newer_parent_run_revokes_old_delivery(self):
-        # A later run must not authorize a child using a stale completed run.
+    def test_newer_parent_run_does_not_make_pr_an_execution_stop(self):
+        # A historical PR receipt is not a second execution policy.
         self.conn.execute("INSERT INTO task_runs (task_id,profile,status,started_at,ended_at,outcome) "
                           "VALUES (?,?,'done',1,2,'blocked')", (self.parent, "parent-owner"))
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.child), "active_pr")
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
 
 
 if __name__ == "__main__":

@@ -332,6 +332,8 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    clock = [int(_kb.time.time())]
+    monkeypatch.setattr(_kb.time, "time", lambda: clock[0])
 
     with kbc.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
@@ -344,7 +346,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
             # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert kb.claim_task(conn, tid, claimer=f"{host}:w{i}") is not None
             conn.execute(
                 "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
                 "WHERE id=?",
@@ -369,6 +371,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
                 f"hit {i}: rate-limit must not count a failure, "
                 f"got {task.consecutive_failures}"
             )
+
+            assert kb.claim_task(conn, tid) is None
+            clock[0] += _kb._resolve_rate_limit_cooldown_seconds() + 1
 
         # Last failure error stamped so the respawn guard recognizes the
         # quota wall.

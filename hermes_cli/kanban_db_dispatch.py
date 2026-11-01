@@ -80,15 +80,6 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
-_RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
-
-_RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
-    re.IGNORECASE,
-)
-
-
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass.
@@ -142,7 +133,7 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window). PR references remain worker context, not admission policy."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -159,7 +150,7 @@ class DispatchResult:
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
+    ``recent_success=2, rate_limited=1, skipped_locked=1,
     memory_pressure=critical`` — the respawn-guard reasons counted per task
     plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
@@ -1538,7 +1529,6 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
-    pr_states: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1551,12 +1541,10 @@ def check_respawn_guard(
     path never increments ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    a re-queue event arrived after it — a deliberate re-run). Existing PRs and
+    comments are worker context, not reasons to stop the assigned owner.
+    The review lane skips recent-success suppression. Stale/dead claim locks
+    remain the reclaim passes' responsibility.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1613,8 +1601,8 @@ def check_respawn_guard(
         if history["active_chain"] and history["runtime_seconds"] >= task.max_runtime_seconds:
             return "budget_runtime_limit_reached: explicit operator action required"
 
-    # Review-lane spawns stop here: a recent completed run and a fresh PR URL
-    # are the canonical *inputs* to a review handoff, not duplicate-work signals.
+    # Review-lane spawns skip only recent-success suppression: the completed
+    # implementation is the input to the explicitly requested review.
     if lane == "review":
         return None
 
@@ -1627,66 +1615,6 @@ def check_respawn_guard(
     if success is not None and not any(_rows_since(
             conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
         return "recent_success"
-
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
-    from hermes_cli.kanban_pr_guard import pr_comments
-    pr_times = [t for t, c in pr_comments(conn, task_id, now)
-        if any((pr_states or {}).get(url) != "MERGED"
-               for url in _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or ""))
-        and not _kb._initial_parent_pr_reference(conn, task_id, c)]
-    if pr_times:
-        # Strictly after: a same-second tie stays guarded (fail closed).
-        if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-                cols=", kind, payload", strict=True)):
-            return None
-        # A dependency is not permission to duplicate an independent own PR.
-        # Terminal PR evidence above survives routine handoff/readback comments;
-        # open/unknown references require an existing explicit admission below.
-        # A canonical reviewer return authorizes correction on this task,
-        # not another PR. Never carry that permission past a newer run or
-        # owner change; auth, cooldown and recent-success guards stay above.
-        rework = conn.execute(
-            "SELECT 1 FROM task_runs r JOIN task_events e "
-            "ON e.task_id = r.task_id AND e.run_id = r.id "
-            "JOIN tasks t ON t.id = r.task_id "
-            "WHERE r.task_id = ? AND r.id = "
-            "(SELECT MAX(id) FROM task_runs WHERE task_id = ?) "
-            "AND r.outcome = 'changes_requested' "
-            "AND e.kind = 'changes_requested' AND json_valid(e.payload) "
-            "AND json_extract(e.payload, '$.status') IN ('ready', 'todo') "
-            "AND json_extract(e.payload, '$.implementer') = t.assignee "
-            "AND t.status = 'ready' AND t.current_run_id IS NULL LIMIT 1",
-            (task_id, task_id),
-        ).fetchone()
-        if rework:
-            return None
-        # A monitor/operator explicitly waking the card after recording
-        # evidence is not duplicate PR work. Use event order, not seconds:
-        # comment + unblock commonly happen in the same second. A newer
-        # comment restores the conservative PR guard until another wake.
-        last_comment = conn.execute(
-            "SELECT MAX(id) AS id FROM task_events "
-            "WHERE task_id = ? AND kind = 'commented'",
-            (task_id,),
-        ).fetchone()
-        if last_comment and last_comment["id"] is not None:
-            explicit_wake = conn.execute(
-                "SELECT 1 FROM task_events WHERE task_id = ? "
-                "AND kind = 'unblocked' AND id > ? LIMIT 1",
-                (task_id, last_comment["id"]),
-            ).fetchone()
-            if explicit_wake:
-                return None
-        if _kb.ready_resume_admitted(conn, task_id):
-            return None
-        return "active_pr"
 
     return None
 
@@ -1707,22 +1635,6 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
         t = unreadable if t is None else t
         if t is not None and (t > since if strict else t >= since):
             yield t, row
-
-
-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
-        return False
-    to = data.get("assignee")
-    return bool(to) and "from" in data and data["from"] != to
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
@@ -2105,7 +2017,6 @@ def _dispatch_lane_task(
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
-    from hermes_cli.kanban_pr_guard import resolve_guard, record_guard
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
@@ -2135,7 +2046,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason, pr_evidence = resolve_guard(conn, task_id, lane=lane)
+    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2146,7 +2057,8 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            record_guard(conn, task_id, guard_reason, pr_evidence)
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2161,8 +2073,6 @@ def _dispatch_lane_task(
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claim_kwargs: dict[str, Any] = {"ttl_seconds": ttl_seconds}
-    if pr_evidence is not None and lane == "ready":
-        claim_kwargs["pr_evidence"] = pr_evidence
     claimed = claim(conn, task_id, **claim_kwargs)
     if claimed is None:
         return False
