@@ -7221,9 +7221,8 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
     from tools.send_message_tool import _send_telegram
     return await _send_telegram(
-        token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=disable_link_previews, force_document=force_document,
-        extra=getattr(pconfig, "extra", None))
+        token, chat_id, message, media_files=media_files, thread_id=thread_id, extra=pconfig.extra,
+        disable_link_previews=disable_link_previews, force_document=force_document)
 
 
 def interactive_setup() -> None:
