@@ -40,14 +40,14 @@ def test_canonical_rework_allows_same_task_claim(conn):
 @pytest.mark.parametrize("mutation", ["missing_event", "wrong_run", "wrong_owner", "bad_payload", "later_run"])
 def test_rework_metadata_does_not_add_an_execution_stop(conn, mutation):
     tid = rework(conn)
-    if mutation == "missing_event":
-        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='changes_requested'", (tid,))
-    elif mutation == "wrong_run":
-        conn.execute("UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='changes_requested'", (tid,))
-    elif mutation == "wrong_owner":
-        conn.execute("UPDATE tasks SET assignee='other' WHERE id=?", (tid,))
-    elif mutation == "bad_payload":
-        conn.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='changes_requested'", (tid,))
+    mutations = {
+        "missing_event": "DELETE FROM task_events WHERE task_id=? AND kind='changes_requested'",
+        "wrong_run": "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='changes_requested'",
+        "wrong_owner": "UPDATE tasks SET assignee='other' WHERE id=?",
+        "bad_payload": "UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='changes_requested'",
+    }
+    if mutation in mutations:
+        conn.execute(mutations[mutation], (tid,))
     else:
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="transient", kind="transient")

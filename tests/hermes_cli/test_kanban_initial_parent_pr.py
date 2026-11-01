@@ -67,39 +67,30 @@ class InitialParentPR(unittest.TestCase):
         self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
 
     def test_parent_pr_metadata_is_not_claim_authority(self):
-        for mutation in ("owner", "creator", "parent_owner", "parent_status", "parent_run",
-                         "parent_outcome", "metadata", "url", "no_parent", "prior_run", "pointer", "lock", "pid", "started", "late_comment"):
+        mutations = {
+            "owner": ("UPDATE tasks SET assignee='other' WHERE id=?", (self.child,)),
+            "creator": ("UPDATE tasks SET created_by='other' WHERE id=?", (self.child,)),
+            "parent_owner": ("UPDATE tasks SET assignee='other' WHERE id=?", (self.parent,)),
+            "parent_status": ("UPDATE tasks SET status='ready' WHERE id=?", (self.parent,)),
+            "parent_run": ("UPDATE task_runs SET profile='other' WHERE id=?", (self.parent_run,)),
+            "parent_outcome": ("UPDATE task_runs SET outcome='blocked' WHERE id=?", (self.parent_run,)),
+            "metadata": ("UPDATE task_runs SET metadata='[]' WHERE id=?", (self.parent_run,)),
+            "url": ("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps({"pr_url": self.url + "1"}), self.parent_run)),
+            "no_parent": ("DELETE FROM task_links WHERE child_id=?", (self.child,)),
+            "prior_run": ("INSERT INTO task_runs (task_id,profile,status,started_at,ended_at,outcome) VALUES (?,?,'done',1,2,'blocked')", (self.child, "child-owner")),
+            "pointer": ("UPDATE tasks SET current_run_id=99 WHERE id=?", (self.child,)),
+            "lock": ("UPDATE tasks SET claim_lock='fixture' WHERE id=?", (self.child,)),
+            "pid": ("UPDATE tasks SET worker_pid=999999 WHERE id=?", (self.child,)),
+            "started": ("UPDATE tasks SET started_at=1 WHERE id=?", (self.child,)),
+            "late_comment": ("UPDATE task_comments SET created_at=created_at+100 WHERE task_id=?", (self.child,)),
+        }
+        for mutation, (sql, args) in mutations.items():
             with self.subTest(mutation=mutation):
-                self.conn.execute("SAVEPOINT negative")
-                if mutation == "owner":
-                    self.conn.execute("UPDATE tasks SET assignee='other' WHERE id=?", (self.child,))
-                elif mutation == "creator":
-                    self.conn.execute("UPDATE tasks SET created_by='other' WHERE id=?", (self.child,))
-                elif mutation == "parent_owner":
-                    self.conn.execute("UPDATE tasks SET assignee='other' WHERE id=?", (self.parent,))
-                elif mutation == "parent_status":
-                    self.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (self.parent,))
-                elif mutation == "parent_run":
-                    self.conn.execute("UPDATE task_runs SET profile='other' WHERE id=?", (self.parent_run,))
-                elif mutation == "parent_outcome":
-                    self.conn.execute("UPDATE task_runs SET outcome='blocked' WHERE id=?", (self.parent_run,))
-                elif mutation == "metadata":
-                    self.conn.execute("UPDATE task_runs SET metadata='[]' WHERE id=?", (self.parent_run,))
-                elif mutation == "url":
-                    self.conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps({"pr_url": self.url + "1"}), self.parent_run))
-                elif mutation == "no_parent":
-                    self.conn.execute("DELETE FROM task_links WHERE child_id=?", (self.child,))
-                elif mutation == "prior_run":
-                    self.conn.execute("INSERT INTO task_runs (task_id,profile,status,started_at,ended_at,outcome) VALUES (?,?, 'done',1,2,'blocked')", (self.child, "child-owner"))
-                elif mutation == "late_comment":
-                    self.conn.execute("UPDATE task_comments SET created_at=created_at+100 WHERE task_id=?", (self.child,))
-                else:
-                    column, value = {"pointer": ("current_run_id", 99), "lock": ("claim_lock", "fixture"),
-                                     "pid": ("worker_pid", 999999), "started": ("started_at", 1)}[mutation]
-                    self.conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, self.child))
+                self.conn.execute("SAVEPOINT metadata")
+                self.conn.execute(sql, args)
                 self.assertIsNone(kb.check_respawn_guard(self.conn, self.child))
-                self.conn.execute("ROLLBACK TO negative")
-                self.conn.execute("RELEASE negative")
+                self.conn.execute("ROLLBACK TO metadata")
+                self.conn.execute("RELEASE metadata")
 
     def test_auth_guard_remains(self):
         self.conn.execute("UPDATE tasks SET last_failure_error='authentication failed' WHERE id=?", (self.child,))

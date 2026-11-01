@@ -94,30 +94,24 @@ class DependencyContinuation(unittest.TestCase):
         self.assertIsNone(kb.claim_task(self.conn, tid))
 
     def test_dependency_metadata_does_not_create_a_pr_stop(self):
-        for mutation in ("wrong_run", "wrong_owner", "missing_promote", "promote_before_wait", "bad_payload", "wrong_kind", "no_parent", "active_lock", "active_pid", "active_pointer", "active_run", "new_comment"):
+        mutations = {
+            "wrong_run": "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='dependency_wait'",
+            "wrong_owner": "UPDATE tasks SET assignee='other' WHERE id=?",
+            "missing_promote": "DELETE FROM task_events WHERE task_id=? AND kind='promoted'",
+            "promote_before_wait": "UPDATE task_events SET kind=CASE kind WHEN 'promoted' THEN 'dependency_wait' ELSE 'promoted' END WHERE task_id=? AND kind IN ('promoted','dependency_wait')",
+            "bad_payload": "UPDATE task_events SET payload='invalid' WHERE task_id=? AND kind='dependency_wait'",
+            "wrong_kind": "UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='dependency_wait'",
+            "no_parent": "DELETE FROM task_links WHERE child_id=?",
+            "active_run": "UPDATE task_runs SET ended_at=NULL WHERE task_id=?",
+            "new_comment": "INSERT INTO task_comments (task_id,author,body,created_at) VALUES (?,'owner','new source after promotion',1)",
+            "active_lock": "UPDATE tasks SET claim_lock='fixture' WHERE id=?",
+            "active_pid": "UPDATE tasks SET worker_pid=12345 WHERE id=?",
+            "active_pointer": "UPDATE tasks SET current_run_id=12345 WHERE id=?",
+        }
+        for mutation, sql in mutations.items():
             with self.subTest(mutation=mutation):
                 tid, _, _ = self.resolved()
-                if mutation == "wrong_run":
-                    self.conn.execute("UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='dependency_wait'", (tid,))
-                elif mutation == "wrong_owner":
-                    self.conn.execute("UPDATE tasks SET assignee='other' WHERE id=?", (tid,))
-                elif mutation == "missing_promote":
-                    self.conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='promoted'", (tid,))
-                elif mutation == "promote_before_wait":
-                    self.conn.execute("UPDATE task_events SET kind=CASE kind WHEN 'promoted' THEN 'dependency_wait' ELSE 'promoted' END WHERE task_id=? AND kind IN ('promoted','dependency_wait')", (tid,))
-                elif mutation == "bad_payload":
-                    self.conn.execute("UPDATE task_events SET payload='invalid' WHERE task_id=? AND kind='dependency_wait'", (tid,))
-                elif mutation == "wrong_kind":
-                    self.conn.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='dependency_wait'", (tid,))
-                elif mutation == "no_parent":
-                    self.conn.execute("DELETE FROM task_links WHERE child_id=?", (tid,))
-                elif mutation == "active_run":
-                    self.conn.execute("UPDATE task_runs SET ended_at=NULL WHERE task_id=?", (tid,))
-                elif mutation == "new_comment":
-                    kb.add_comment(self.conn, tid, author="owner", body="new source after promotion")
-                else:
-                    column, value = {"active_lock": ("claim_lock", "fixture"), "active_pid": ("worker_pid", 12345), "active_pointer": ("current_run_id", 12345)}[mutation]
-                    self.conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, tid))
+                self.conn.execute(sql, (tid,))
                 self.conn.commit()
                 self.assertIsNone(kb.check_respawn_guard(self.conn, tid))
 
