@@ -1474,7 +1474,7 @@ def _goal_handoff_context(kb, conn, task) -> str:
     if ingress and ((information and effective is not None)
                     or (not information and effective not in ("draft_pr", "verified_live"))):
         raise ValueError("missing mandate context: invalid original delivery goal")
-    if ingress and effective == "verified_live" and (original.get("agent") != "otto" or original.get("kind") != "codework"):
+    if ingress and effective == "verified_live" and (original.get("agent") not in ("otto", "noor") or original.get("kind") != "codework"):
         raise ValueError("missing mandate context: unsupported original delivery goal")
     amendments = []
     verified_comment_ids = set()
@@ -1505,7 +1505,7 @@ def _goal_handoff_context(kb, conn, task) -> str:
         goal = payload["delivery_goal"]
         if not ingress or information or goal not in ("draft_pr", "verified_live"):
             raise ValueError(f"missing mandate context: invalid delivery event {row['id']}")
-        if goal == "verified_live" and (original.get("agent") != "otto" or original.get("kind") != "codework"):
+        if goal == "verified_live" and (original.get("agent") not in ("otto", "noor") or original.get("kind") != "codework"):
             raise ValueError(f"missing mandate context: unsupported delivery event {row['id']}")
 
         effective = goal

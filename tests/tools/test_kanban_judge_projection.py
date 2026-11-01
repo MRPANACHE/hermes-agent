@@ -85,9 +85,31 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(data['effective_delivery_goal'], 'verified_live')
         self.assertEqual(data['delivery_source'], 'native_transition')
 
-    def test_non_otto_original_live_delivery_is_not_a_grant(self):
+    def test_noor_live_delivery_retains_exact_goal_and_original_constraints(self):
+        self.runs[-1].summary = 'Live SHA and original symptom readback'
+        metadata = json.loads(self.task.body.split('\n', 1)[0])
+        metadata['delivery_goal'] = 'verified_live'
+        self.task.body = json.dumps(metadata) + '\nNo money or irreversible actions.'
+        original = self.task.body
+        data = json.loads(self.project().split('\n', 1)[1])
+        self.assertEqual(data['effective_delivery_goal'], 'verified_live')
+        self.assertEqual(data['original_body'], original)
+        self.assertEqual(self.task.body, original)
+
+    def test_noor_live_transition_is_retained_without_rewriting_existing_tasks(self):
+        self.runs[-1].summary = 'Exact current live evidence'
+        original = self.task.body
+        self.assertEqual(json.loads(self.project().split('\n', 1)[1])['effective_delivery_goal'], 'draft_pr')
+        self.amendment(delivery_goal='verified_live')
+        data = json.loads(self.project().split('\n', 1)[1])
+        self.assertEqual(data['effective_delivery_goal'], 'verified_live')
+        self.assertEqual(data['delivery_source'], 'native_transition')
+        self.assertEqual(self.task.body, original)
+
+    def test_other_agent_original_live_delivery_is_not_a_grant(self):
         self.runs[-1].summary = 'Current exact evidence'
         metadata = json.loads(self.task.body.split('\n', 1)[0])
+        metadata['agent'] = 'pippa'
         metadata['delivery_goal'] = 'verified_live'
         self.task.body = json.dumps(metadata)
         with self.assertRaisesRegex(ValueError, 'unsupported original delivery goal'):
@@ -161,6 +183,9 @@ class ProjectionTests(unittest.TestCase):
             self.project()
 
     def test_unauthorized_delivery_change_denied(self):
+        metadata = json.loads(self.task.body.split('\n', 1)[0])
+        metadata['agent'] = 'pippa'
+        self.task.body = json.dumps(metadata)
         self.amendment(delivery_goal='verified_live')
         with self.assertRaisesRegex(ValueError, 'unsupported delivery'):
             self.project()
