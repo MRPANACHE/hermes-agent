@@ -1898,6 +1898,8 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # Assignee-scoped compatibility route; never fallback after ambiguous owner admission.
+        "worker_transport": "gateway",  # gateway | cli (older release or no gateway)
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,

@@ -10,6 +10,24 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+### Mixed-release worker transports
+
+The dispatcher reads `kanban.worker_transport` from the assigned profile, not
+from its own launch profile. The default `gateway` submits the claim to that
+profile's `kanban.run` owner. For a profile on an older release or without a
+gateway, set `hermes --profile NAME config set kanban.worker_transport cli`.
+This selects the existing one-shot worker before any admission, retaining
+board/run/claim identity, workspace, task skills, model/provider, reasoning and
+CLI toolsets. There is no fallback after a failed or ambiguous gateway RPC.
+
+For installations selecting releases per profile, point the dispatcher's existing
+`HERMES_BIN` at the trusted per-profile Hermes launcher. The CLI route invokes it
+with `-p NAME` and does not inject the dispatcher's source tree. Otherwise the
+existing same-install executable resolver applies. Choose a CLI-capable release
+for `cli`; new gateway-only releases must use `gateway`. Invalid transport values
+refuse before worker start. Direct `worker.command` profiles are unchanged.
+Daily admission and restart-safe process supervision apply to both routes.
+
 ### Exact-date run-hour budgets
 
 With `kanban.hard_run_limits: true`, admission keeps the shared-board 20-hour
