@@ -19,13 +19,13 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ## Kanban hard run limits
 
 `kanban.hard_run_limits` defaults to `false`. When enabled on the claiming
-runtime, admission stops after five spawned runs without a measured outcome,
-and after twenty run-hours across boards per Europe/Amsterdam calendar day.
-Administrative schedule rows do not count as attempts; running workers finish.
-Native, source-bound Mara decisions can authorize incident or Noor daily-work
-exceptions and at most one additional five-run series. An ordinary unblock is
-not an override. Native `limit_hit` events distinguish refused claims from
-authorized exceptions for the daily brief.
+runtime, admission retains the twenty run-hour limit across boards per
+Europe/Amsterdam calendar day. There is no per-card five-run stop and no
+supervisor reset requirement. Running workers finish. Explicit `wait_only`
+scheduling receipts distinguish diagnostic work-attempt counts, but all runtime
+still consumes the daily budget. Source-bound native incident/daily-work
+exceptions and `limit_hit` event evidence retain their existing daily-budget
+semantics.
 
 ## Directory Structure
 
