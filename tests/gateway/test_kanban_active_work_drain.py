@@ -13,13 +13,36 @@ def test_running_cards_are_counted_once_per_database(tmp_path, monkeypatch):
 
     path = tmp_path / "board.db"
     with sqlite3.connect(path) as conn:
-        conn.execute("CREATE TABLE tasks (status TEXT)")
-        conn.executemany("INSERT INTO tasks VALUES (?)", [("running",), ("running",), ("ready",)])
+        conn.execute("CREATE TABLE tasks (status TEXT, assignee TEXT)")
+        conn.executemany("INSERT INTO tasks VALUES (?, ?)", [
+            ("running", "mara"), ("running", "otto"), ("ready", "mara"),
+        ])
     monkeypatch.setattr(kb, "list_boards", lambda **kwargs: [{"slug": "a"}, {"slug": "b"}])
     monkeypatch.setattr(kb, "kanban_db_path", lambda **kwargs: path)
-    assert GatewayShutdownMixin._active_kanban_worker_count() == 2
+    runner = GatewayShutdownMixin()
+    runner._primary_profile_name = "mara"
+    assert runner._active_kanban_worker_count() == 1
+    runner._served_profile_homes = {"otto": tmp_path / "otto"}
+    assert runner._active_kanban_worker_count() == 2
     path.write_bytes(b"unreadable sqlite")
-    assert GatewayShutdownMixin._active_kanban_worker_count() == 1
+    assert runner._active_kanban_worker_count() == 1
+
+
+def test_foreign_running_card_does_not_block_but_unknown_owner_does(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    path = tmp_path / "board.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE tasks (status TEXT, assignee TEXT)")
+        conn.execute("INSERT INTO tasks VALUES ('running', 'otto')")
+    monkeypatch.setattr(kb, "list_boards", lambda **kwargs: [{"slug": "default"}])
+    monkeypatch.setattr(kb, "kanban_db_path", lambda **kwargs: path)
+    runner = GatewayShutdownMixin()
+    runner._primary_profile_name = "mara"
+    assert runner._active_kanban_worker_count() == 0
+    with sqlite3.connect(path) as conn:
+        conn.executemany("INSERT INTO tasks VALUES ('running', ?)", [(None,), ("",)])
+    assert runner._active_kanban_worker_count() == 2
 
 
 @pytest.mark.asyncio
