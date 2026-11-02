@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sys
 
 
@@ -67,7 +68,7 @@ def main(argv=None):
     from hermes_cli import kanban_db as kb
     args = sys.argv[1:] if argv is None else argv
     db_path, payload = args
-    with kb.connect(db_path) as conn:
+    with kb.connect(Path(db_path)) as conn:
         result = apply_measured_outcome(conn, **json.loads(payload))
         print(json.dumps(result))
 

@@ -56,6 +56,24 @@ def test_stale_feedback_never_overwrites_changed_work(conn, mutation):
     assert kb.get_task(conn, tid).status == before
 
 
+@pytest.mark.parametrize("action,status", [("close", "done"), ("reopen", "ready")])
+@pytest.mark.parametrize("relative", [False, True])
+def test_module_entrypoint_opens_argv_path(conn, tmp_path, monkeypatch, capsys, action, status, relative):
+    import json
+    from hermes_cli.kanban_db_measured_outcome import main
+
+    args = waiting(conn)
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    monkeypatch.chdir(Path(db_path).parent)
+    argv_path = Path(db_path).name if relative else db_path
+    main([argv_path, json.dumps({**args, "action": action})])
+    result = json.loads(capsys.readouterr().out)
+    assert result["applied"] is True
+    assert kb.get_task(conn, args["task_id"]).status == status
+    main([argv_path, json.dumps({**args, "action": action})])
+    assert json.loads(capsys.readouterr().out)["replay"] is True
+
+
 def test_conflicting_replay_refused(conn):
     args = waiting(conn)
     apply_measured_outcome(conn, **args, action="close")
