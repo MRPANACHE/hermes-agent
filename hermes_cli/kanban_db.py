@@ -2049,6 +2049,39 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+TRANSIENT_RETRY_SECONDS = 60
+
+
+def _transient_retry_due(conn: sqlite3.Connection, row, now: int) -> Optional[dict]:
+    """Only typed transient blocks retry, after cooldown and actual worker exit."""
+    if (row['block_kind'] != 'transient' or row['current_run_id'] is not None
+            or int(row['block_recurrences'] or 0) >= BLOCK_RECURRENCE_LIMIT):
+        return None
+    event = conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id=? AND kind IN ('blocked','block_loop_detected','unblocked','gave_up') "
+        "ORDER BY id DESC LIMIT 1", (row['id'],),
+    ).fetchone()
+    if event is None or now < int(event['created_at']) + TRANSIENT_RETRY_SECONDS:
+        return None
+    try:
+        payload = json.loads(event['payload'] or '{}')
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get('kind') != 'transient':
+        return None
+    worker = conn.execute(
+        "SELECT worker_pid,worker_started_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (row['id'],),
+    ).fetchone()
+    if worker and worker['worker_pid']:
+        from hermes_cli.kanban_db_dispatch import _worker_alive
+        if _worker_alive(worker['worker_pid'], worker['worker_started_at']):
+            return None
+    return {'reason': 'transient_retry', 'blocked_event_id': event['id'],
+            'backoff_seconds': TRANSIENT_RETRY_SECONDS}
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
@@ -2059,21 +2092,28 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).
+    explicit ``kanban_unblock`` (#28712), except typed transient blocks after
+    their cooldown and worker exit. The retry preserves parent, failure,
+    recurrence and normal claim/day-budget gates.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    now = int(time.time())
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "block_kind, block_recurrences, current_run_id "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Explicit human-intervention block; only ``unblock_task`` may exit it.
+            retry = _transient_retry_due(conn, row, now) if cur_status == 'blocked' else None
+            if cur_status == 'blocked' and row['block_kind'] == 'transient' and retry is None:
+                continue
+            if cur_status == "blocked" and _has_sticky_block(conn, task_id) and retry is None:
+                # Input/capability and untyped explicit blocks remain sticky.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -2105,7 +2145,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     )
                 _append_event(
                     conn, task_id, "promoted",
-                    {"status": resume_status} if resume_status != "ready" else None,
+                    ({**retry, 'status': resume_status} if retry is not None else
+                     {"status": resume_status} if resume_status != "ready" else None),
                 )
                 promoted += 1
     return promoted
