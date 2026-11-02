@@ -207,13 +207,18 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     def _active_kanban_dispatch_count(self) -> int:
         return max(0, int(getattr(self, "_kanban_dispatch_active_count", 0)))
 
-    @staticmethod
-    def _active_kanban_worker_count() -> int:
-        """Count native running cards; an unreadable board remains busy during maintenance."""
+    def _active_kanban_worker_count(self) -> int:
+        """Count workers owned by this gateway's served profiles, not sibling gateways.
+
+        Unknown owners and unreadable boards remain busy during maintenance.
+        """
         import sqlite3
         from hermes_cli import kanban_db as kb
 
         try:
+            profiles = sorted({getattr(self, "_primary_profile_name", None) or "default",
+                               *(getattr(self, "_served_profile_homes", None) or {})})
+            placeholders = ",".join("?" for _ in profiles)
             boards = kb.list_boards(include_archived=False)
             paths = {kb.kanban_db_path(board=board["slug"]).resolve() for board in boards}
             count = 0
@@ -221,7 +226,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 if not path.exists():
                     continue
                 with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as conn:
-                    count += conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+                    count += conn.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND "
+                        f"(assignee IN ({placeholders}) OR assignee IS NULL OR assignee = '')",
+                        profiles,
+                    ).fetchone()[0]
             return count
         except Exception:
             logger.warning("Cannot read Kanban work count; keeping gateway busy", exc_info=True)
