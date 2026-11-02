@@ -10,6 +10,16 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+### Exact-date run-hour budgets
+
+With `kanban.hard_run_limits: true`, admission keeps the shared-board 20-hour
+Europe/Amsterdam calendar-day brake. Per-card run counts do not stop owner
+repairs. An operator-approved temporary budget uses
+`kanban.daily_run_hours_overrides`: exact `YYYY-MM-DD` dates mapped to positive
+integer hours. Only the matching local date receives an override; absent or
+invalid values retain 20 hours. Exhaustion defers claims without blocking cards
+or cancelling active runs. This setting is not execution authority.
+
 ### Completion checkpoints before the iteration cap
 
 Dispatcher-owned workers get one checkpoint notice near 90% of their finite iteration

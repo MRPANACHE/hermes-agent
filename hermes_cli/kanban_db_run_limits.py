@@ -247,7 +247,8 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
     """In the native ready/review claim transaction; never cancel running workers."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.kanban_db import _append_event
-    if (load_config_readonly() or {}).get("kanban", {}).get("hard_run_limits", False) is not True:
+    config = (load_config_readonly() or {}).get("kanban", {})
+    if config.get("hard_run_limits", False) is not True:
         return True
     task = conn.execute("SELECT status,claim_lock,worker_pid,current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
     if (not task or task["status"] != source_status or task["claim_lock"] is not None
@@ -258,9 +259,14 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
     # start a second five-run approval loop.
     hits = []
     usage = daily_usage(conn, now)
-    if usage["runtime_seconds"] >= 20 * 3600:
+    overrides = config.get("daily_run_hours_overrides", {})
+    budget = overrides.get(usage["local_date"], 20) if isinstance(overrides, dict) else 20
+    # Invalid input never disables or raises the cost brake.
+    if type(budget) is not int or budget <= 0:
+        budget = 20
+    if usage["runtime_seconds"] >= budget * 3600:
         exception = _exception(conn, task_id)
-        daily = {"limit_key": "daily_run_hours", "observed": usage["hours"], "threshold": 20, "unit": "hours",
+        daily = {"limit_key": "daily_run_hours", "observed": usage["hours"], "threshold": budget, "unit": "hours",
                  **{k: usage[k] for k in ("timezone", "local_date", "window_start", "window_end")},
                  "accounting_scope": usage["accounting_scope"], "board_count": len(usage["accounted_boards"]),
                  "episode_key": f"day:{usage['local_date']}:{task_id}:" + str(exception["event_id"] if exception else 0)}
