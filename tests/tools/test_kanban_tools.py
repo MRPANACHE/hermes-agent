@@ -458,9 +458,29 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": wake_timestamp}
+            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": wake_timestamp, "wait_only": False}
             for event in kb.list_events(conn, worker_env)
         )
+
+
+def test_schedule_waits_for_measurement_without_waking_a_worker(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    invalid = json.loads(kt._handle_schedule({"reason": "measure", "await_measurement": True,
+                                            "wake_at": "2099-01-01T00:00:00+00:00"}))
+    assert "error" in invalid
+    result = json.loads(kt._handle_schedule({"reason": "OOS measures independently", "await_measurement": True,
+                                           "wait_only": False}))
+    assert result["ok"] and result["wake_at"] is None
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "scheduled"
+        event = next(event for event in kb.list_events(conn, worker_env) if event.kind == "scheduled")
+        assert event.payload and "wake_at" not in event.payload and event.payload["wait_only"] is False
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None and run.outcome == "scheduled"
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):

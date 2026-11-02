@@ -69,21 +69,12 @@ def deliver(conn, tid, decision, **overrides):
 
 
 
-def test_five_real_attempts_stop_sixth_without_synthetic_run(board):
+def test_card_attempts_never_require_a_supervisor_reset(board):
     tid = card(board)
-    ids = [attempt(board, tid) for _ in range(5)]
-    before = len(kb.list_runs(board, tid))
-    assert kb.claim_task(board, tid) is None
-    assert len(kb.list_runs(board, tid)) == before
-    assert kb.get_task(board, tid).status == "blocked"
-    event, p = hits(board, tid)[0]
-    assert event.run_id is None
-    assert p["run_ids"] == ids
-    assert p["observed"] == p["threshold"] == 5
-    assert p["action"] == "blocked_new_run" and p["enforced"] is True
-    assert kb.unblock_task(board, tid)
-    assert kb.claim_task(board, tid) is None
-    assert len(hits(board, tid)) == 1
+    ids = [attempt(board, tid) for _ in range(12)]
+    assert len(ids) == 12
+    assert kb.claim_task(board, tid) is not None
+    assert hits(board, tid) == []
 
 
 def test_administrative_schedule_rows_do_not_spend_attempts(board):
@@ -96,47 +87,27 @@ def test_administrative_schedule_rows_do_not_spend_attempts(board):
     assert kb.claim_task(board, tid) is not None
 
 
-def test_review_lane_cannot_bypass_cap(board):
+def test_review_lane_has_no_card_attempt_stop(board):
     tid = card(board)
-    for _ in range(5):
+    for _ in range(6):
         attempt(board, tid)
     with kb.write_txn(board):
         board.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
-    assert kb.claim_review_task(board, tid) is None
-    assert kb.get_task(board, tid).status == "blocked"
+    assert kb.claim_review_task(board, tid) is not None
+    assert hits(board, tid) == []
 
 
-def test_native_mara_assessment_grants_only_one_five_attempt_series(board):
+def test_wait_only_is_diagnostic_but_keeps_daily_runtime(board):
+    now = int(datetime.fromisoformat("2026-10-31T12:00:00+01:00").timestamp())
     tid = card(board)
-    for _ in range(5):
-        attempt(board, tid)
-    assert kb.claim_task(board, tid) is None
-    limit_id = hits(board, tid)[0][0].id
-    assert kb.unblock_task(board, tid)
-    deliver(board, tid, disposition(board, tid, "new_series", limit_event_id=limit_id))
-    for _ in range(5):
-        attempt(board, tid)
-    assert kb.claim_task(board, tid) is None
-    assert hits(board, tid)[-1][1]["assessment_used"] is True
-    assert kb.unblock_task(board, tid)
-    # A second judgment against the second hit cannot grant another series.
-    deliver(board, tid, disposition(board, tid, "new_series", limit_event_id=hits(board, tid)[-1][0].id))
-    assert kb.claim_task(board, tid) is None
-    assert len(kb.list_runs(board, tid)) == 10
-
-
-@pytest.mark.parametrize("wrong", ["actor_requested_by", "previous_run_id", "block_event_id"])
-def test_unbound_or_non_mara_resume_does_not_grant_series(board, wrong):
-    tid = card(board)
-    ids = [attempt(board, tid) for _ in range(5)]
-    assert kb.claim_task(board, tid) is None
-    p = {"actor_requested_by": "agent:mara", "action": "resume", "previous_run_id": ids[-1],
-         "block_event_id": kb.list_events(board, tid)[-1].id}
-    p[wrong] = "unrelated"
-    assert kb.unblock_task(board, tid)
+    task = kb.claim_task(board, tid)
     with kb.write_txn(board):
-        kb._append_event(board, tid, "mrpanache_resumed", p)
-    assert kb.claim_task(board, tid) is None
+        kb._append_event(board, tid, "spawned", {"pid": 999999998}, run_id=task.current_run_id)
+        board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now-600, task.current_run_id))
+    with patch("hermes_cli.kanban_db.time.time", return_value=now):
+        assert kb.schedule_task(board, tid, reason="wait only", wait_only=True, expected_run_id=task.current_run_id)
+    assert task_series(board, tid)["run_ids"] == []
+    assert daily_usage(board, now)["runtime_seconds"] == 600
 
 
 def test_native_completion_resets_series_but_comment_does_not(board):

@@ -18,9 +18,17 @@ def day_window(now: int, timezone: str = "Europe/Amsterdam") -> dict:
             "start": int(start.timestamp()), "end": int(end.timestamp())}
 
 
-def execution_runs(conn, *, task_id=None, after_event_id=0):
-    """Only real worker starts spend attempts or hours (one row per run)."""
+def execution_runs(conn, *, task_id=None, after_event_id=0, work_only=False):
+    """Actual worker starts; only explicit wait-only receipts spare task attempts.
+
+    Daily runtime always includes waiting workers: work_only is never used by
+    the hours accountant.
+    """
     where = "AND r.task_id=?" if task_id is not None else ""
+    if work_only:
+        where += (" AND NOT EXISTS (SELECT 1 FROM task_events w WHERE w.task_id=r.task_id "
+                  "AND w.run_id=r.id AND w.kind='scheduled' "
+                  "AND json_extract(w.payload,'$.wait_only')=1)")
     return conn.execute(
         "SELECT r.*, MIN(e.id) AS spawn_event_id FROM task_runs r "
         "JOIN task_events e ON e.task_id=r.task_id AND e.run_id=r.id AND e.kind='spawned' "
@@ -205,7 +213,7 @@ def task_series(conn, task_id: str) -> dict:
     for event_id, d in supervisor_decisions(conn, task_id):
         if d["kind"] == "measured_closure":
             frontier = max(frontier, event_id)
-    rows = execution_runs(conn, task_id=task_id, after_event_id=frontier)
+    rows = execution_runs(conn, task_id=task_id, after_event_id=frontier, work_only=True)
     return {"outcome_event_id": frontier, "run_ids": [r["id"] for r in rows]}
 
 
@@ -245,15 +253,10 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
     if (not task or task["status"] != source_status or task["claim_lock"] is not None
             or task["worker_pid"] is not None or task["current_run_id"] is not None):
         return False
-    series = task_series(conn, task_id)
-    base = _single_assessment(conn, task_id, series)
+    # Card-attempt budgets are retired. The native day-hours accountant below
+    # remains the cost brake; comments and supervisor classifications cannot
+    # start a second five-run approval loop.
     hits = []
-    if len(series["run_ids"]) >= (base + 5 if base is not None else 5):
-        hits.append({"limit_key": "task_runs_without_outcome", "observed": len(series["run_ids"]),
-                     "threshold": 5, "unit": "runs", "timezone": "Europe/Amsterdam",
-                     "run_ids": series["run_ids"], "outcome_event_id": series["outcome_event_id"],
-                     "assessment_used": base is not None,
-                     "episode_key": f"task:{task_id}:{series['outcome_event_id']}:{int(base is not None)}"})
     usage = daily_usage(conn, now)
     if usage["runtime_seconds"] >= 20 * 3600:
         exception = _exception(conn, task_id)
@@ -272,9 +275,4 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
     if not hits:
         return True
     # Day exhaustion is not a card fault: retain ready/review for next midnight.
-    if hits[0]["limit_key"] == "task_runs_without_outcome":
-        conn.execute("UPDATE tasks SET status='blocked',block_kind='needs_input',last_failure_error=? WHERE id=?",
-                     ("Mara: beoordeel runlimiet; hooguit één nieuwe reeks", task_id))
-        _append_event(conn, task_id, "blocked", {"reason": "run_limit:task_runs_without_outcome", "kind": "needs_input",
-                                               "source_status": source_status, "assessment_used": base is not None})
     return False
