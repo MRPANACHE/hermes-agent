@@ -440,7 +440,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
     from tools import kanban_tools
     from tools.registry import registry
 
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
     import time
     wake_timestamp = int(time.time()) + 3600
     wake_at = datetime.fromtimestamp(wake_timestamp, UTC).isoformat()
@@ -459,7 +459,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": wake_timestamp}
+            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": wake_timestamp, "wait_only": False}
             for event in kb.list_events(conn, worker_env)
         )
 
