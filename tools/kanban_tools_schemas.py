@@ -212,9 +212,11 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "wake_at": _prop("string", "Future ISO timestamp with explicit timezone, e.g. 2026-10-11T15:00:00+02:00"),
-        "reason": _prop("string", "Specific reason for the timed external dependency"),
+        "reason": _prop("string", "Specific dependency reason; name the independent measuring service"),
+        "await_measurement": _prop("boolean", "Wait for the existing independent measurement producer, without wake_at or timed agent wake."),
+        "wait_only": _prop("boolean", "True only if this run only observed a dependency; diagnostic only, never exempts runtime hours."),
     },
-    ["wake_at", "reason"],
+    ["reason"],
     include_board=False,
 )
 

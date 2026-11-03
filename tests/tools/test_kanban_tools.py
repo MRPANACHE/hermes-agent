@@ -459,9 +459,42 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": wake_timestamp}
+            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": wake_timestamp, "wait_only": False}
             for event in kb.list_events(conn, worker_env)
         )
+
+
+def test_schedule_waits_for_measurement_without_waking_a_worker(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    assert entry is not None
+    schema = entry.schema
+    assert "wake_at" not in schema["parameters"]["required"]
+    invalid = json.loads(kt._handle_schedule({"reason": "measure", "await_measurement": True,
+                                            "wake_at": "2099-01-01T00:00:00+00:00"}))
+    assert "error" in invalid
+    invalid_bool = json.loads(kt._handle_schedule({"reason": "measure", "await_measurement": "true"}))
+    assert "error" in invalid_bool
+    result = json.loads(kt._handle_schedule({"reason": "OOS measures independently", "await_measurement": True,
+                                           "wait_only": False}))
+    assert result["ok"] and result["wake_at"] is None and result["wake_timestamp"] is None
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "scheduled"
+        event = next(event for event in kb.list_events(conn, worker_env) if event.kind == "scheduled")
+        assert event.payload is not None
+        assert "wake_at" not in event.payload and event.payload["wait_only"] is False
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None and run.outcome == "scheduled"
+        # A parked measure wait never becomes a due timed worker, even years later.
+        monkeypatch.setattr(kb.time, "time", lambda: 4_000_000_000)
+        assert kb.dispatch_once(conn, max_spawn=0).awakened == []
+        parked = kb.get_task(conn, worker_env)
+        assert parked is not None and parked.status == "scheduled"
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
