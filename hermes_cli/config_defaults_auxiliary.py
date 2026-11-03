@@ -1,4 +1,5 @@
-"""Pure-data auxiliary default builder, extracted from config_defaults."""
+"""Pure-data factory for auxiliary model configuration defaults."""
+
 
 def _aux(timeout, *, reasoning_effort=True, **extra):
     """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
