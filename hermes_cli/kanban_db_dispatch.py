@@ -1764,22 +1764,29 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     When ``kanban.dispatch_profiles`` is set (#110995) the returned predicate
     additionally requires the assignee to be listed, fail-closed — so a card
     assigned to ``default`` is only claimable by homes that opted into it.
-    Foreign assignees land in the existing ``skipped_nonspawnable`` bucket.
+    Foreign and parked assignees land in the existing ``skipped_nonspawnable``
+    bucket without a claim or run; default-host markers are ignored as in serving.
     """
     try:
-        from hermes_cli.profiles import normalize_profile_name, profile_exists
+        from hermes_cli.profiles import (
+            get_profile_dir, normalize_profile_name, profile_exists, profile_is_parked,
+        )
     except Exception:
         return None
     allowlist = _dispatch_profile_allowlist(normalize_profile_name)
-    if allowlist is None:
-        return profile_exists
 
     def _gated(name: str) -> bool:
         try:
             canon = normalize_profile_name(name)
-        except ValueError:
+            if allowlist is not None and canon not in allowlist:
+                return False
+            if not profile_exists(name):
+                return False
+            # Parkeerintentie geldt vóór claim én voor de wake-up-telemetrie.
+            # Niet cachen: stop/start moet bij de volgende tick werken.
+            return canon == "default" or not profile_is_parked(get_profile_dir(canon))
+        except (OSError, ValueError):
             return False
-        return canon in allowlist and bool(profile_exists(name))
 
     return _gated
 
