@@ -3,7 +3,25 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import sys
+
+
+def _feedback_eligible_status(conn, task):
+    """Only explicitly non-human blockers may yield to measured feedback."""
+    if task.status in {"done", "scheduled"}:
+        return True
+    if task.status != "blocked" or task.block_kind not in {"capability", "needs_input"}:
+        return False
+    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+                         "ORDER BY id DESC LIMIT 1", (task.id,)).fetchone()
+    if not event:
+        return False
+    block = json.loads(event["payload"])
+    reason = block.get("reason", "")
+    if block.get("kind") != task.block_kind or re.search(r"\b(?:david|bram|tgr)\b", reason, re.IGNORECASE):
+        return False
+    return task.block_kind == "capability" or bool(re.search(r"\b(?:mara|dolly)\b", reason, re.IGNORECASE))
 
 
 def apply_measured_outcome(conn, *, task_id, profile, expected_run_id, action,
@@ -31,7 +49,7 @@ def apply_measured_outcome(conn, *, task_id, profile, expected_run_id, action,
         latest = conn.execute("SELECT id,profile FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
                               (task_id,)).fetchone()
         if (not task or not latest or latest["id"] != expected_run_id or latest["profile"] != profile
-                or task.assignee != profile or task.status not in {"done", "scheduled"}
+                or task.assignee != profile or not _feedback_eligible_status(conn, task)
                 or task.current_run_id is not None or task.worker_pid is not None or task.claim_lock is not None):
             return {"applied": False, "reason": "native_task_changed_or_active"}
         if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND (ended_at IS NULL OR worker_pid IS NOT NULL)",

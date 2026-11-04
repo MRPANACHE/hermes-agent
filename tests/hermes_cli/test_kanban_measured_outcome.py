@@ -1,4 +1,5 @@
 """Independent source feedback lands on one idle card, idempotently."""
+import json
 from pathlib import Path
 import pytest
 from hermes_cli import kanban_db as kb
@@ -72,6 +73,36 @@ def test_module_entrypoint_opens_argv_path(conn, tmp_path, monkeypatch, capsys, 
     assert kb.get_task(conn, args["task_id"]).status == status
     main([argv_path, json.dumps({**args, "action": action})])
     assert json.loads(capsys.readouterr().out)["replay"] is True
+
+
+@pytest.mark.parametrize("action", ["close", "reopen"])
+@pytest.mark.parametrize("kind,reason,allowed", [
+    ("capability", "Mara corrigeert bestaande bronbinding", True),
+    ("capability", "Bestaande route ontbreekt", True),
+    ("needs_input", "Mara: corrigeer de bronbinding", True),
+    ("needs_input", "Dolly moet de bestaande route hervatten", True),
+    ("needs_input", "David moet toestemming geven", False),
+    ("needs_input", "Bram moet de keuze maken", False),
+    ("needs_input", "Mara wacht op David", False),
+    ("capability", "David moet nieuwe toegang verlenen", False),
+    ("capability", "TGR-vrijgave ontbreekt", False),
+    ("needs_input", "Onbekende eigenaar moet antwoorden", False),
+    ("dependency", "Wacht op Mara", False),
+])
+def test_nonhuman_blockers_yield_but_human_and_unknown_stay(conn, action, kind, reason, allowed):
+    args = waiting(conn)
+    tid = args["task_id"]
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='blocked',block_kind=? WHERE id=?", (kind, tid))
+        kb._append_event(conn, tid, "blocked", {"kind": kind, "reason": reason})
+    result = apply_measured_outcome(conn, **args, action=action)
+    assert result["applied"] is allowed
+    assert kb.get_task(conn, tid).status == (("done" if action == "close" else "ready") if allowed else "blocked")
+    if allowed:
+        assert kb.get_task(conn, tid).block_kind is None
+        assert apply_measured_outcome(conn, **args, action=action)["replay"]
+        if action == "reopen":
+            assert any("ACE-leerroute" in c.body for c in kb.list_comments(conn, tid))
 
 
 def test_conflicting_replay_refused(conn):
