@@ -423,9 +423,8 @@ def test_dispatcher_sweeps_survive_iso_text_timestamps(conn, monkeypatch) -> Non
 
 def test_respawn_guards_compare_mixed_int_and_iso_times_by_value(conn) -> None:
     """SQLite sorts TEXT above every INTEGER, so ISO stamps (#97455) must not pass
-    the guards' SQL windows by type: an old ISO success does not hold a card, an
-    old ISO PR comment does not either, and an ISO handoff OLDER than an int PR
-    comment does not lift ``active_pr``."""
+    success guard's SQL window by type: old ISO success does not hold a card.
+    PR comments and handoffs remain context regardless of timestamp format."""
     now, iso = int(time.time()), _iso
 
     def card(title):
@@ -456,7 +455,7 @@ def test_respawn_guards_compare_mixed_int_and_iso_times_by_value(conn) -> None:
         conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES "
                      "(?, 'assigned', '{\"assignee\": \"ops\", \"from\": \"dev\"}', ?)", (guarded, iso(7200)))
     assert kbd.check_respawn_guard(conn, old_pr) is None
-    assert kbd.check_respawn_guard(conn, guarded) == "active_pr"
+    assert kbd.check_respawn_guard(conn, guarded) is None
 
 
 def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
