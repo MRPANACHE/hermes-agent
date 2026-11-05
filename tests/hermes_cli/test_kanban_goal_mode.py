@@ -138,17 +138,20 @@ def test_loop_stops_on_judge_transport_failure(monkeypatch):
 
     monkeypatch.setattr(goals, "judge_goal", _failing_judge)
     turns = []
+    retained = []
 
     res = goals.run_kanban_goal_loop(
         task_id="t1",
         goal_text="do the thing",
         run_turn=lambda p: turns.append(p) or "x",
         task_status_fn=lambda: "running",
-        block_fn=lambda r: pytest.fail("should not block"),
+        block_fn=lambda r: pytest.fail("must use the dedicated unavailable callback"),
+        judge_unavailable_fn=retained.append,
         first_response="first attempt",
     )
-    assert res["outcome"] == "stopped"
-    assert "judge transport failure" in res["reason"]
+    assert res["outcome"] == "blocked_judge_unavailable"
+    assert "judge transport unreachable" in res["reason"]
+    assert retained == [res["reason"]]
     assert turns == []
 
 

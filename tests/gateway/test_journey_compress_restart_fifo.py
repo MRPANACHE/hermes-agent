@@ -158,6 +158,12 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
             await asyncio.to_thread(owner.wait, 60)
             before['stopped'] = {r['request_id']: (r['status'], r['outcome']) for r in admissions()}
             before['compacted'] = transcript(before['child'])
+            raw = next(r['wire'] for r in reversed(peer.requests)
+                       if r['model'] == 'original' and 'SUMMARY_RETAINED_FACTS' not in r['wire'])
+            compacted_contents = {str(content) for _, _, content in before['compacted']}
+            before['removed'] = {str(m['content']) for m in json.loads(raw)
+                                 if m['role'] != 'system'} - compacted_contents
+            assert before['removed'], 'compression did not replace any original transcript rows'
             peer.release.set()
         assert all(executed(name) == 0 for name in FOLLOWERS), [r['text'] for r in peer.requests]
 
@@ -196,9 +202,10 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
         assert executed(compacting['text'][:12]) == before['compacting_requests'], 'compacted turn replayed'
         for name in FOLLOWERS:
             wire = next(r['wire'] for r in peer.requests if r['text'] == name)
-            # protect_first_n keeps PRESSURE_0 verbatim; the compacted middle is only inside the summary.
+            # The tail floor can retain PRESSURE_1 when compression starts early. Check the
+            # rows actually replaced by this committed compression, not a guessed boundary.
             turns = [str(m.get('content', '')) for m in json.loads(wire)]
-            assert 'SUMMARY_RETAINED_FACTS' in wire and not any(t.startswith('PRESSURE_1 ') for t in turns), name
+            assert 'SUMMARY_RETAINED_FACTS' in wire and not before['removed'].intersection(turns), name
         settled = admissions()
         assert {r['target_session_id'] for r in settled} == {sid}
         assert [r['request_id'] for r in settled][-3:] == list(FOLLOWERS)

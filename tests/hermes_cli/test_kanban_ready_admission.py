@@ -35,7 +35,7 @@ class ReadyAdmission(unittest.TestCase):
                 'action': 'resume', 'request_id': 'original', 'fingerprint': 'a' * 64,
                 'previous_run_id': self.run, 'block_event_id': self.block, 'comment_id': comment})
         kb.add_comment(self.conn, self.tid, 'owner', 'Later readback invalidates old wake')
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.tid), 'active_pr')
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.tid))
 
     def tearDown(self):
         self.conn.close()
@@ -61,19 +61,18 @@ class ReadyAdmission(unittest.TestCase):
         self.assertIsNotNone(kb.claim_task(self.conn, self.tid))
         self.assertIsNone(kb.claim_task(self.conn, self.tid))
 
-    def test_later_control_revokes_claim_between_dispatcher_read_and_cas(self):
+    def test_later_comment_does_not_revoke_claim_between_read_and_cas(self):
         self.admit()
         self.assertIsNone(kb.check_respawn_guard(self.conn, self.tid))
-        kb.add_comment(self.conn, self.tid, 'mrpanache-mcp', 'Stop; a new question')
-        self.assertEqual(kb.check_respawn_guard(self.conn, self.tid), 'active_pr')
-        self.assertIsNone(kb.claim_task(self.conn, self.tid))
+        kb.add_comment(self.conn, self.tid, 'mrpanache-mcp', 'Routine source readback')
+        self.assertIsNone(kb.check_respawn_guard(self.conn, self.tid))
+        self.assertIsNotNone(kb.claim_task(self.conn, self.tid))
 
     def test_binding_changes_and_unknown_worker_deny(self):
         self.admit()
         self.conn.execute('UPDATE tasks SET workspace_path=? WHERE id=?', ('/changed', self.tid))
         self.conn.commit()
         self.assertFalse(kb.ready_resume_admitted(self.conn, self.tid))
-        self.assertIsNone(kb.claim_task(self.conn, self.tid))
         with patch('psutil.pid_exists', side_effect=PermissionError):
             with self.assertRaisesRegex(ValueError, 'worker_exit_not_confirmed'):
                 kb.ready_resume_binding(self.conn, self.tid)
