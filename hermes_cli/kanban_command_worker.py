@@ -182,12 +182,17 @@ def main() -> int:
         run_id = None
 
     from hermes_cli import _subprocess_compat as compat
+    from hermes_cli.process_identity import release_process_group_once_empty, spawn_owned
 
+    # detached-spawn: ok — options only; spawn_owned below owns the child group.
+    spawn_options = compat.windows_detach_popen_kwargs()
+    spawn_options.pop("start_new_session", None)  # POSIX session ownership belongs to spawn_owned.
     try:
-        child = subprocess.Popen(
+        child = spawn_owned(
             argv,
+            purpose="kanban-command-worker",
             env=_child_env(),
-            **compat.windows_detach_popen_kwargs(),
+            **spawn_options,
         )
     except FileNotFoundError:
         return _fail(f"worker command executable not found: {argv[0]!r}")
@@ -216,6 +221,8 @@ def main() -> int:
             if term_at and time.monotonic() - term_at[0] >= _term_grace():
                 _terminate_child_tree(child, force=True)
                 returncode = child.wait()
+
+    release_process_group_once_empty(child.pid, proc=child)
 
     if terminated:
         # No canonical transition here.  In particular, a dispatcher timeout
