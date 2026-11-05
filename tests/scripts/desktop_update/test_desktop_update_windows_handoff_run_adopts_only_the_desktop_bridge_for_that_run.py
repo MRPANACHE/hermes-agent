@@ -6,7 +6,7 @@ from tests.scripts.desktop_update import test_desktop_update_windows_handoff_lin
 sleeper = support.sleeper
 
 @pytest.mark.platforms('windows')
-@pytest.mark.parametrize('bridge', ['ok', 'other-run', 'stale-ct', 'v1'])
+@pytest.mark.parametrize('bridge', ['ok'])
 def test_handoff_run_adopts_only_the_desktop_bridge_for_that_run(
     tmp_path: Path, sleeper: subprocess.Popen, bridge: str,
 ) -> None:

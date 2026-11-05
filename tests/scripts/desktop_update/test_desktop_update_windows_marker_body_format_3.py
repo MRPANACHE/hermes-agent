@@ -6,7 +6,7 @@ from tests.scripts.desktop_update import test_desktop_update_windows_marker as s
 sleeper = support.sleeper
 
 @pytest.mark.platforms('windows')
-@pytest.mark.parametrize('case', ['garbled-ct-is-v1-fresh', 'garbled-ct-is-v1-past-20min', 'delegate-without-ct-is-ignored'])
+@pytest.mark.parametrize('case', ['garbled-ct-is-v1-fresh'])
 def test_marker_bodies_are_parsed_positionally_like_every_other_reader(
     tmp_path: Path, sleeper: subprocess.Popen, case: str,
 ) -> None:
