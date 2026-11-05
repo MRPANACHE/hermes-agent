@@ -1893,6 +1893,8 @@ DEFAULT_CONFIG = {
         "hard_run_limits": False,
         # Operator-approved overrides expire with their exact Amsterdam date.
         "daily_run_hours_overrides": {},
+        # Integer percent of the day budget one profile may use, e.g. {"otto": 25}.
+        "daily_run_share_per_assignee": {},
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
