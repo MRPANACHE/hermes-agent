@@ -113,14 +113,14 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_dependency_block_with_terminal_parents_parks_then_escalates(
+def test_dependency_block_with_terminal_parents_retains_needs_input(
     kanban_home: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A ``dependency`` block whose parents are all terminal can never be
     satisfied by ``recompute_ready``: it must park in ``blocked`` as
     ``needs_input`` (no ``dependency_wait``, no re-promotion), say so on the
-    CLI, and count toward the loop breaker so a re-block after an unblock
-    reaches ``triage``."""
+    CLI, and retain that human-input route after a repeated block. Generic and
+    transient loop escalation must not hide an unanswered input request."""
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
         with kb.write_txn(conn):
@@ -145,9 +145,11 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
         assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
-        assert kb.get_task(conn, child).status == "triage"
+        parked = kb.get_task(conn, child)
+        assert (parked.status, parked.block_kind) == ("blocked", "needs_input")
         loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
+        assert loop["target_status"] == "blocked"
 
 
 def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
