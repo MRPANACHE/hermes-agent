@@ -255,7 +255,10 @@ def test_an_open_control_directory_names_its_path_and_mode(tmp_path):
     home.mkdir(mode=0o700)
     with tempfile.TemporaryDirectory(prefix='h-owner-') as root:
         directory = Path(root) / f'hermes-gw-{_home_hash(home)}'
-        directory.mkdir(mode=0o755)
+        directory.mkdir(mode=0o700)
+        # The native qualifier uses umask 077: request and then set the unsafe fixture
+        # explicitly, so this test exercises discovery refusal under either umask.
+        directory.chmod(0o755)
         pointer = home / 'gateway.sock.path'
         pointer.write_text(str(directory / 'control.sock'), encoding='utf-8')
         pointer.chmod(0o600)

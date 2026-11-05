@@ -98,6 +98,33 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
         raise RuntimeStartError(reason) from exc
 
 
+def request_absent_gateway(home: Path, *, deadline: float, idle_exit: bool):
+    """One native start decision; a service still stopping raises its drain verdict.
+
+    Recheck ownership after service discovery. A profile served by a multiplexer
+    must start that host, never acquire a competing per-profile daemon.
+    """
+    from hermes_cli import gateway_runtime as runtime
+    from hermes_cli.gateway_runtime_multiplex import implied_host_root, multiplexer_serves_home
+    from hermes_cli.gateway_runtime_service import (
+        discover_existing_gateway_service, start_existing_gateway_service,
+    )
+
+    target = multiplexer_serves_home(home) or home
+    service = discover_existing_gateway_service(target, deadline=deadline)
+    if service is None and target == home and (host := implied_host_root(home)) is not None:
+        target = host
+        service = discover_existing_gateway_service(target, deadline=deadline)
+    if runtime.discover_gateway_endpoint(home, timeout=remaining(deadline)).state != "absent":
+        return None
+    if service is not None:
+        start_existing_gateway_service(service, deadline=deadline)
+        return home, 0, None
+    offset = stdio_log_size(target)
+    child = spawn_unmanaged_gateway(target, deadline=deadline, idle_exit=idle_exit)
+    return target, offset, child
+
+
 def start_detached_replacement(profile_home: Path, *, force: bool = False) -> int:
     """``gateway restart --detach`` with no service: start the stopped owner's replacement the way
     ``gateway ensure`` starts an absent one. In the foreground, the restarting client (Desktop's
