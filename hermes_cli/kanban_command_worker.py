@@ -187,6 +187,7 @@ def main() -> int:
         child = subprocess.Popen(
             argv,
             env=_child_env(),
+            # detached-spawn: ok — supervisor awaits this child and group-kills it on termination
             **compat.windows_detach_popen_kwargs(),
         )
     except FileNotFoundError:

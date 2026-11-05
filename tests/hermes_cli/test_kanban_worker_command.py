@@ -72,15 +72,16 @@ def spawn_env(monkeypatch, tmp_path):
     return root, workspace, captured
 
 
+@pytest.mark.parametrize("prefix", ["", "\ufeff"])
 def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
-    spawn_env, monkeypatch
+    spawn_env, monkeypatch, prefix
 ):
     root, workspace, captured = spawn_env
     monkeypatch.setenv("WORKER_COMMAND_SECRET", "host-secret-must-not-leak")
     _write_profile(
         root,
         "engine",
-        "worker:\n  command:\n    - /home/david/bin/codex-sub\n"
+        prefix + "worker:\n  command:\n    - /home/david/bin/codex-sub\n"
         "    - luna\n    - --\n    - fixed instruction; read HERMES_KANBAN_TASK_ID\n",
     )
 
@@ -232,6 +233,7 @@ def test_profile_without_command_keeps_native_profile_scoped_environment(
 @pytest.mark.parametrize(
     "declared, message",
     [
+        ("worker:\n  command: [", "does not parse"),
         ('worker:\n  command: "/bin/worker --flag"\n', "argv"),
         ("worker:\n  command:\n    - ./run.sh\n", "absolute"),
         ("worker:\n  command:\n    - worker\n", "absolute"),
@@ -383,7 +385,7 @@ def _run_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
     )
     return subprocess.run(
         SUPERVISOR,
-        cwd=str(Path(__file__).parents[2]),
+        check=False, cwd=str(Path(__file__).parents[2]),
         env=env,
         capture_output=True,
         text=True,
@@ -417,7 +419,7 @@ def _run_supervisor_mode(
     )
     return subprocess.run(
         SUPERVISOR,
-        cwd=str(Path(__file__).parents[2]),
+        check=False, cwd=str(Path(__file__).parents[2]),
         env=env,
         capture_output=True,
         text=True,

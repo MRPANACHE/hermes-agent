@@ -58,7 +58,7 @@ def test_transient_recurrence_still_escalates_instead_of_looping(board):
 
 
 def test_transient_waits_for_the_previous_native_worker_to_exit(board):
-    tid, run = blocked(board)
+    _tid, run = blocked(board)
     with kb.write_txn(board):
         board.execute('UPDATE task_runs SET worker_pid=?,worker_started_at=? WHERE id=?',
                       (os.getpid(), _process_fingerprint(os.getpid()), run))
