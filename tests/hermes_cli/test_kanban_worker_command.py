@@ -174,6 +174,17 @@ def test_profile_command_config_accepts_utf8_bom(spawn_env):
     assert captured["env"]["HERMES_KANBAN_WORKER_COMMAND"] == '["/bin/echo"]'
 
 
+def test_profile_command_selected_backend_failure_is_not_native_fallback(tmp_path, monkeypatch):
+    from hermes_cli import config_backend
+
+    def unavailable(_path):
+        raise config_backend.ConfigBackendUnavailable("fixture backend unavailable")
+
+    monkeypatch.setattr(config_backend, "read_config_doc", unavailable)
+    with pytest.raises(RuntimeError, match="worker.command.*unreadable"):
+        kb._resolve_worker_config(str(tmp_path))
+
+
 @pytest.mark.parametrize("value", ["unknown", "", "7", "null"])
 def test_profile_command_unknown_completion_mode_fails_closed(
     spawn_env, value,
