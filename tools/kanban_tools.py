@@ -840,18 +840,22 @@ def _handle_block(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_schedule")
 def _handle_schedule(args: dict, **kw) -> str:
-    """Park the dispatcher-owned card until an explicit future dependency time."""
+    """Park the owning card for a timed dependency or independent measurement."""
     tid = _worker_guard("kanban_schedule", args)
     _check(_check_kanban_worker_mode(), "kanban_schedule is only available to the owning dispatcher worker")
     _check(args.get("board") is None, "kanban_schedule cannot target another board")
     _check(isinstance(args.get("reason"), str), "reason must be a string")
     reason = _redact(_require_text(args, "reason", "reason is required — explain the timed dependency"))
-    _check(isinstance(args.get("wake_at"), str), "wake_at is required: future ISO timestamp with timezone")
-    wake_at = _require_text(args, "wake_at", "wake_at is required: future ISO timestamp with timezone")
+    waiting = args.get("await_measurement", False)
+    wait_only = args.get("wait_only", False)
+    _check(type(waiting) is bool and type(wait_only) is bool, "await_measurement and wait_only must be booleans")
+    wake_at = args.get("wake_at")
+    _check((waiting and wake_at is None) or (not waiting and isinstance(wake_at, str)),
+           "provide wake_at for time waits, or await_measurement=true without wake_at")
     with _board(None) as (kb, conn):
-        wake_timestamp = kb.parse_schedule_time(wake_at)
-        _check(wake_timestamp > int(time.time()), "wake_at must be in the future")
-        ok = kb.schedule_task(conn, tid, wake_at=wake_at, reason=reason, expected_run_id=_worker_run_id(tid))
+        wake_timestamp = kb.parse_schedule_time(wake_at) if wake_at is not None else None
+        _check(wake_timestamp is None or wake_timestamp > int(time.time()), "wake_at must be in the future")
+        ok = kb.schedule_task(conn, tid, wake_at=wake_at, reason=reason, wait_only=wait_only, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not schedule {tid} (unknown id, stale run or already terminal)")
         return _ok_landed(kb, conn, tid, "scheduled", wake_at=wake_at, wake_timestamp=wake_timestamp, reason=reason)
 

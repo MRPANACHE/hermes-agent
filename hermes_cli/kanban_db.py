@@ -3978,7 +3978,7 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
-    wake_at: Optional[str] = None,
+    wake_at: Optional[str] = None, wait_only: bool = False,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
@@ -4038,7 +4038,7 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        payload = {"reason": reason}
+        payload = {"reason": reason, "wait_only": wait_only}
         if wake_timestamp is not None:
             payload["wake_at"] = wake_timestamp
         if resume_status == "review":
