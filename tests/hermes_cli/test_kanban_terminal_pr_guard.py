@@ -71,118 +71,88 @@ def test_prior_run_parent_pr_and_later_comments_spawn_next_tick(board):
 
 
 @pytest.mark.parametrize("reply", ["open", "closed-unmerged", "timeout", "network", "bad-json", "wrong-pr", "partial"])
-def test_open_unknown_or_network_never_spawns(board, reply):
+def test_open_unknown_or_network_does_not_stop_owner(board, reply):
     tid, _, _ = resolved_parent(board)
-    kwargs = {
-        "open": {"return_value": gh_reply("open", False)},
-        "closed-unmerged": {"return_value": gh_reply("closed", False)},
-        "timeout": {"side_effect": subprocess.TimeoutExpired("gh", 3)},
-        "network": {"side_effect": subprocess.CalledProcessError(1, "gh", stderr="secret")},
-        "bad-json": {"return_value": subprocess.CompletedProcess([], 0, "invalid", "secret")},
-        "wrong-pr": {"return_value": gh_reply(url=OWN_PR)},
-        "partial": {"return_value": subprocess.CompletedProcess([], 0, '{"state":"closed"}', "")},
-    }[reply]
-    with patch("subprocess.run", **kwargs):
-        assert not tick(board, tid).spawned
-        assert not tick(board, tid).spawned
-    assert kb.get_task(board, tid).status == "ready"
-    assert len(kb.list_runs(board, tid)) == 1
-    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'", (tid,)).fetchone()[0] == 1
+    # PR access is irrelevant to claiming an authorized existing assignment.
+    with patch("subprocess.run", side_effect=AssertionError(reply)) as lookup:
+        assert [s[0] for s in tick(board, tid).spawned] == [tid]
+        lookup.assert_not_called()
+    assert kb.get_task(board, tid).status == "running"
+    assert len(kb.list_runs(board, tid)) == 2
+    assert not board.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='respawn_guarded'", (tid,)).fetchone()
 
 
-def test_independent_open_own_pr_does_not_inherit_parent_clearance(board):
+def test_independent_open_own_pr_is_context_for_same_owner(board):
     tid, _, _ = resolved_parent(board)
     kb.add_comment(board, tid, author="builder", body=f"My independent PR {OWN_PR}")
-    def reply(command, **kwargs):
-        assert not board.in_transaction
-        assert kwargs["timeout"] == 3
-        assert kwargs["env"]["GH_CONFIG_DIR"].endswith("isolated-gh")
-        return gh_reply("open", False, url=OWN_PR) if command[2].endswith("3165") else gh_reply()
-    with patch("subprocess.run", side_effect=reply):
-        assert dict(tick(board, tid).respawn_guarded)[tid] == "active_pr"
-    assert kb.get_task(board, tid).status == "ready"
+    with patch("subprocess.run", side_effect=AssertionError("No PR authority lookup")):
+        assert [s[0] for s in tick(board, tid).spawned] == [tid]
+    assert kb.get_task(board, tid).assignee == "builder"
+    assert OWN_PR in kb.list_comments(board, tid)[-1].body
 
 
-def test_fifteen_minute_escalation_is_durable_deduplicated_and_recovers(board):
-    tid, parent, _ = resolved_parent(board)
-    with patch("subprocess.run", side_effect=OSError("unreachable")):
-        assert not tick(board, tid).spawned
-        board.execute("UPDATE task_events SET created_at=created_at-899 WHERE task_id=? AND kind='respawn_guarded'", (tid,))
-        board.commit()
-        with patch("time.time", return_value=kb.time.time()):
-            assert not tick(board, tid).spawned
-        board.execute("UPDATE task_events SET created_at=created_at-2 WHERE task_id=? AND kind='respawn_guarded'", (tid,))
-        board.commit()
-        for _ in range(3):
-            assert not tick(board, tid).spawned
-            kb.add_comment(board, tid, author="coordinator", body="ordinary readback")
-    events = [json.loads(r[0]) for r in board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='respawn_guarded'", (tid,))]
-    assert len(events) == 2
-    assert events[-1]["escalated"] and events[-1]["owner"] == "builder"
-    assert events[-1]["threshold_seconds"] == 900
-    provenance = events[-1]["sources"][PARENT_PR][0]
-    assert provenance["parent_task_id"] == parent
-    assert provenance["parent_run_id"] == board.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (parent,)).fetchone()[0]
-    # A fresh connection models dispatcher restart: no in-memory dedup state.
+def test_historical_escalation_and_routine_comments_do_not_stop_owner(board):
+    tid, _, _ = resolved_parent(board)
+    # Preserve the historical episode as evidence, not a persistent policy.
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "respawn_guarded", {"reason": "active_pr", "escalated": True})
+    for _ in range(3):
+        kb.add_comment(board, tid, author="coordinator", body="ordinary readback")
     with kb.connect() as restarted, patch("subprocess.run", side_effect=OSError("unreachable")):
-        assert not tick(restarted, tid).spawned
-        assert restarted.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'", (tid,)).fetchone()[0] == 2
-    with patch("subprocess.run", return_value=gh_reply()):
-        assert len(tick(board, tid).spawned) == 1
+        assert [s[0] for s in tick(restarted, tid).spawned] == [tid]
+    events = board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='respawn_guarded'", (tid,)).fetchall()
+    assert len(events) == 1 and json.loads(events[0][0])["escalated"]
+    assert kb.claim_task(board, tid) is None
 
 
 @pytest.mark.parametrize("mutation", ["comment", "owner", "parent", "expired"])
-def test_terminal_receipt_cannot_transfer_across_changed_claim_state(board, mutation):
-    from hermes_cli.kanban_pr_guard import collect_pr_evidence
+def test_current_claim_state_not_terminal_pr_receipt_controls_admission(board, mutation):
     tid, parent, _ = resolved_parent(board)
-    with patch("subprocess.run", return_value=gh_reply()):
-        receipt = collect_pr_evidence(board, tid)
     if mutation == "comment":
         kb.add_comment(board, tid, author="builder", body=OWN_PR)
     elif mutation == "owner":
-        board.execute("UPDATE tasks SET assignee='other' WHERE id=?", (tid,)); board.commit()
+        kb.assign_task(board, tid, "other")
     elif mutation == "parent":
         board.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,)); board.commit()
     else:
-        receipt["observed_at"] -= 16
-    assert kb.claim_task(board, tid, pr_evidence=receipt) is None
-    assert len(kb.list_runs(board, tid)) == 1
+        board.execute("UPDATE task_comments SET created_at=created_at-86401 WHERE task_id=?", (tid,)); board.commit()
+    task = kb.claim_task(board, tid)
+    if mutation == "parent":
+        assert task is None
+        assert len(kb.list_runs(board, tid)) == 1
+    else:
+        assert task is not None
+        assert task.assignee == ("other" if mutation == "owner" else "builder")
+        assert kb.claim_task(board, tid) is None
 
 
 @pytest.mark.parametrize("state", ["open", "unknown"])
-def test_unresolved_episode_cannot_age_into_twenty_four_hour_bypass(board, state):
+def test_reference_age_is_not_an_execution_stop(board, state):
     tid, _, _ = resolved_parent(board)
-    kwargs = {"return_value": gh_reply("open", False)} if state == "open" else {"side_effect": OSError("denied")}
-    with patch("subprocess.run", **kwargs):
-        assert not tick(board, tid).spawned
-        board.execute("UPDATE task_comments SET created_at=created_at-86401 WHERE task_id=?", (tid,))
-        board.commit()
-        assert not tick(board, tid).spawned
-    with patch("subprocess.run", return_value=gh_reply()):
+    board.execute("UPDATE task_comments SET created_at=created_at-86401 WHERE task_id=?", (tid,))
+    board.commit()
+    with patch("subprocess.run", side_effect=AssertionError(state)):
         assert len(tick(board, tid).spawned) == 1
 
 
-def test_no_profile_auth_cannot_borrow_dispatcher_credentials(board, monkeypatch):
+def test_no_profile_auth_does_not_borrow_dispatcher_credentials(board, monkeypatch):
     tid, _, _ = resolved_parent(board)
     monkeypatch.setattr(acceptance, "_gh_env", lambda home: (_ for _ in ()).throw(acceptance._GateAuthError("unavailable")))
-    with patch("subprocess.run") as run:
-        assert not tick(board, tid).spawned
+    with patch("subprocess.run", side_effect=AssertionError("No borrowed credentials")) as run:
+        assert len(tick(board, tid).spawned) == 1
         run.assert_not_called()
 
 
-def test_lookup_budget_is_bounded_and_unread_pr_remains_guarded(board):
+def test_many_pr_references_need_no_lookup_budget(board):
     tid, _, _ = resolved_parent(board)
     for n in range(10, 17):
         kb.add_comment(board, tid, author="builder", body=f"https://github.com/example/repo/pull/{n}")
-    def reply(command, **kwargs):
-        assert kwargs["timeout"] == 3 and not board.in_transaction
-        return gh_reply(url="https://github.com/example/repo/pull/" + command[2].split("/")[-1])
-    with patch("subprocess.run", side_effect=reply) as run:
-        assert not tick(board, tid).spawned
-        assert run.call_count == 4
+    with patch("subprocess.run", side_effect=AssertionError("No PR lookup")) as run:
+        assert len(tick(board, tid).spawned) == 1
+        run.assert_not_called()
 
 
-def test_full_dispatch_tick_claims_once_after_terminal_read(board):
+def test_full_dispatch_tick_claims_once_without_terminal_pr_lookup(board):
     tid, _, _ = resolved_parent(board)
     with patch("subprocess.run", return_value=gh_reply()), patch.object(dispatch, "_memory_pressure_level", return_value="ok"):
         first = kb.dispatch_once(board, max_in_progress=1, reconcile_orphans=False, spawn_fn=lambda task, workspace: None)

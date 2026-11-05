@@ -46,11 +46,6 @@ def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
-
 @pytest.mark.platforms("windows")
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
@@ -175,16 +170,6 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Links + dependency resolution
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
 
@@ -199,7 +184,9 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
-        assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+        assert any(e.kind == "scheduled" and e.payload == {
+            "reason": "run next week", "wait_only": False,
+        } for e in events)
 
 
 
@@ -332,6 +319,8 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    clock = [int(_kb.time.time())]
+    monkeypatch.setattr(_kb.time, "time", lambda: clock[0])
 
     with kbc.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
@@ -344,7 +333,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
             # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert kb.claim_task(conn, tid, claimer=f"{host}:w{i}") is not None
             conn.execute(
                 "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
                 "WHERE id=?",
@@ -369,6 +358,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
                 f"hit {i}: rate-limit must not count a failure, "
                 f"got {task.consecutive_failures}"
             )
+
+            assert kb.claim_task(conn, tid) is None
+            clock[0] += _kb._resolve_rate_limit_cooldown_seconds() + 1
 
         # Last failure error stamped so the respawn guard recognizes the
         # quota wall.
