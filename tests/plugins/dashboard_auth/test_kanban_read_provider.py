@@ -19,7 +19,7 @@ from hermes_cli.dashboard_auth import token_auth
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 import plugins.dashboard_auth.drain as drain_plugin
-import plugins.dashboard_auth.kanban_read as kanban_read
+from plugins.dashboard_auth import kanban_read
 
 
 def _strong_secret() -> str:
@@ -162,7 +162,7 @@ def mounted_dashboard(tmp_path, monkeypatch):
     drain_secret = _strong_secret()
     monkeypatch.setenv("HERMES_DASHBOARD_KANBAN_READ_SECRET", kanban_secret)
     monkeypatch.setenv("HERMES_DASHBOARD_DRAIN_SECRET", drain_secret)
-    monkeypatch.setattr(drain_plugin, "_load_config_drain_auth_section", lambda: {})
+    monkeypatch.setattr(drain_plugin, "_load_config_drain_auth_section", dict)
 
     kanban_ctx = MagicMock()
     kanban_read.register(kanban_ctx)
@@ -203,7 +203,7 @@ def _count_tasks() -> int:
 
 
 def test_mounted_loopback_routes_are_read_only_and_scope_bound(mounted_dashboard):
-    client, app, kanban_secret, drain_secret = mounted_dashboard
+    client, _app, kanban_secret, drain_secret = mounted_dashboard
     from hermes_cli import web_server
 
     board_path = kanban_read.KANBAN_BOARD_ROUTE_PATH

@@ -6,8 +6,11 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_run_limits import daily_usage, day_window, enforce_run_limits
-from tests.hermes_cli.test_kanban_hard_run_limits import board, hits
+from tests.hermes_cli import test_kanban_hard_run_limits as limit_fixtures
+from tests.hermes_cli.test_kanban_hard_run_limits import hits
 from tests.hermes_cli.test_kanban_assignee_day_share import configure, spent
+
+board = limit_fixtures.board
 
 
 def ledger(rows):
