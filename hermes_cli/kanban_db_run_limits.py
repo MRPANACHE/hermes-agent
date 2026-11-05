@@ -46,6 +46,27 @@ def _runtime_seconds(conn, now, window, assignee=None):
                    - max(window["start"], row["started_at"])) for row in rows)
 
 
+def _session_runtime_seconds(path, now, window, assignee=None):
+    """Shared session ledger; missing is empty, unreadable accounting fails closed.
+
+    Attribute turns to the executing profile (Mara/Otto help included), not the
+    requesting agent. Each line is one spent turn, even when its log is reused.
+    """
+    try:
+        stream = path.open(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    seconds = 0
+    with stream:
+        for line in stream:
+            row = json.loads(line)
+            start, end = row["started_at"], row["ended_at"]
+            if assignee is None or row["profile"] == assignee:
+                seconds += max(0, min(now, window["end"], end if end is not None else now)
+                               - max(window["start"], start))
+    return seconds
+
+
 def daily_usage(conn, now: int, assignee: str | None = None) -> dict:
     """Fleet total over the native shared-board registry, not the caller's pin.
 
@@ -91,8 +112,12 @@ def daily_usage(conn, now: int, assignee: str | None = None) -> dict:
             accounted.append(str(path.resolve()))
         finally:
             other.close()
+    ledger = kb.kanban_home() / "kanban" / "session-usage.jsonl"
+    session_seconds = _session_runtime_seconds(ledger, now, window, assignee)
+    seconds += session_seconds
     return {**window, "runtime_seconds": seconds, "hours": seconds / 3600,
-            "accounting_scope": "shared_boards", "accounted_boards": accounted}
+            "accounting_scope": "shared_boards", "accounted_boards": accounted,
+            "session_runtime_seconds": session_seconds, "session_usage_ledger": str(ledger)}
 
 
 def _payload(raw):
