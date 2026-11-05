@@ -119,7 +119,7 @@ def goal_budget_history(conn: sqlite3.Connection, task_id: str) -> dict:
             runtime += max(0, run.ended_at - run.started_at)
         budget = (run.metadata or {}).get("goal_budget", {})
         historical = re.fullmatch(r"Goal-mode worker exhausted its turn budget \((\d+)/(\d+)\) "
-                                  r"without completing the task\. Last judge verdict: .*", run.summary or "", re.S)
+                                  r"without completing the task\. Last judge verdict: .*", run.summary or "", re.DOTALL)
         turns += int(budget.get("turns_used", int(historical[1]) if historical else 0))
         for key, value in budget.get("usage", {}).items():
             usage[key] = usage.get(key, 0) + value
@@ -184,7 +184,7 @@ def goal_budget_binding(conn: sqlite3.Connection, task_id: str) -> dict:
         # Historical inference requires the native run's exact exhaustion
         # receipt AND its linked block event; goal_max_turns is not evidence.
         match = re.fullmatch(r"Goal-mode worker exhausted its turn budget \((\d+)/(\d+)\) "
-                             r"without completing the task\. Last judge verdict: .*", last.summary or "", re.S)
+                             r"without completing the task\. Last judge verdict: .*", last.summary or "", re.DOTALL)
         if (task.block_kind is not None or payload.get("kind") is not None or not match
                 or int(match[1]) < int(match[2]) or payload.get("reason") != last.summary):
             deny("budget_execution_proof_missing")
@@ -483,7 +483,7 @@ def _resolve_worker_config(
         return None
     config_path = os.path.join(hermes_home, "config.yaml")
     try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
+        with open(config_path, "r", encoding="utf-8-sig") as config_file:
             raw_text = config_file.read()
     except FileNotFoundError:
         return None
