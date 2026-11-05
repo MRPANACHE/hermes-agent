@@ -756,7 +756,6 @@ def test_windows_dispatcher_termination_uses_tree_kill(monkeypatch):
 
 @pytest.mark.platforms("posix")
 def test_posix_termination_falls_back_when_killpg_is_unavailable(monkeypatch):
-    import signal
     from hermes_cli import _subprocess_compat as compat
 
     sent = []
