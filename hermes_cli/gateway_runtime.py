@@ -405,8 +405,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     """
     import time
     from hermes_cli.gateway_runtime_service import (
-        RuntimeStartError, discover_existing_gateway_service, remaining,
-        start_existing_gateway_service,
+        RuntimeStartError, remaining,
     )
     from hermes_constants import get_default_hermes_root, get_process_hermes_home
 
@@ -473,28 +472,20 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             if reserved is not None:
                 requested = True
             if observed.state == "absent" and not requested:
-                # A named profile the default multiplexer serves has no daemon of its own: start
-                # (or await) the MULTIPLEXER. A per-profile spawn here would become a second owner
-                # that blocks the multiplexer's next all-or-nothing reserve.
-                from hermes_cli.gateway_runtime_multiplex import implied_host_root, multiplexer_serves_home
-                target = multiplexer_serves_home(home) or home
-                service = discover_existing_gateway_service(target, deadline=deadline)
-                if service is None and target == home and (host := implied_host_root(home)) is not None:
-                    # Main's guard refuses a named profile a gateway of its own unless it is standalone
-                    # or already installed; with no multiplexer evidence yet, the host is still its owner.
-                    target = host
-                    service = discover_existing_gateway_service(target, deadline=deadline)
-                # Runtime locks settle races remaining after this second probe.
-                observed = discover_gateway_endpoint(home, timeout=remaining(deadline))
-                if observed.state != "absent":
+                try:
+                    from hermes_cli.gateway_runtime_start import request_absent_gateway
+                    started = request_absent_gateway(home, deadline=deadline, idle_exit=idle_exit)
+                    if started is None:
+                        continue
+                    child_home, child_offset, child = started
+                    requested = True
+                except RuntimeStartError as exc:
+                    # The socket can disappear before systemd finishes stopping. This is the
+                    # same pre-admission drain, not a failed fire or permission to replace it.
+                    if not wait_for_drain or exc.state != "draining":
+                        raise
+                    time.sleep(min(0.1, remaining(deadline)))
                     continue
-                if service is not None:
-                    start_existing_gateway_service(service, deadline=deadline)
-                else:
-                    from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, stdio_log_size
-                    child_home, child_offset = target, stdio_log_size(target)
-                    child = spawn_unmanaged_gateway(target, deadline=deadline, idle_exit=idle_exit)
-                requested = True
             time.sleep(min(delay, remaining(deadline)))
             # Capped low: each probe is a lock-file read or one local identify, and READY is noticed
             # within ~50 ms instead of up to 250 ms later on every cold start.
