@@ -440,7 +440,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
     from tools import kanban_tools
     from tools.registry import registry
 
-    from datetime import UTC, datetime
+    from datetime import datetime
     import time
     wake_timestamp = int(time.time()) + 3600
     wake_at = datetime.fromtimestamp(wake_timestamp, UTC).isoformat()

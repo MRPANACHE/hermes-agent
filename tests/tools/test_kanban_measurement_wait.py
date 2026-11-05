@@ -3,7 +3,9 @@ import json
 
 import pytest
 
-from tests.tools.test_kanban_tools import worker_env
+from tests.tools import test_kanban_tools as fixtures
+
+worker_env = fixtures.worker_env
 
 
 def test_measurement_wait_stays_parked_without_timed_dispatch(worker_env, monkeypatch):

@@ -3978,8 +3978,7 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
-    wake_at: Optional[str] = None,
-    wait_only: bool = False,
+    wake_at: Optional[str] = None, wait_only: bool = False,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
