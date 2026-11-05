@@ -765,4 +765,4 @@ def test_posix_termination_falls_back_when_killpg_is_unavailable(monkeypatch):
 
     compat.terminate_process_tree(1234, force=True)
 
-    assert sent == [(1234, signal.SIGKILL)]
+    assert sent == [(1234, getattr(signal, "SIGKILL", signal.SIGTERM))]
