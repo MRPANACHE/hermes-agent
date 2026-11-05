@@ -45,7 +45,7 @@ test('identity uses the production bundled variant and exact input tokens, not i
   expect(JSON.parse(execFileSync(process.execPath, [cli, 'identity', '--commit', commit], { env: hostileEnvironment, encoding: 'utf8' }))).toEqual(tagless)
 })
 
-test('channel smoke binds the complete admitted request, not a commit-build identity or display version', () => {
+test.each(['valid', 'tag', 'raw', 'request'])('channel smoke binds the complete admitted request, not a commit-build identity or display version (%s)', (phase) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'channel-smoke-'))
   const token = randomBytes(8).toString('hex'), sequence = 65537
   const request = { schema: 1, buildId: randomBytes(16).toString('hex'), channel: `smoke-${token}`,
@@ -61,52 +61,58 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
     [cli, command, '--commit', commit, '--channel-request', requestPath, ...args], { encoding: 'utf8' })
   try {
     fs.writeFileSync(requestPath, JSON.stringify(request))
-    const identity = run('identity')
-    expect(identity.status, identity.stderr).toBe(0)
-    expect(JSON.parse(identity.stdout)).toMatchObject({ appId: request.identity.appId,
-      msixIdentity: request.identity.msixAppIdWithOrg, applicationId: request.identity.appNamePascal,
-      windowsVersion: request.windowsVersion })
-    const env = { ...process.env, HERMES_DESKTOP_VARIANT: 'bundled', HERMES_BUILD_COMMIT: '',
-      HERMES_PAYLOAD_TAG: '', HERMES_PAYLOAD_VERSION: '', _HERMES_CHANNEL_REQUEST_JSON: JSON.stringify(request) }
-    for (const platform of ['darwin', 'win32']) {
-      const stamp = buildStampPayload({ commit, dirty: false }, env, platform,
-        { runtime: { commands: { hermes: 'bin/hermes' } } })
-      fs.writeFileSync(stampPath, JSON.stringify(stamp))
-      const result = run('stamp', ['--platform', platform, '--stamp', stampPath])
-      expect(result.status, result.stderr).toBe(0)
-      expect(JSON.parse(result.stdout)).toBe(platform === 'darwin' ? request.version : request.windowsVersion)
-      const options = { commit, platform, channelRequest: request }
-      for (const key of Object.keys(request)) {
-        const changed = { ...stamp, channelBuild: { ...request, [key]: null } }
-        expect(() => verifyBundleStamp(changed, options), key).toThrow('channelBuild')
-      }
-      for (const [key, value] of [['source', 'commit-build'], ['tag', 'v1.2.3'], ['branch', 'main'],
-        ['dirty', true], ['updateMechanism', 'external'], ['displayVersion', request.version], ['baseVersion', request.version]]) {
-        expect(() => verifyBundleStamp({ ...stamp, [key]: value }, options), key).toThrow(key)
-      }
-      expect(() => verifyBundleStamp(stamp, { commit, platform })).toThrow()
-      if (platform === 'darwin') {
-        const plist = { CFBundleIdentifier: request.identity.appId, CFBundleShortVersionString: request.version,
-          CFBundleVersion: request.version, CFBundleExecutable: request.identity.displayName }
-        expect(verifyMacMetadata(plist, stamp, options)).toBe(request.version)
-        for (const key of ['CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion']) {
-          expect(() => verifyMacMetadata({ ...plist, [key]: 'wrong' }, stamp, options)).toThrow(key)
+    if (phase === 'valid') {
+      const identity = run('identity')
+      expect(identity.status, identity.stderr).toBe(0)
+      expect(JSON.parse(identity.stdout)).toMatchObject({ appId: request.identity.appId,
+        msixIdentity: request.identity.msixAppIdWithOrg, applicationId: request.identity.appNamePascal,
+        windowsVersion: request.windowsVersion })
+      const env = { ...process.env, HERMES_DESKTOP_VARIANT: 'bundled', HERMES_BUILD_COMMIT: '',
+        HERMES_PAYLOAD_TAG: '', HERMES_PAYLOAD_VERSION: '', _HERMES_CHANNEL_REQUEST_JSON: JSON.stringify(request) }
+      for (const platform of ['darwin', 'win32']) {
+        const stamp = buildStampPayload({ commit, dirty: false }, env, platform,
+          { runtime: { commands: { hermes: 'bin/hermes' } } })
+        fs.writeFileSync(stampPath, JSON.stringify(stamp))
+        const result = run('stamp', ['--platform', platform, '--stamp', stampPath])
+        expect(result.status, result.stderr).toBe(0)
+        expect(JSON.parse(result.stdout)).toBe(platform === 'darwin' ? request.version : request.windowsVersion)
+        const options = { commit, platform, channelRequest: request }
+        for (const key of Object.keys(request)) {
+          const changed = { ...stamp, channelBuild: { ...request, [key]: null } }
+          expect(() => verifyBundleStamp(changed, options), key).toThrow('channelBuild')
         }
-        expect(stampAssertions(stamp, { commit, tag: null, channelRequest: request })).toEqual([])
-        expect(stampAssertions(stamp, { commit, tag: null }).join(';')).toContain('channelBuild')
-        expect(stampAssertions({ ...stamp, channelBuild: { ...request, bundleEnv: { HERMES_MODEL: 'other' } } },
-          { commit, tag: null, channelRequest: request }).join(';')).toContain('channelBuild')
+        for (const [key, value] of [['source', 'commit-build'], ['tag', 'v1.2.3'], ['branch', 'main'],
+          ['dirty', true], ['updateMechanism', 'external'], ['displayVersion', request.version], ['baseVersion', request.version]]) {
+          expect(() => verifyBundleStamp({ ...stamp, [key]: value }, options), key).toThrow(key)
+        }
+        expect(() => verifyBundleStamp(stamp, { commit, platform })).toThrow()
+        if (platform === 'darwin') {
+          const plist = { CFBundleIdentifier: request.identity.appId, CFBundleShortVersionString: request.version,
+            CFBundleVersion: request.version, CFBundleExecutable: request.identity.displayName }
+          expect(verifyMacMetadata(plist, stamp, options)).toBe(request.version)
+          for (const key of ['CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion']) {
+            expect(() => verifyMacMetadata({ ...plist, [key]: 'wrong' }, stamp, options)).toThrow(key)
+          }
+          expect(stampAssertions(stamp, { commit, tag: null, channelRequest: request })).toEqual([])
+          expect(stampAssertions(stamp, { commit, tag: null }).join(';')).toContain('channelBuild')
+          expect(stampAssertions({ ...stamp, channelBuild: { ...request, bundleEnv: { HERMES_MODEL: 'other' } } },
+            { commit, tag: null, channelRequest: request }).join(';')).toContain('channelBuild')
+        }
       }
     }
-    expect(run('identity', ['--tag', 'v1.2.3']).status).not.toBe(0)
-    for (const raw of ['', JSON.stringify(request).replace('{', '{"channel":"duplicate",')]) {
-      fs.writeFileSync(requestPath, raw)
-      expect(run('identity').status).not.toBe(0)
+    if (phase === 'tag') expect(run('identity', ['--tag', 'v1.2.3']).status).not.toBe(0)
+    if (phase === 'raw') {
+      for (const raw of ['', JSON.stringify(request).replace('{', '{"channel":"duplicate",')]) {
+        fs.writeFileSync(requestPath, raw)
+        expect(run('identity').status).not.toBe(0)
+      }
     }
-    for (const invalid of [{ ...request, commit: 'b'.repeat(40) }, { ...request, channel: 'smoke/invalid' },
-      { ...request, windowsVersion: '1.2.3.0' }, { ...request, identity: { token } }]) {
-      fs.writeFileSync(requestPath, JSON.stringify(invalid))
-      expect(run('identity').status).not.toBe(0)
+    if (phase === 'request') {
+      for (const invalid of [{ ...request, commit: 'b'.repeat(40) }, { ...request, channel: 'smoke/invalid' },
+        { ...request, windowsVersion: '1.2.3.0' }, { ...request, identity: { token } }]) {
+        fs.writeFileSync(requestPath, JSON.stringify(invalid))
+        expect(run('identity').status).not.toBe(0)
+      }
     }
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
 }, 15_000)

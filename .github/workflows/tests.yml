@@ -37,14 +37,15 @@ concurrency:
 
 jobs:
   test:
-    # Standard hosted runners; four native partitions retain the complete suite.
-    name: Run tests (${{ matrix.slice }}/4)
+    # Standard hosted runners: eight native partitions retain the complete suite
+    # within the unchanged 30-minute job budget (four exceeded it).
+    name: Run tests (${{ matrix.slice }}/8)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        slice: [1, 2, 3, 4]
+        slice: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -108,7 +109,7 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_SLICE: ${{ matrix.slice }}/4
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/8
           HERMES_TEST_WORKERS: 4
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
