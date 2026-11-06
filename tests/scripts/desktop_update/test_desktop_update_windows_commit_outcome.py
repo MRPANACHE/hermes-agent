@@ -111,9 +111,3 @@ def test_verify_failure_after_a_committed_update_is_ok_with_warnings(tmp_path: P
     assert 'previous version' not in result['message']
     # The fleet the Desktop stopped is still brought back.
     assert argv[-1] == ['gateway', 'start', '--all'], argv
-
-
-
-
-
-
