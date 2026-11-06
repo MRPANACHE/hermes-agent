@@ -2,13 +2,16 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.update_cmd_git import _locate_real_git
 
 
-def test_git_core_is_found_under_resolved_custom_install(tmp_path):
+@pytest.mark.parametrize("layout", ["mingw64/libexec/git-core", "ucrt64/bin", "future-runtime/libexec/git-core"])
+def test_git_core_is_found_under_resolved_custom_install(tmp_path, layout):
     root = tmp_path / "managed-git"
     shim = root / "cmd" / "git.exe"
-    real = root / "mingw64" / "libexec" / "git-core" / "git.exe"
+    real = root / layout / "git.exe"
     shim.parent.mkdir(parents=True)
     real.parent.mkdir(parents=True)
     shim.touch()

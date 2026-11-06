@@ -629,12 +629,13 @@ def _locate_real_git() -> Optional[Path]:
     if located:
         # Managed/custom Git installs need not live under Program Files. Resolve
         # the launcher, then inspect its installation ancestors, never another PATH shim.
-        roots.extend(Path(located[0]).resolve().parents)
-    candidates = [
-        root / arch / "libexec" / "git-core" / "git.exe"
-        for root in roots
-        for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+        roots.extend(list(Path(located[0]).resolve().parents)[:3])
+    portable = _portable_git_candidates()
+    roots.extend(candidate.parents[3] for candidate in portable)
+    # Git-for-Windows changes runtime prefixes (mingw64, clangarm64, ucrt64).
+    # Discover the installed layout rather than adding architecture aliases.
+    candidates = [candidate for root in roots for pattern in ("*/libexec/git-core/git.exe", "*/bin/git.exe")
+                  for candidate in sorted(root.glob(pattern))] + portable
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 
