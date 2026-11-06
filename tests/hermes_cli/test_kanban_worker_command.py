@@ -80,7 +80,7 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     _write_profile(
         root,
         "engine",
-        "worker:\n  command:\n    - /home/david/bin/codex-sub\n"
+        f"worker:\n  command:\n    - {sys.executable}\n"
         "    - luna\n    - --\n    - fixed instruction; read HERMES_KANBAN_TASK_ID\n",
     )
 
@@ -91,7 +91,7 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     assert captured["cmd"] == SUPERVISOR
     assert captured["kwargs"].get("shell", False) is False
     assert json.loads(captured["env"]["HERMES_KANBAN_WORKER_COMMAND"]) == [
-        "/home/david/bin/codex-sub",
+        sys.executable,
         "luna",
         "--",
         "fixed instruction; read HERMES_KANBAN_TASK_ID",

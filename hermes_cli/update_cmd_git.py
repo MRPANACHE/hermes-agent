@@ -599,17 +599,25 @@ def _git_is_trampoline(git_cmd: list) -> bool:
 
 
 def _portable_git_candidates() -> list:
-    """PortableGit candidates: shared root first (where the managed tree actually lives, not the
-    profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
+    """PortableGit candidates: retained shared/profile layouts, then current PM facts.
 
-    The Hermes-managed PortableGit tree lives under the SHARED root (``<root>/git/...``), not the
-    profile-scoped HERMES_HOME (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must look
-    there (monerostar review, #87876).
+    PM records the exact installed entry even when a bundle or CI uses a different
+    store. Preserve the existing search order for older installations.
     """
     from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
     with suppress(Exception):
         candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
+    # PM owns the current PortableGit location, including CI and bundle stores.
+    from pm import paths as pm_paths
+    from pm.lock import Facts
+
+    with suppress(Exception):
+        fact = Facts(pm_paths.facts_path()).get("git")
+        if fact is not None and "entry" in fact:
+            root = pm_paths.store_root() / fact["entry"]
+            candidates += [root / arch / "libexec" / "git-core" / "git.exe"
+                           for arch in ("clangarm64", "mingw64", "mingw32")]
     return candidates
 
 
