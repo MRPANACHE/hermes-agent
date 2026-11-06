@@ -5,7 +5,10 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli.config import atomic_config_replace as atomic_config_write
 from hermes_cli.kanban_db_run_limits import day_window, enforce_run_limits
-from tests.hermes_cli.test_kanban_hard_run_limits import board, hits  # noqa: F401
+from tests.hermes_cli import test_kanban_hard_run_limits as limit_fixtures
+from tests.hermes_cli.test_kanban_hard_run_limits import hits
+
+board = limit_fixtures.board
 
 
 def configure(shares):

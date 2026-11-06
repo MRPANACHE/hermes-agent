@@ -100,11 +100,21 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 FIND_UPDATE_CHILD = r"""
 param([int]$Parent, [int]$Seconds)
 $deadline = (Get-Date).AddSeconds($Seconds)
+$previous = 0
 while ((Get-Date) -lt $deadline) {
-    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
-        Where-Object { $_.CommandLine -match '--yes' } | Select-Object -First 1
-    if ($row) { [Console]::Out.Write($row.ProcessId); exit 0 }
-    Start-Sleep -Milliseconds 100
+    # CREATE_SUSPENDED has not initialized the child's PEB: CIM CommandLine
+    # can be null, so '--yes' is not an observable pre-publication boundary.
+    $suspended = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" | ForEach-Object {
+        $child = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+        if ($child -and @($child.Threads | Where-Object {
+            $_.ThreadState -eq 'Wait' -and $_.WaitReason -eq 'Suspended'
+        }).Count) { $_.ProcessId }
+    })
+    # Probe children resume immediately; only the update waits behind the held
+    # marker lock. Require the same kernel-suspended child on successive polls.
+    if ($previous -and $previous -in $suspended) { [Console]::Out.Write($previous); exit 0 }
+    $previous = if ($suspended.Count -eq 1) { $suspended[0] } else { 0 }
+    Start-Sleep -Seconds 1
 }
 exit 1
 """

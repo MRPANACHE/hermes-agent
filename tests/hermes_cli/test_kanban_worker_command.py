@@ -80,7 +80,7 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     _write_profile(
         root,
         "engine",
-        "worker:\n  command:\n    - /home/david/bin/codex-sub\n"
+        f"worker:\n  command:\n    - {sys.executable}\n"
         "    - luna\n    - --\n    - fixed instruction; read HERMES_KANBAN_TASK_ID\n",
     )
 
@@ -91,7 +91,7 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     assert captured["cmd"] == SUPERVISOR
     assert captured["kwargs"].get("shell", False) is False
     assert json.loads(captured["env"]["HERMES_KANBAN_WORKER_COMMAND"]) == [
-        "/home/david/bin/codex-sub",
+        sys.executable,
         "luna",
         "--",
         "fixed instruction; read HERMES_KANBAN_TASK_ID",
@@ -159,6 +159,19 @@ def test_profile_command_completion_mode_ignores_root_config(spawn_env):
     kb._default_spawn(_make_task(), str(workspace))
 
     assert captured["env"]["HERMES_KANBAN_WORKER_COMPLETION_MODE"] == "exit_code"
+
+
+def test_profile_command_config_accepts_utf8_bom(spawn_env):
+    root, workspace, captured = spawn_env
+    profile = root / "profiles" / "engine"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_bytes(
+        b"\xef\xbb\xbfworker:\n  command:\n    - /bin/echo\n"
+    )
+
+    kb._default_spawn(_make_task(), str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_WORKER_COMMAND"] == '["/bin/echo"]'
 
 
 @pytest.mark.parametrize("value", ["unknown", "", "7", "null"])
@@ -383,6 +396,7 @@ def _run_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
     )
     return subprocess.run(
         SUPERVISOR,
+        check=False,
         cwd=str(Path(__file__).parents[2]),
         env=env,
         capture_output=True,
@@ -417,6 +431,7 @@ def _run_supervisor_mode(
     )
     return subprocess.run(
         SUPERVISOR,
+        check=False,
         cwd=str(Path(__file__).parents[2]),
         env=env,
         capture_output=True,
@@ -737,3 +752,17 @@ def test_windows_dispatcher_termination_uses_tree_kill(monkeypatch):
 
     assert calls
     assert calls[0][0] == ["taskkill", "/T", "/F", "/PID", "1234"]
+
+
+@pytest.mark.platforms("posix")
+def test_posix_termination_falls_back_when_killpg_is_unavailable(monkeypatch):
+    from hermes_cli import _subprocess_compat as compat
+
+    sent = []
+    monkeypatch.setattr(compat.os, "getpgid", lambda pid: pid)
+    monkeypatch.delattr(compat.os, "killpg", raising=False)
+    monkeypatch.setattr(compat.os, "kill", lambda pid, signum: sent.append((pid, signum)))
+
+    compat.terminate_process_tree(1234, force=True)
+
+    assert sent == [(1234, signal.SIGKILL)]
