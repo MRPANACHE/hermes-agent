@@ -1,4 +1,8 @@
 """Portable Git discovery follows the selected PM facts, not a fixed install root."""
+from types import SimpleNamespace
+
+import pytest
+
 from pm import paths
 from pm.lock import Facts
 
@@ -19,3 +23,20 @@ def test_selected_pm_git_core_is_a_candidate_and_can_be_selected(tmp_path, monke
     assert core in git_update._portable_git_candidates()
     monkeypatch.setattr(git_update, '_probe_fork_bomb', lambda argv: False if argv == [str(core)] else True)
     assert git_update._locate_real_git() == core
+
+
+@pytest.mark.parametrize('layout', ['libexec/git-core', 'bin'])
+def test_tool_path_locates_git_when_the_parent_pm_binding_is_absent(tmp_path, monkeypatch, layout):
+    from hermes_platform.resolver import core as resolver
+
+    root = tmp_path / 'portable-git'
+    command = root / 'cmd/git.exe'
+    command.parent.mkdir(parents=True)
+    command.write_text('fixture command', encoding='utf-8')
+    binary = root / 'mingw64' / layout / 'git.exe'
+    binary.parent.mkdir(parents=True)
+    binary.write_text('fixture binary', encoding='utf-8')
+    monkeypatch.setattr(paths, 'facts_path', lambda: tmp_path / 'missing-facts.json')
+    monkeypatch.setattr(resolver, 'locate_command', lambda name: SimpleNamespace(command=(str(command),)))
+    monkeypatch.setattr(git_update, '_probe_fork_bomb', lambda argv: False if argv == [str(binary)] else True)
+    assert git_update._locate_real_git() == binary

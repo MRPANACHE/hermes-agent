@@ -611,13 +611,23 @@ def _portable_git_candidates() -> list:
     # PM owns the current PortableGit location, including CI and bundle stores.
     from pm import paths as pm_paths
     from pm.lock import Facts
+    from hermes_platform.resolver.core import locate_command
 
+    roots = []
     with suppress(Exception):
         fact = Facts(pm_paths.facts_path()).get("git")
         if fact is not None and "entry" in fact:
-            root = pm_paths.store_root() / fact["entry"]
-            candidates += [root / arch / "libexec" / "git-core" / "git.exe"
-                           for arch in ("clangarm64", "mingw64", "mingw32")]
+            roots.append(pm_paths.store_root() / fact["entry"])
+    # Isolated children intentionally lack the parent's PM store binding, but
+    # retain its tool PATH. Resolve that command passively without provisioning.
+    with suppress(Exception):
+        command = locate_command("git").command
+        if command:
+            roots.append(Path(command[0]).parent.parent)
+    for root in dict.fromkeys(roots):
+        candidates += [root / arch / location / "git.exe"
+                       for arch in ("clangarm64", "mingw64", "mingw32")
+                       for location in ("libexec/git-core", "bin")]
     return candidates
 
 
