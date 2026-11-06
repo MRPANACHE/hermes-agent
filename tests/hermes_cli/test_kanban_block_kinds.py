@@ -9,9 +9,9 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
   never enter the human ``blocked`` bucket a cron would keep unblocking —
   unless no parent is open, in which case the wait can never be satisfied
   and the block is recorded as ``needs_input`` (sticky, loop-counted).
-* ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
-  each same-cause re-block after an unblock increments ``block_recurrences``,
-  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+* ``needs_input`` / ``capability`` remain visible in ``blocked`` even after
+  repeated waits; the loop event retains their recurrence count. Generic or
+  transient recurrence reaches ``triage`` at ``BLOCK_RECURRENCE_LIMIT``.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -119,8 +119,7 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
     """A ``dependency`` block whose parents are all terminal can never be
     satisfied by ``recompute_ready``: it must park in ``blocked`` as
     ``needs_input`` (no ``dependency_wait``, no re-promotion), say so on the
-    CLI, and count toward the loop breaker so a re-block after an unblock
-    reaches ``triage``."""
+    CLI, and record the repeated human wait without auto-triaging it."""
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
         with kb.write_txn(conn):
