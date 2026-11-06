@@ -98,10 +98,14 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 # -- the update child is the delegate before it runs anything ------------------
 
 FIND_UPDATE_CHILD = r"""
-param([int]$Parent, [int]$Seconds)
+param([int]$Parent, [int]$Seconds, [string]$Executable)
 $deadline = (Get-Date).AddSeconds($Seconds)
 while ((Get-Date) -lt $deadline) {
-    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" | Select-Object -First 1
+    # De help-probe en custodian draaien voor de updater. Selecteer de exacte
+    # interpreter zonder de help-probe; CREATE_SUSPENDED kan nog geen argv hebben.
+    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
+        Where-Object { [string]::Equals($_.ExecutablePath, $Executable, [StringComparison]::OrdinalIgnoreCase) -and
+            $_.CommandLine -notmatch '--help' } | Select-Object -First 1
     if ($row) { [Console]::Out.Write($row.ProcessId); exit 0 }
     Start-Sleep -Milliseconds 100
 }
@@ -133,7 +137,7 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
             time.sleep(0.02)
         lock = _HeldLock(home)   # after the claim, before the delegate publication
         child = subprocess.run([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
-                                '-Parent', str(script.pid), '-Seconds', '60'],
+                                '-Parent', str(script.pid), '-Seconds', '60', '-Executable', sys.executable],
                                capture_output=True, text=True, timeout=90, check=False)
         assert child.returncode == 0, 'the update child never appeared'
         child_pid = int(child.stdout)

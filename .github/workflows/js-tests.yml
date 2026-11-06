@@ -11,10 +11,13 @@ on:
 
 jobs:
   check:
-    name: JS & TS checks
-    # Standard GitHub runners expose 32 host CPUs despite a 2-core job quota.
-    # The check runner caps concurrent workspace checks to two in CI; keep the
-    # complete discovered population and the 30-minute job budget unchanged.
+    name: JS & TS checks (${{ matrix.partition }}/4)
+    # Verdeel de volledige populatie, inclusief de zware UI-suite, over native
+    # Vitest-shards. Meer workers op één tweecorehost lost oversubscriptie niet op.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -85,8 +88,8 @@ jobs:
       - name: Run WhatsApp bridge node tests
         run: node --test scripts/whatsapp-bridge/*.test.mjs
 
-      # Every check runs at the same time. The step fails only after all of
-      # them finish. There are two reasons this is not ``npm run --ws check``.
+      # Iedere partitie voert alle toegewezen checks uit, ook na een fout.
+      # There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
       #     run then reports one failure, where the matrix this replaced
@@ -103,7 +106,7 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2 --partition ${{ matrix.partition }}/4
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when
