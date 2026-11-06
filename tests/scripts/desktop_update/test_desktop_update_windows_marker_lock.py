@@ -101,8 +101,7 @@ FIND_UPDATE_CHILD = r"""
 param([int]$Parent, [int]$Seconds)
 $deadline = (Get-Date).AddSeconds($Seconds)
 while ((Get-Date) -lt $deadline) {
-    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
-        Where-Object { $_.CommandLine -match '--yes' } | Select-Object -First 1
+    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" | Select-Object -First 1
     if ($row) { [Console]::Out.Write($row.ProcessId); exit 0 }
     Start-Sleep -Milliseconds 100
 }
@@ -137,8 +136,11 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
                                 '-Parent', str(script.pid), '-Seconds', '60'],
                                capture_output=True, text=True, timeout=90, check=False)
         assert child.returncode == 0, 'the update child never appeared'
-        watch = _ProcessWatch(int(child.stdout))
+        child_pid = int(child.stdout)
+        watch = _ProcessWatch(child_pid)
         try:
+            from tests.hermes_cli.windows_process_observation import assert_initial_threads_suspended
+            assert_initial_threads_suspended(child_pid, expected_parent=script.pid)
             subprocess.run(['taskkill', '/F', '/PID', str(script.pid)], capture_output=True, check=True)
             script.wait(timeout=30)
             # The script's death closes the child's job; kill-on-close then terminates the child

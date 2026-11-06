@@ -27,6 +27,12 @@ still consumes the daily budget. Source-bound native incident/daily-work
 exceptions and `limit_hit` event evidence retain their existing daily-budget
 semantics.
 
+`kanban.daily_run_share_per_assignee` optionally maps a profile name to an integer
+percentage (1–99) of that daily fleet budget. New runs for that assignee stop at
+the share without interrupting existing work; other assignees retain their own
+admission. Invalid entries do not remove the fleet limit. The same source-bound
+incident/daily-work exception and `limit_hit` evidence rules apply.
+
 ## Directory Structure
 
 ```text

@@ -23,6 +23,9 @@ async def test_managed_claims_participate_in_zero_and_nonzero_drain(tmp_path):
         _active_deferred_agent_worker_count=lambda: 0, _snapshot_running_agents=dict,
         _update_runtime_status=lambda *a: None)
     runner._drain_work_counts = GatewayShutdownMixin._drain_work_counts.__get__(runner)
+    runner._active_kanban_work_count = GatewayShutdownMixin._active_kanban_work_count.__get__(runner)
+    runner._active_kanban_dispatch_count = GatewayShutdownMixin._active_kanban_dispatch_count.__get__(runner)
+    runner._active_kanban_worker_count = GatewayShutdownMixin._active_kanban_worker_count.__get__(runner)
     authority.runner = runner
     authority.pending_stops = {}
     authority.adopted = {}

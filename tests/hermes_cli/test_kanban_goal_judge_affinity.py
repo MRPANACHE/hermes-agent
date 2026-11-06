@@ -55,7 +55,8 @@ def test_cli_gate_transport_failure_fails_open_but_genuine_verdict_rejects():
 def test_tool_gate_transport_failure_fails_open_but_genuine_verdict_rejects():
     with patch.object(kanban_tools, "_goal_judge_available", return_value=True):
         with patch.object(kanban_tools, "judge_goal", return_value=_TRANSPORT_FAILED):
-            kanban_tools._goal_gate("kanban_complete", _task(), "task-1", "ev")  # no raise
+            with pytest.raises(kanban_tools._Reject, match="judge error"):
+                kanban_tools._goal_gate("kanban_complete", _task(), "task-1", "ev")
         with patch.object(kanban_tools, "judge_goal", return_value=_GENUINE_CONTINUE):
             with pytest.raises(kanban_tools._Reject):
                 kanban_tools._goal_gate("kanban_complete", _task(), "task-1", "ev")
@@ -93,7 +94,7 @@ def test_goal_loop_judge_binds_per_task_affinity_scope():
 
     seen = []
 
-    def fake_judge(goal, last_response):
+    def fake_judge(goal, last_response, **_kwargs):
         seen.append(get_affinity_scope())
         return ("continue", "not yet", False, None, False)
 

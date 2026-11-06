@@ -144,8 +144,8 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         # A cron/human unblocks; the worker re-declares the same impossible wait.
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
-        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
-        assert kb.get_task(conn, child).status == "triage"
+        assert kb.block_task(conn, child, reason="waiting on upstream", kind="dependency")
+        assert kb.get_task(conn, child).status == "blocked"  # Human input stays visible, never auto-triaged.
         loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
 
@@ -196,5 +196,3 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
-

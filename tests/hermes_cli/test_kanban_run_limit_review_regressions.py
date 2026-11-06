@@ -105,8 +105,17 @@ def test_native_coordinator_card_gets_mara_one_extra_series(board):
                          created_by="coordinator", body="No MCP ingress metadata.")
     for _ in range(5):
         attempt(board, tid)
-    assert kb.claim_task(board, tid) is None
-    decision = disposition(board, tid, "new_series", limit_event_id=hits(board, tid)[0][0].id)
+    # A retained historical limit event is assessable without enforcing that retired cap.
+    from hermes_cli.kanban_db_run_limits import task_series
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "limit_hit", {
+            "limit_key": "task_runs_without_outcome", "enforced": True,
+            "action": "blocked_new_run", "run_ids": task_series(board, tid)["run_ids"],
+            "outcome_event_id": task_series(board, tid)["outcome_event_id"],
+        })
+    event_id = hits(board, tid)[0][0].id
+    assert kb.block_task(board, tid, reason="Retained historical limit", kind="needs_input")
+    decision = disposition(board, tid, "new_series", limit_event_id=event_id)
     response = native_decision(board, tid, decision)
     assert response["ok"] is True
     assert list(supervisor_decisions(board, tid))[-1][1] == decision
@@ -114,8 +123,8 @@ def test_native_coordinator_card_gets_mara_one_extra_series(board):
     assert kb.unblock_task(board, tid)
     for _ in range(5):
         attempt(board, tid)
-    assert kb.claim_task(board, tid) is None
-    again = disposition(board, tid, "new_series", limit_event_id=hits(board, tid)[-1][0].id)
+    assert kb.claim_task(board, tid) is not None
+    again = disposition(board, tid, "new_series", limit_event_id=event_id)
     assert "binding_invalid" in native_decision(board, tid, again)["error"]
     assert len(list(supervisor_decisions(board, tid))) == 1
 
@@ -163,7 +172,8 @@ def test_native_measured_closure_resets_only_the_measured_series(board):
     tid = card(board)
     for _ in range(5):
         attempt(board, tid)
-    assert kb.claim_task(board, tid) is None
+    assert kb.claim_task(board, tid) is not None
+    assert kb.block_task(board, tid, reason="Awaiting measured result", kind="needs_input")
     choice = disposition(board, tid, "measured_closure", case_ref="oos://cases/fixture",
                          measurement_ref="oos://measurements/fixture")
     assert native_decision(board, tid, choice)["ok"] is True

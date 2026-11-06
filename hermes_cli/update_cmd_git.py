@@ -622,9 +622,17 @@ def _locate_real_git() -> Optional[Path]:
     re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
     invoked directly (#87876).
     """
+    from hermes_platform.resolver import locate_command
+
+    located = locate_command("git").command
+    roots = [Path(base) / "Git" for base in (r"C:\Program Files", r"C:\Program Files (x86)")]
+    if located:
+        # Managed/custom Git installs need not live under Program Files. Resolve
+        # the launcher, then inspect its installation ancestors, never another PATH shim.
+        roots.extend(Path(located[0]).resolve().parents)
     candidates = [
-        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        root / arch / "libexec" / "git-core" / "git.exe"
+        for root in roots
         for arch in ("clangarm64", "mingw64", "mingw32")
     ] + _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
