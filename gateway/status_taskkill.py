@@ -6,7 +6,8 @@ def require_exit_after_taskkill_error(pid, result):
 
     The caller has already enforced its original start-time guard and attempted
     taskkill once. A nonzero tree result can name an already-exited descendant;
-    no retry, signalling, PID substitution or language-specific error parsing occurs.
+    allow two seconds for asynchronous kernel teardown. No retry, signalling,
+    PID substitution or language-specific error parsing occurs.
     """
     try:
         import psutil
@@ -14,7 +15,7 @@ def require_exit_after_taskkill_error(pid, result):
         pass
     else:
         try:
-            psutil.Process(pid).wait(timeout=0)
+            psutil.Process(pid).wait(timeout=2)
         except psutil.NoSuchProcess:
             return
         except psutil.Error:

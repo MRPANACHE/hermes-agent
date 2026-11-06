@@ -18,7 +18,7 @@ def test_taskkill_error_requires_a_terminal_target_observation(monkeypatch, stat
                 raise psutil.NoSuchProcess(pid)
 
         def wait(self, timeout):
-            assert timeout == 0
+            assert timeout == 2
             if state == 'running':
                 raise psutil.TimeoutExpired(timeout)
             if state == 'denied':
