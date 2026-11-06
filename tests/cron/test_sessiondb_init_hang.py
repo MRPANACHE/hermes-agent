@@ -42,6 +42,7 @@ def test_sessiondb_init_preserves_multiplex_profile_context(owner_run, tmp_path)
 
     owner, job, execution_id, agent_cls = owner_run
     profile_home = tmp_path / "profiles" / "jobsearch"
+    profile_home.mkdir(parents=True)
     owner.db.db_path = profile_home / "state.db"
     observed = []
 

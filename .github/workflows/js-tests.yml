@@ -11,14 +11,13 @@ on:
 
 jobs:
   check:
-    name: JS & TS checks
-    # One 32-core job replaces a 14-leg matrix. The matrix spread about 612s
-    # of check payload over 4-core runners. It paid about 371s of repeated
-    # setup to do it: 14 checkouts, 14 node installs, 14 node_modules
-    # restores.
-    #
-    # One larger runner installs one time. vitest, tsc and eslint each size
-    # their own worker pool from the core count.
+    name: JS & TS checks (${{ matrix.partition }}/4)
+    # Verdeel de volledige populatie, inclusief de zware UI-suite, over native
+    # Vitest-shards. Meer workers op één tweecorehost lost oversubscriptie niet op.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -89,8 +88,8 @@ jobs:
       - name: Run WhatsApp bridge node tests
         run: node --test scripts/whatsapp-bridge/*.test.mjs
 
-      # Every check runs at the same time. The step fails only after all of
-      # them finish. There are two reasons this is not ``npm run --ws check``.
+      # Iedere partitie voert alle toegewezen checks uit, ook na een fout.
+      # There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
       #     run then reports one failure, where the matrix this replaced
@@ -107,7 +106,7 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2 --partition ${{ matrix.partition }}/4
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when

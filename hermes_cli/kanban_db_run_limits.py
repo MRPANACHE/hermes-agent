@@ -30,19 +30,48 @@ def execution_runs(conn, *, task_id=None, after_event_id=0, work_only=False):
                   "AND w.run_id=r.id AND w.kind='scheduled' "
                   "AND json_extract(w.payload,'$.wait_only')=1)")
     return conn.execute(
-        "SELECT r.*, MIN(e.id) AS spawn_event_id FROM task_runs r "
+        "SELECT r.*, MIN(e.id) AS spawn_event_id, "
+        "(SELECT MIN(w.created_at) FROM task_events w WHERE w.task_id=r.task_id AND w.run_id=r.id "
+        "AND w.kind='worker_lost' AND w.created_at>=r.started_at "
+        "AND json_extract(w.payload,'$.claim_lock')=r.claim_lock) AS worker_lost_at FROM task_runs r "
         "JOIN task_events e ON e.task_id=r.task_id AND e.run_id=r.id AND e.kind='spawned' "
         "WHERE e.id>? " + where + " GROUP BY r.id ORDER BY r.id",
         (after_event_id, task_id) if task_id is not None else (after_event_id,),
     ).fetchall()
 
 
-def _runtime_seconds(conn, now, window):
-    return sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now)
-                   - max(window["start"], row["started_at"])) for row in execution_runs(conn))
+def _runtime_seconds(conn, now, window, assignee=None):
+    rows = execution_runs(conn)
+    if assignee is not None:
+        own = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE assignee=?", (assignee,))}
+        rows = [row for row in rows if row["task_id"] in own]
+    return sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now,
+                         row["worker_lost_at"] if row["worker_lost_at"] is not None else now)
+                   - max(window["start"], row["started_at"])) for row in rows)
 
 
-def daily_usage(conn, now: int) -> dict:
+def _session_runtime_seconds(path, now, window, assignee=None):
+    """Shared session ledger; missing is empty, unreadable accounting fails closed.
+
+    Attribute turns to the executing profile (Mara/Otto help included), not the
+    requesting agent. Each line is one spent turn, even when its log is reused.
+    """
+    try:
+        stream = path.open(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    seconds = 0
+    with stream:
+        for line in stream:
+            row = json.loads(line)
+            start, end = row["started_at"], row["ended_at"]
+            if assignee is None or row["profile"] == assignee:
+                seconds += max(0, min(now, window["end"], end if end is not None else now)
+                               - max(window["start"], start))
+    return seconds
+
+
+def daily_usage(conn, now: int, assignee: str | None = None) -> dict:
     """Fleet total over the native shared-board registry, not the caller's pin.
 
     Open other boards read-only: a worker's HERMES_KANBAN_DB/current-board
@@ -61,7 +90,7 @@ def daily_usage(conn, now: int) -> dict:
     if own:
         info = Path(own).stat()
         seen.add((info.st_dev, info.st_ino))
-    seconds = _runtime_seconds(conn, now, window)
+    seconds = _runtime_seconds(conn, now, window, assignee)
     accounted = [own or ":memory:"]
     paths = [kb.kanban_home() / "kanban.db"]
     pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
@@ -83,12 +112,16 @@ def daily_usage(conn, now: int) -> dict:
         other = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         other.row_factory = sqlite3.Row
         try:
-            seconds += _runtime_seconds(other, now, window)
+            seconds += _runtime_seconds(other, now, window, assignee)
             accounted.append(str(path.resolve()))
         finally:
             other.close()
+    ledger = kb.kanban_home() / "kanban" / "session-usage.jsonl"
+    session_seconds = _session_runtime_seconds(ledger, now, window, assignee)
+    seconds += session_seconds
     return {**window, "runtime_seconds": seconds, "hours": seconds / 3600,
-            "accounting_scope": "shared_boards", "accounted_boards": accounted}
+            "accounting_scope": "shared_boards", "accounted_boards": accounted,
+            "session_runtime_seconds": session_seconds, "session_usage_ledger": str(ledger)}
 
 
 def _payload(raw):
@@ -243,6 +276,35 @@ def _record_hit(conn, task_id, payload):
         _append_event(conn, task_id, "limit_hit", payload)
 
 
+def _assignee_share_hits(conn, task_id, now, config, budget, exception):
+    """Per-profile share of the fleet day budget (David 5-11: business agents first).
+
+    ``daily_run_share_per_assignee`` maps a profile to an integer percent of the
+    day budget. Invalid entries never raise or remove a cap. A classified Mara
+    exception is recorded as allowed, like the fleet cap.
+    """
+    shares = config.get("daily_run_share_per_assignee", {})
+    assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    share = shares.get(assignee) if isinstance(shares, dict) and assignee else None
+    if type(share) is not int or not 0 < share < 100:
+        return []
+    usage = daily_usage(conn, now, assignee)
+    threshold = budget * share / 100
+    if usage["runtime_seconds"] < threshold * 3600:
+        return []
+    hit = {"limit_key": "assignee_day_share", "assignee": assignee, "share_percent": share,
+           "observed": usage["hours"], "threshold": threshold, "unit": "hours",
+           **{k: usage[k] for k in ("timezone", "local_date", "window_start", "window_end")},
+           "accounting_scope": usage["accounting_scope"], "board_count": len(usage["accounted_boards"]),
+           "episode_key": f"share:{usage['local_date']}:{task_id}:" + str(exception["event_id"] if exception else 0)}
+    if exception:
+        _record_hit(conn, task_id, {**hit, "action": "exception_allowed", "enforced": True,
+                    "exception_reason": exception["reason"], "exception_class": exception["work_class"],
+                    "exception_event_id": exception["event_id"], "evidence_refs": exception["evidence_refs"]})
+        return []
+    return [hit]
+
+
 def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool:
     """In the native ready/review claim transaction; never cancel running workers."""
     from hermes_cli.config import load_config_readonly
@@ -276,6 +338,7 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
                         "exception_event_id": exception["event_id"], "evidence_refs": exception["evidence_refs"]})
         else:
             hits.append(daily)
+    hits.extend(_assignee_share_hits(conn, task_id, now, config, budget, _exception(conn, task_id)))
     for hit in hits:
         _record_hit(conn, task_id, {**hit, "action": "blocked_new_run", "enforced": True})
     if not hits:

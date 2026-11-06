@@ -12,6 +12,7 @@ import time
 import pytest
 
 from tests.installation_launcher_fixture import publish_fixture_launcher
+from tests.waiting import wait_until
 from tests.scripts.desktop_update.windows_handoff_support import (
     MARKER,
     POWERSHELL,
@@ -24,6 +25,7 @@ from tests.scripts.desktop_update.windows_handoff_support import (
     _op,
     _HeldLock,
     _custodian,
+    _log,
 )
 
 
@@ -98,12 +100,15 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
 # -- the update child is the delegate before it runs anything ------------------
 
 FIND_UPDATE_CHILD = r"""
-param([int]$Parent, [int]$Seconds)
+param([int]$Parent, [int]$Seconds, [int]$Custodian)
 $deadline = (Get-Date).AddSeconds($Seconds)
 while ((Get-Date) -lt $deadline) {
-    $row = Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
-        Where-Object { $_.CommandLine -match '--yes' } | Select-Object -First 1
-    if ($row) { [Console]::Out.Write($row.ProcessId); exit 0 }
+    # De bronlog bewijst dat alle probes voorbij zijn. Alleen de apart gebonden
+    # custodian mag naast de updater leven; onzekere topologie weigert.
+    $rows = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent" |
+        Where-Object { $_.ProcessId -ne $Custodian })
+    if ($rows.Count -gt 1) { throw 'ambiguous update child topology' }
+    if ($rows.Count -eq 1) { [Console]::Out.Write($rows[0].ProcessId); exit 0 }
     Start-Sleep -Milliseconds 100
 }
 exit 1
@@ -133,12 +138,20 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
             assert time.monotonic() < deadline and script.poll() is None, 'script never claimed'
             time.sleep(0.02)
         lock = _HeldLock(home)   # after the claim, before the delegate publication
+        # Geen interpreter- of argv-aanname: de native launcher kan een andere
+        # Python-image kiezen, en de suspended image heeft nog geen CIM-argv.
+        wait_until(lambda: script.poll() is not None or 'running: python ' in _log(home),
+                   timeout=max(0, deadline - time.monotonic()), what='update probes to complete')
+        assert script.poll() is None, 'handoff exited before creating its update child'
         child = subprocess.run([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
-                                '-Parent', str(script.pid), '-Seconds', '60'],
+                                '-Parent', str(script.pid), '-Seconds', '60', '-Custodian', _custodian(home, script.pid)],
                                capture_output=True, text=True, timeout=90, check=False)
         assert child.returncode == 0, 'the update child never appeared'
-        watch = _ProcessWatch(int(child.stdout))
+        child_pid = int(child.stdout)
+        watch = _ProcessWatch(child_pid)
         try:
+            from tests.hermes_cli.windows_process_observation import assert_initial_threads_suspended
+            assert_initial_threads_suspended(child_pid, expected_parent=script.pid)
             subprocess.run(['taskkill', '/F', '/PID', str(script.pid)], capture_output=True, check=True)
             script.wait(timeout=30)
             # The script's death closes the child's job; kill-on-close then terminates the child

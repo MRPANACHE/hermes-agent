@@ -108,6 +108,12 @@ class TestTerminatePidRoutingOnWindows:
 
     def test_force_taskkill_failure_raises_oserror(self, monkeypatch):
         from gateway import status
+        import psutil as process_api
+
+        probe = MagicMock()
+        probe.wait.side_effect = process_api.TimeoutExpired(2, pid=12345)
+        constructor = MagicMock(return_value=probe)
+        monkeypatch.setattr(process_api, "Process", constructor)
 
         def fake_run(args, **kwargs):
             result = MagicMock()
@@ -120,6 +126,8 @@ class TestTerminatePidRoutingOnWindows:
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123456)
         with pytest.raises(OSError, match="cannot be terminated"):
             status.terminate_pid(12345, force=True, expected_start_time=123456)
+        constructor.assert_called_once_with(12345)
+        probe.wait.assert_called_once_with(timeout=2)
 
     def test_graceful_on_windows_uses_os_kill_sigterm(self, monkeypatch):
         """Non-force path calls os.kill with SIGTERM (Windows has no SIGKILL).

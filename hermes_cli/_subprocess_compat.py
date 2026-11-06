@@ -855,11 +855,12 @@ def terminate_process_tree(pid: int, *, force: bool = False) -> None:
 
     import signal
 
-    signum = signal.SIGKILL if force else signal.SIGTERM
+    signum = getattr(signal, "SIGKILL", signal.SIGTERM) if force else signal.SIGTERM
     try:
         pgid = os.getpgid(int(pid))
-        if pgid == int(pid):
-            os.killpg(pgid, signum)
+        killpg = getattr(os, "killpg", None)
+        if pgid == int(pid) and killpg is not None:
+            killpg(pgid, signum)
             return
     except Exception:
         pass

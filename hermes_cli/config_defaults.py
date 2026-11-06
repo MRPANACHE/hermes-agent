@@ -1893,6 +1893,8 @@ DEFAULT_CONFIG = {
         "hard_run_limits": False,
         # Operator-approved overrides expire with their exact Amsterdam date.
         "daily_run_hours_overrides": {},
+        # Integer percent of the day budget one profile may use, e.g. {"otto": 25}.
+        "daily_run_share_per_assignee": {},
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
@@ -1903,9 +1905,6 @@ DEFAULT_CONFIG = {
         # Assignee when the orchestrator can't match one to an installed profile; "" = default
         # profile. A task never ends up with assignee=None.
         "default_assignee": "",
-        # Global cap: positive int = the HOST never has more than N tasks 'running' across all
-        # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
-        # MemTotal is unreadable (macOS/Windows) None means no cap.
         # Global concurrency cap (#33488): when set to a positive int, the HOST never has more than N tasks
         # in 'running' at once — counted across every active board and across both the ready and review
         # dispatch lanes (workers are OS processes sharing one machine's memory, so the cap bounds the

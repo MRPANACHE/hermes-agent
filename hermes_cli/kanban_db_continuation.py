@@ -119,7 +119,7 @@ def goal_budget_history(conn: sqlite3.Connection, task_id: str) -> dict:
             runtime += max(0, run.ended_at - run.started_at)
         budget = (run.metadata or {}).get("goal_budget", {})
         historical = re.fullmatch(r"Goal-mode worker exhausted its turn budget \((\d+)/(\d+)\) "
-                                  r"without completing the task\. Last judge verdict: .*", run.summary or "", re.S)
+                                  r"without completing the task\. Last judge verdict: .*", run.summary or "", re.DOTALL)
         turns += int(budget.get("turns_used", int(historical[1]) if historical else 0))
         for key, value in budget.get("usage", {}).items():
             usage[key] = usage.get(key, 0) + value
@@ -184,7 +184,7 @@ def goal_budget_binding(conn: sqlite3.Connection, task_id: str) -> dict:
         # Historical inference requires the native run's exact exhaustion
         # receipt AND its linked block event; goal_max_turns is not evidence.
         match = re.fullmatch(r"Goal-mode worker exhausted its turn budget \((\d+)/(\d+)\) "
-                             r"without completing the task\. Last judge verdict: .*", last.summary or "", re.S)
+                             r"without completing the task\. Last judge verdict: .*", last.summary or "", re.DOTALL)
         if (task.block_kind is not None or payload.get("kind") is not None or not match
                 or int(match[1]) < int(match[2]) or payload.get("reason") != last.summary):
             deny("budget_execution_proof_missing")
@@ -471,31 +471,26 @@ def _resolve_worker_config(
 ) -> Optional[WorkerCommandConfig]:
     """Resolve a named profile's fixed ``worker.command`` argv.
 
-    The profile config is read directly so malformed YAML cannot be swallowed
-    by the normal config loader and silently fall back to a native agent.  A
+    The selected config backend is read without the forgiving config loader, so
+    malformed YAML cannot silently fall back to a native agent. A
     command is deliberately profile-scoped and absolute-only: card content,
     task fields, and the task workspace never participate in executable
     selection.  The parsed list is passed literally; Hermes performs no shell,
     environment-variable, or backslash expansion.
     """
     from hermes_cli.kanban_db import WorkerCommandConfig, _IS_WINDOWS, _WORKER_COMPLETION_MODES
+    from hermes_cli.config_backend import ConfigBackendUnavailable, read_config_doc
     if not hermes_home:
         return None
     config_path = os.path.join(hermes_home, "config.yaml")
     try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            raw_text = config_file.read()
+        parsed = read_config_doc(config_path)
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, ConfigBackendUnavailable) as exc:
         raise RuntimeError(
             f"worker.command: profile config {config_path!r} is unreadable: {exc}"
         ) from exc
-
-    from utils import fast_safe_load
-
-    try:
-        parsed = fast_safe_load(raw_text)
     except Exception as exc:
         raise RuntimeError(
             f"worker.command: {config_path!r} does not parse as YAML; refusing "

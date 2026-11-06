@@ -437,8 +437,8 @@ def terminate_pid(
         os.kill(pid, signal.SIGTERM)
         return
     if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
-        raise OSError(details or f"taskkill failed for PID {pid}")
+        from gateway.status_taskkill import require_exit_after_taskkill_error
+        require_exit_after_taskkill_error(pid, result)
 
 
 def _start_times_agree(current: Any, *recorded: Any) -> bool:

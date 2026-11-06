@@ -1067,6 +1067,8 @@ class _DeadWorker:
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
+        if self.event_payload.get("infrastructure"):
+            return "interrupted"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1184,7 +1186,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import apply_attempt_note, end_lost_run, managed_run_exit_code, owner_reclaim_blocked
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1217,12 +1219,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             )
             if cur.rowcount != 1:
                 continue
-            run_id = _kb._end_run(
-                conn, row["id"],
-                outcome=dead.run_outcome, status=dead.run_outcome,
-                error=dead.error_text,
-                metadata=dict(dead.event_payload),
-            )
+            run_id = end_lost_run(conn, row["id"], dead)
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
@@ -1263,6 +1260,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
+    crash_details = [item for item in crash_details if not item[3].event_payload.get("infrastructure")]
     for _, _, _, dead in crash_details:
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
@@ -1609,7 +1607,7 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
+    if latest_run is not None and latest_run["outcome"] in {"spawn_failed", "interrupted"}:
         if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
