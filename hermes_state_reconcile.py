@@ -234,6 +234,7 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
                                  isolation_level=None)) as conn:
         budget.arm(conn)
         try:
+            # Connection setup also executes SQL while gateway.lock is held.
             _reapply_durability_barriers(conn)
             budget.check()
             conn.execute('BEGIN IMMEDIATE')

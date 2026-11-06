@@ -27,11 +27,15 @@ still consumes the daily budget. Source-bound native incident/daily-work
 exceptions and `limit_hit` event evidence retain their existing daily-budget
 semantics.
 
-`kanban.daily_run_share_per_assignee` optionally maps a profile name to an integer
-percentage (1–99) of that daily fleet budget. New runs for that assignee stop at
-the share without interrupting existing work; other assignees retain their own
-admission. Invalid entries do not remove the fleet limit. The same source-bound
-incident/daily-work exception and `limit_hit` evidence rules apply.
+`kanban.daily_run_share_per_assignee` optionally maps assignee/profile names to
+integer percentages from 1 through 99 of that same daily budget, including a
+`kanban.daily_run_hours_overrides` entry for the Amsterdam date. For example,
+`{otto: 25, mara: 15}` reserves smaller admission shares for those profiles.
+Shared-board worker runtime and completed turns in the shared session ledger
+both count; a help turn belongs to its executing profile, not its requesting
+agent. Invalid or missing share entries add no profile-specific limit, but do
+not disable the fleet daily limit. A reached limit refuses new admission without
+interrupting already running work.
 
 ## Directory Structure
 

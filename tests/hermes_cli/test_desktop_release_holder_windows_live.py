@@ -108,7 +108,8 @@ def test_consented_retry_closes_exactly_the_holder_and_promotes(swap_fixture, ca
     assert promoted == live_root / "Hermes.exe"
     assert promoted.read_text(encoding="utf-8") == "new"
     assert helper.wait(10) is not None
-    assert not [p.pid for p in tree if p.is_running()]
+    _, alive = psutil.wait_procs(tree, timeout=10)
+    assert not alive, alive
     assert not consent.exists(), "a consent covers one retry only"
     assert "Closed with your consent: " in capsys.readouterr().out
 
@@ -172,7 +173,8 @@ def test_a_program_in_a_sibling_unpacked_folder_is_neither_named_nor_closed(swap
 
         assert error == "" and promoted == live_root / "Hermes.exe"
         assert helper.wait(10) is not None
-        assert not [p.pid for p in tree if p.is_running()]
+        _, alive = psutil.wait_procs(tree, timeout=10)
+        assert not alive, alive
         assert all(p.is_running() for p in sibling_tree), "closed a program that never held the renamed folder"
         assert f"pid {sibling.pid}" not in capsys.readouterr().out
     finally:

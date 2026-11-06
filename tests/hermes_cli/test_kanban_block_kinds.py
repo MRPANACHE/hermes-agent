@@ -9,9 +9,9 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
   never enter the human ``blocked`` bucket a cron would keep unblocking —
   unless no parent is open, in which case the wait can never be satisfied
   and the block is recorded as ``needs_input`` (sticky, loop-counted).
-* ``needs_input`` / ``capability`` remain visible in ``blocked`` even after
-  repeated waits; the loop event retains their recurrence count. Generic or
-  transient recurrence reaches ``triage`` at ``BLOCK_RECURRENCE_LIMIT``.
+* ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
+  each same-cause re-block after an unblock increments ``block_recurrences``,
+  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -113,13 +113,14 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_dependency_block_with_terminal_parents_parks_then_escalates(
+def test_dependency_block_with_terminal_parents_retains_needs_input(
     kanban_home: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A ``dependency`` block whose parents are all terminal can never be
     satisfied by ``recompute_ready``: it must park in ``blocked`` as
     ``needs_input`` (no ``dependency_wait``, no re-promotion), say so on the
-    CLI, and record the repeated human wait without auto-triaging it."""
+    CLI, and retain that human-input route after a repeated block. Generic and
+    transient loop escalation must not hide an unanswered input request."""
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
         with kb.write_txn(conn):
@@ -143,10 +144,12 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         # A cron/human unblocks; the worker re-declares the same impossible wait.
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
-        assert kb.block_task(conn, child, reason="waiting on upstream", kind="dependency")
-        assert kb.get_task(conn, child).status == "blocked"  # Human input stays visible, never auto-triaged.
+        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
+        parked = kb.get_task(conn, child)
+        assert (parked.status, parked.block_kind) == ("blocked", "needs_input")
         loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
+        assert loop["target_status"] == "blocked"
 
 
 def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(

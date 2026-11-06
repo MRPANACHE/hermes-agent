@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_run_limits import daily_usage, supervisor_decisions
+from hermes_cli.kanban_db_run_limits import daily_usage, supervisor_decisions, task_series
 from tools import kanban_tools as kt
 from tests.hermes_cli import test_kanban_hard_run_limits as limit_fixtures
 from tests.hermes_cli.test_kanban_hard_run_limits import attempt, card, disposition, hits
@@ -100,13 +100,11 @@ def test_unreadable_registered_accounting_does_not_grant_new_run(board, tmp_path
     assert kb.get_task(board, tid).status == "ready"
 
 
-def test_native_coordinator_card_gets_mara_one_extra_series(board):
-    tid = kb.create_task(board, title="Native coordinator task", assignee="otto",
+def test_historical_limit_decision_preserves_blocked_lifecycle(board):
+    tid = kb.create_task(board, title="Retained historical coordinator task", assignee="otto",
                          created_by="coordinator", body="No MCP ingress metadata.")
     for _ in range(5):
         attempt(board, tid)
-    # A retained historical limit event is assessable without enforcing that retired cap.
-    from hermes_cli.kanban_db_run_limits import task_series
     with kb.write_txn(board):
         kb._append_event(board, tid, "limit_hit", {
             "limit_key": "task_runs_without_outcome", "enforced": True,
@@ -116,10 +114,9 @@ def test_native_coordinator_card_gets_mara_one_extra_series(board):
     event_id = hits(board, tid)[0][0].id
     assert kb.block_task(board, tid, reason="Retained historical limit", kind="needs_input")
     decision = disposition(board, tid, "new_series", limit_event_id=event_id)
-    response = native_decision(board, tid, decision)
-    assert response["ok"] is True
+    assert native_decision(board, tid, decision)["ok"] is True
     assert list(supervisor_decisions(board, tid))[-1][1] == decision
-    assert kb.get_task(board, tid).status == "blocked"  # Judgment is not a free unblock.
+    assert kb.get_task(board, tid).status == "blocked"
     assert kb.unblock_task(board, tid)
     for _ in range(5):
         attempt(board, tid)
@@ -127,6 +124,21 @@ def test_native_coordinator_card_gets_mara_one_extra_series(board):
     again = disposition(board, tid, "new_series", limit_event_id=event_id)
     assert "binding_invalid" in native_decision(board, tid, again)["error"]
     assert len(list(supervisor_decisions(board, tid))) == 1
+
+
+def test_native_coordinator_card_needs_no_extra_series_decision(board):
+    tid = kb.create_task(board, title="Native coordinator task", assignee="otto",
+                         created_by="coordinator", body="No MCP ingress metadata.")
+    for _ in range(12):
+        attempt(board, tid)
+    assert hits(board, tid) == []
+    # The retired card-attempt stop cannot be recreated by requesting a reset
+    # against an event that is not an actual native limit hit.
+    decision = disposition(board, tid, "new_series", limit_event_id=kb.list_events(board, tid)[0].id)
+    assert "binding_invalid" in native_decision(board, tid, decision)["error"]
+    assert not list(supervisor_decisions(board, tid))
+    assert kb.get_task(board, tid).status == "ready"
+    assert kb.claim_task(board, tid) is not None
 
 
 @pytest.mark.parametrize("work_class,assignee", [("incident_work", "otto"), ("noor_day_work", "noor")])
@@ -169,15 +181,20 @@ def test_native_decision_rejects_cross_task_and_stale_execution_prefix_atomicall
 
 
 def test_native_measured_closure_resets_only_the_measured_series(board):
-    tid = card(board)
-    for _ in range(5):
-        attempt(board, tid)
-    assert kb.claim_task(board, tid) is not None
-    assert kb.block_task(board, tid, reason="Awaiting measured result", kind="needs_input")
+    tid, other = card(board), card(board)
+    runs = [attempt(board, tid, start=now() - 600, end=now() - 500) for _ in range(5)]
+    other_run = attempt(board, other, start=now() - 300, end=now() - 200)
+    assert hits(board, tid) == []
+    assert task_series(board, tid)["run_ids"] == runs
+    usage_before = daily_usage(board, now())
+    assert usage_before["runtime_seconds"] == 600
     choice = disposition(board, tid, "measured_closure", case_ref="oos://cases/fixture",
                          measurement_ref="oos://measurements/fixture")
     assert native_decision(board, tid, choice)["ok"] is True
-    assert kb.unblock_task(board, tid)
+    assert task_series(board, tid)["run_ids"] == []
+    assert task_series(board, other)["run_ids"] == [other_run]
+    assert daily_usage(board, now()) == usage_before
+    assert kb.get_task(board, tid).status == "ready"  # Measurement is not a lifecycle mutation.
     assert kb.claim_task(board, tid) is not None
 
 
