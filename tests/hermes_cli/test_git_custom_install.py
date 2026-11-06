@@ -17,7 +17,7 @@ def test_git_core_is_found_under_resolved_custom_install(tmp_path, layout):
     shim.touch()
     real.touch()
     with patch("hermes_platform.resolver.locate_command", return_value=SimpleNamespace(command=(str(shim),))), \
-            patch("hermes_cli.update_cmd_git._probe_fork_bomb", return_value=False) as probe:
+            patch("hermes_cli.update_cmd_git._probe_fork_bomb", side_effect=lambda command: command != [str(real)]) as probe:
         assert _locate_real_git() == real
         assert [str(real)] in [call.args[0] for call in probe.call_args_list]
     with patch("hermes_platform.resolver.locate_command", return_value=SimpleNamespace(command=(str(shim),))), \
