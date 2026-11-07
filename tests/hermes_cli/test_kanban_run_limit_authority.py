@@ -40,7 +40,7 @@ def test_title_profile_or_arbitrary_unblock_is_not_exception_authority(board):
     assert hits(board, tid)[0][1]["action"] == "blocked_new_run"
 
 
-def test_classification_does_not_reintroduce_retired_card_attempt_cap(board):
+def test_retired_attempt_cap_does_not_stop_classified_work(board):
     tid = card(board)
     deliver(board, tid, disposition(board, tid, "classification", work_class="incident_work"))
     for _ in range(5):
@@ -53,12 +53,12 @@ def test_measured_linked_closure_resets_only_assessed_execution_prefix(board):
     tid = card(board)
     for _ in range(5):
         attempt(board, tid)
-    series_before = task_series(board, tid)["run_ids"]
-    assert len(series_before) == 5
+    assert len(task_series(board, tid)["run_ids"]) == 5
     d = disposition(board, tid, "measured_closure", case_ref="oos://cases/fixture", measurement_ref="oos://measurements/fixture")
     assert validate_supervisor_decision(board, tid, d) == d
     deliver(board, tid, d)
     assert task_series(board, tid)["run_ids"] == []
+    assert kb.get_task(board, tid).status == "ready"
     attempt(board, tid)
     assert len(task_series(board, tid)["run_ids"]) == 1
 

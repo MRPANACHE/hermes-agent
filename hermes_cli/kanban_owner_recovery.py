@@ -227,6 +227,12 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     dead.event_payload["attempt_note"] = note
     if lost:
         dead.event_payload["worker_lost"] = lost
+        transport = _latest_run_event(conn, task_id, "owner_transport_lost")
+        if (transport.get("reason") == "owner_unreachable"
+                and transport.get("claim_lock") == lost.get("claim_lock")
+                and transport.get("run_id") == lost.get("run_id")):
+            dead.event_payload["infrastructure"] = True
+
         if dead.protocol_violation:
             from hermes_cli.kanban_db_dispatch import _PROTOCOL_VIOLATION_ERROR
             dead.protocol_violation = False
@@ -240,6 +246,29 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
     head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
     dead.error_text = f"{head} [{note}]{sep}{output}"
+    if dead.event_payload.get("infrastructure"):
+        dead.event_kind = "interrupted"
+
+
+def worker_loss_time(conn, task_id):
+    """Alleen een claimgebonden verliesbron begrenst de werkelijk bestede tijd."""
+    row = conn.execute(
+        "SELECT MIN(e.created_at) FROM task_events e JOIN task_runs r ON r.id=e.run_id "
+        "JOIN tasks t ON t.current_run_id=r.id WHERE t.id=? AND e.task_id=t.id "
+        "AND e.kind='worker_lost' AND e.created_at>=r.started_at "
+        "AND json_extract(e.payload,'$.claim_lock')=r.claim_lock", (task_id,)).fetchone()
+    return row[0] if row else None
+
+
+def end_lost_run(conn, task_id, dead):
+    """Sluit veilig vrijgegeven werk op het oorspronkelijke bronmoment van verlies."""
+    from hermes_cli import kanban_db as kb
+    lost_at = worker_loss_time(conn, task_id)
+    run_id = kb._end_run(conn, task_id, outcome=dead.run_outcome, status=dead.run_outcome,
+                         error=dead.error_text, metadata=dict(dead.event_payload))
+    if lost_at is not None:
+        conn.execute("UPDATE task_runs SET ended_at=MIN(ended_at, ?) WHERE id=?", (lost_at, run_id))
+    return run_id
 
 
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:

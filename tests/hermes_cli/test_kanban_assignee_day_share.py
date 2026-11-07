@@ -5,10 +5,9 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli.config import atomic_config_replace as atomic_config_write
 from hermes_cli.kanban_db_run_limits import day_window, enforce_run_limits
-from tests.hermes_cli import test_kanban_hard_run_limits as limit_fixtures
-from tests.hermes_cli.test_kanban_hard_run_limits import hits
+from tests.hermes_cli import test_kanban_hard_run_limits as limits
 
-board = limit_fixtures.board
+board = limits.board
 
 
 def configure(shares):
@@ -39,7 +38,7 @@ def test_capped_profile_waits_while_others_still_run(board):
     noor = kb.create_task(board, title='business', assignee='noor')
     assert enforce_run_limits(board, otto, 'ready', now) is False
     assert enforce_run_limits(board, noor, 'ready', now) is True
-    hit = hits(board, otto)[0][1]
+    hit = limits.hits(board, otto)[0][1]
     assert (hit['limit_key'], hit['assignee'], hit['threshold'], hit['action']) == (
         'assignee_day_share', 'otto', 5.0, 'blocked_new_run')
     assert kb.get_task(board, otto).status == 'ready'

@@ -198,5 +198,3 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
-
