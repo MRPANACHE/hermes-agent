@@ -11,6 +11,7 @@ walk and is hashed to ``gwk_<sha256[:24]>`` (it embeds platform/chat/user identi
 
 import hashlib
 import logging
+import os
 from typing import Any, Optional
 
 from utils import base_url_hostname
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 _MEMO_ATTR = "_prompt_cache_scope_memo"
 _DECLARED_SCOPE_PREFIX = "gwk_"
+# A host that starts one process per unit of a larger job (a batch runner) declares the scope its
+# parallel processes share, so their identical instructions route to one warm bucket.
+HOST_CACHE_SCOPE_ENV = "HERMES_PROMPT_CACHE_SCOPE"
 
 
 def _lineage_root(session_id: str, session_db: Any) -> Optional[str]:
@@ -136,11 +140,14 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
 
 def resolve_prompt_cache_scope(agent: Any) -> str:
     """Rotation-stable cache-scope id: the inherited parent scope of a same-model cache-parity
-    fork, else the declared scope, else the compression-lineage root of ``agent.session_id``
-    (the physical id without ancestry/DB). Memoized on the agent."""
+    fork, else the host-declared process scope, else the declared scope, else the compression-lineage
+    root of ``agent.session_id`` (the physical id without ancestry/DB). Memoized on the agent."""
     inherited = getattr(agent, "_inherited_cache_scope", None)
     if isinstance(inherited, str) and inherited:
         return _apply_fork_tag(agent, inherited)
+    host_scope = _host_declared_scope(agent)
+    if host_scope:
+        return host_scope
     sid = str(getattr(agent, "session_id", None) or "")
     if not sid:
         return ""
@@ -161,6 +168,22 @@ def resolve_prompt_cache_scope(agent: Any) -> str:
         except Exception:
             pass  # frozen/slotted doubles: resolution works, just unmemoized
     return _apply_fork_tag(agent, scope)
+
+
+def _host_declared_scope(agent: Any) -> Optional[str]:
+    """``HERMES_PROMPT_CACHE_SCOPE`` as set by the launching host, or None.
+
+    It changes only the cache routing key, never session identity, affinity or compression. Ignored on
+    slot-keyed routes, where parallel streams under one key would evict each other's slot.
+    """
+    scope = os.environ.get(HOST_CACHE_SCOPE_ENV, "").strip()
+    if not scope:
+        return None
+    if is_slot_keyed_cache_route(
+        getattr(agent, "provider", ""), getattr(agent, "model", ""), getattr(agent, "base_url", ""),
+    ):
+        return None
+    return scope
 
 
 # ``<scope>::<tag>`` — double colon so gateway session keys that already contain single
