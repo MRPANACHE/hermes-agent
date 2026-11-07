@@ -35,7 +35,7 @@ def test_restored_trees_lose_their_vitest_history_before_any_check(tmp_path):
     steps = _steps()
     names = [step.get("name") for step in steps]
     drop = names.index("Drop vitest run history from the restored tree")
-    assert names.index("Restore node_modules") < drop < names.index("Run all workspace checks")
+    assert names.index("Restore node_modules") < drop < names.index("Run the native workspace check")
 
     trees = [_concrete(pattern) for pattern in _cached_trees(steps)]
     for tree in trees:
