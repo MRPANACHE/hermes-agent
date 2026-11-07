@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import time
 
@@ -111,3 +112,15 @@ def test_verify_failure_after_a_committed_update_is_ok_with_warnings(tmp_path: P
     assert 'previous version' not in result['message']
     # The fleet the Desktop stopped is still brought back.
     assert argv[-1] == ['gateway', 'start', '--all'], argv
+
+
+_TIMED_CHECKOUT_HOLDER = """
+import msvcrt, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o644)
+os.lseek(fd, 1 << 20, os.SEEK_SET)
+msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # hermes_cli/update_lock.py::_try_lock's byte
+Path = __import__('pathlib').Path
+Path(sys.argv[2]).write_text('ready')
+while not Path(sys.argv[3]).exists():
+    time.sleep(0.05)
+"""

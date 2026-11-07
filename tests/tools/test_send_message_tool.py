@@ -1523,6 +1523,18 @@ class _FakePlatform:
         self.value = value
 
 
+def _existing_buzz_media(tmp_path):
+    paths = [tmp_path / name for name in ("one.jpg", "two.jpg")]
+    for path in paths:
+        path.write_bytes(b"disposable image fixture")
+    return [(str(path), False) for path in paths]
+
+
+class _NativeBuzzAdapter(SimpleNamespace):
+    async def send_image_file(self, *args, **kwargs):
+        return await self.image_delivery(*args, **kwargs)
+
+
 class TestSendViaAdapterStandaloneFallback:
     """Coverage for the out-of-process plugin-platform send path.
 
@@ -1613,13 +1625,13 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
 
     @pytest.mark.asyncio
-    async def test_buzz_media_uses_current_profile_and_native_file_receipts(self, monkeypatch):
+    async def test_buzz_media_uses_current_profile_and_native_file_receipts(self, monkeypatch, tmp_path):
         from tools.send_message_tool import _send_via_adapter
 
         platform = Platform("buzz")
-        adapter = SimpleNamespace(
+        adapter = _NativeBuzzAdapter(
             send=AsyncMock(),
-            send_image_file=AsyncMock(side_effect=[
+            image_delivery=AsyncMock(side_effect=[
                 SimpleNamespace(success=True, message_id="event-one", error=None),
                 SimpleNamespace(success=True, message_id="event-two", error=None),
             ]),
@@ -1645,7 +1657,7 @@ class TestSendViaAdapterStandaloneFallback:
         result = await _send_via_adapter(
             platform, SimpleNamespace(extra={}), "channel", "Caption",
             thread_id="reply-event",
-            media_files=[("/safe/one.jpg", False), ("/safe/two.jpg", False)],
+            media_files=_existing_buzz_media(tmp_path),
         )
 
         assert result == {
@@ -1654,20 +1666,20 @@ class TestSendViaAdapterStandaloneFallback:
             "media_delivered": True,
         }
         assert resolved == [(platform, "emma")]
-        assert [call.kwargs["caption"] for call in adapter.send_image_file.await_args_list] == [
+        assert [call.kwargs["caption"] for call in adapter.image_delivery.await_args_list] == [
             "Caption", None,
         ]
         assert all(call.kwargs["reply_to"] == "reply-event"
-                   for call in adapter.send_image_file.await_args_list)
+                   for call in adapter.image_delivery.await_args_list)
         adapter.send.assert_not_awaited()
         runner.adapters[platform].send.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_buzz_media_failure_never_reports_success(self, monkeypatch):
+    async def test_buzz_media_failure_never_reports_success(self, monkeypatch, tmp_path):
         from tools.send_message_tool import _send_via_adapter
 
         platform = Platform("buzz")
-        adapter = SimpleNamespace(send_image_file=AsyncMock(side_effect=[
+        adapter = _NativeBuzzAdapter(image_delivery=AsyncMock(side_effect=[
             SimpleNamespace(success=True, message_id="event-one", error=None),
             SimpleNamespace(success=False, message_id=None, error="upload rejected"),
         ]))
@@ -1682,19 +1694,19 @@ class TestSendViaAdapterStandaloneFallback:
 
         result = await _send_via_adapter(
             platform, SimpleNamespace(extra={}), "channel", "Caption",
-            media_files=[("/safe/one.jpg", False), ("/safe/two.jpg", False)],
+            media_files=_existing_buzz_media(tmp_path),
         )
         assert result == {
-            "error": "Buzz media send failed: upload rejected",
+            "error": "Buzz media send failed after 1/2 files: upload rejected",
             "sent_message_ids": ["event-one"],
         }
 
     @pytest.mark.asyncio
-    async def test_buzz_later_media_exception_preserves_prior_event_id(self, monkeypatch):
+    async def test_buzz_later_media_exception_preserves_prior_event_id(self, monkeypatch, tmp_path):
         from tools.send_message_tool import _send_via_adapter
 
         platform = Platform("buzz")
-        adapter = SimpleNamespace(send_image_file=AsyncMock(side_effect=[
+        adapter = _NativeBuzzAdapter(image_delivery=AsyncMock(side_effect=[
             SimpleNamespace(success=True, message_id="event-one", error=None),
             RuntimeError("upload failed"),
         ]))
@@ -1709,10 +1721,10 @@ class TestSendViaAdapterStandaloneFallback:
 
         result = await _send_via_adapter(
             platform, SimpleNamespace(extra={}), "channel", "Caption",
-            media_files=[("/safe/one.jpg", False), ("/safe/two.jpg", False)],
+            media_files=_existing_buzz_media(tmp_path),
         )
         assert result == {
-            "error": "Buzz media send failed: upload failed",
+            "error": "Buzz media send failed after 1/2 files: upload failed",
             "sent_message_ids": ["event-one"],
         }
 

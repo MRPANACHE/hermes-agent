@@ -471,24 +471,23 @@ def _resolve_worker_config(
 ) -> Optional[WorkerCommandConfig]:
     """Resolve a named profile's fixed ``worker.command`` argv.
 
-    The profile document is read through the backend without the forgiving
-    defaults loader: malformed YAML must never silently select a native agent. A
+    The selected config backend is read without the forgiving config loader, so
+    malformed YAML cannot silently fall back to a native agent. A
     command is deliberately profile-scoped and absolute-only: card content,
     task fields, and the task workspace never participate in executable
     selection.  The parsed list is passed literally; Hermes performs no shell,
     environment-variable, or backslash expansion.
     """
     from hermes_cli.kanban_db import WorkerCommandConfig, _IS_WINDOWS, _WORKER_COMPLETION_MODES
+    from hermes_cli.config_backend import ConfigBackendUnavailable, read_config_doc
     if not hermes_home:
         return None
     config_path = os.path.join(hermes_home, "config.yaml")
-    from hermes_cli.config_backend import read_config_doc
-
     try:
         parsed = read_config_doc(config_path)
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, ConfigBackendUnavailable) as exc:
         raise RuntimeError(
             f"worker.command: profile config {config_path!r} is unreadable: {exc}"
         ) from exc

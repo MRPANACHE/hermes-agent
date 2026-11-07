@@ -1,4 +1,4 @@
-// Run every workspace check at the same time and report all failures.
+// Run every workspace check and report all failures.
 //
 // The unit of work is a CHECK, and not a workspace. A package that declares
 // `check:*` sub-scripts gives one unit for each sub-script. A package with a
@@ -15,9 +15,12 @@
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
 // `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--partition I/N` divides checks and the desktop UI's native Vitest shards.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
@@ -45,11 +48,24 @@ function discoverUnits() {
   return units
 }
 
+// De UI is één check maar duurder dan de overige negen samen op kleine runners.
+// Native Vitest verdeelt zijn tests; de overige ontdekte checks blijven exact één keer.
+export function partitionUnits(units, partition) {
+  if (!partition) return units
+  const match = /^([1-9]\d*)\/([1-9]\d*)$/.exec(partition)
+  if (!match || Number(match[1]) > Number(match[2])) throw new Error('Invalid check partition')
+  const [, index, count] = match.map(Number)
+  const expanded = units.flatMap(unit => unit.pkg === 'apps/desktop' && unit.script === 'check:test:ui'
+    ? Array.from({ length: count }, (_, i) => ({ ...unit, args: ['--', '--', `--shard=${i + 1}/${count}`, '--maxWorkers=2'] }))
+    : [unit])
+  return expanded.filter((_, i) => i % count === index - 1)
+}
+
 /** @param {{pkg: string, script: string}} unit */
 function runUnit(unit) {
   return new Promise((resolve) => {
     const started = Date.now()
-    const child = spawn(NPM, ['run', '--prefix', unit.pkg, unit.script], {
+    const child = spawn(NPM, ['run', '--prefix', unit.pkg, unit.script, ...(unit.args || [])], {
       // Buffer, and do not inherit. Children that share one stdout
       // interleave their lines, and a failure is then hard to read.
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -76,7 +92,8 @@ function runUnit(unit) {
 
 async function main() {
   const argv = process.argv.slice(2)
-  const units = discoverUnits()
+  const partitionIdx = argv.indexOf('--partition')
+  const units = partitionUnits(discoverUnits(), partitionIdx < 0 ? null : argv[partitionIdx + 1] || 'invalid')
 
   if (units.length === 0) {
     console.error(
@@ -86,7 +103,7 @@ async function main() {
   }
 
   if (argv.includes('--list')) {
-    for (const u of units) console.log(`${u.pkg} :: ${u.script}`)
+    for (const u of units) console.log(`${u.pkg} :: ${u.script} ${(u.args || []).join(' ')}`.trimEnd())
     return
   }
 
@@ -97,7 +114,7 @@ async function main() {
   )
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
-  for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)
+  for (const u of units) console.log(`  ${u.pkg} :: ${u.script} ${(u.args || []).join(' ')}`.trimEnd())
   console.log('')
 
   const queue = [...units]
@@ -140,4 +157,4 @@ async function main() {
   console.log(`\nall ${results.length} checks passed`)
 }
 
-await main()
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main()

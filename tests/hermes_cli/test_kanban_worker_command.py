@@ -73,17 +73,23 @@ def spawn_env(monkeypatch, tmp_path):
 
 
 def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
-    spawn_env, monkeypatch
+    spawn_env, monkeypatch, tmp_path
 ):
     root, workspace, captured = spawn_env
     monkeypatch.setenv("WORKER_COMMAND_SECRET", "host-secret-must-not-leak")
     _write_profile(
         root,
         "engine",
-        f"worker:\n  command:\n    - {sys.executable}\n"
+        "worker:\n  command:\n    - /home/david/bin/codex-sub\n"
         "    - luna\n    - --\n    - fixed instruction; read HERMES_KANBAN_TASK_ID\n",
     )
 
+    executable = tmp_path / "codex-sub"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (root / "profiles" / "engine" / "config.yaml").write_text(
+        f"worker:\n  command:\n    - {executable}\n    - luna\n    - --\n    - fixed instruction; read HERMES_KANBAN_TASK_ID\n", encoding="utf-8"
+    )
     task = _make_task()
     pid = kb._default_spawn(task, str(workspace), board="builds")
 
@@ -91,7 +97,7 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     assert captured["cmd"] == SUPERVISOR
     assert captured["kwargs"].get("shell", False) is False
     assert json.loads(captured["env"]["HERMES_KANBAN_WORKER_COMMAND"]) == [
-        sys.executable,
+        str(executable),
         "luna",
         "--",
         "fixed instruction; read HERMES_KANBAN_TASK_ID",
@@ -172,6 +178,17 @@ def test_profile_command_config_accepts_utf8_bom(spawn_env):
     kb._default_spawn(_make_task(), str(workspace))
 
     assert captured["env"]["HERMES_KANBAN_WORKER_COMMAND"] == '["/bin/echo"]'
+
+
+def test_profile_command_selected_backend_failure_is_not_native_fallback(tmp_path, monkeypatch):
+    from hermes_cli import config_backend
+
+    def unavailable(_path):
+        raise config_backend.ConfigBackendUnavailable("fixture backend unavailable")
+
+    monkeypatch.setattr(config_backend, "read_config_doc", unavailable)
+    with pytest.raises(RuntimeError, match="worker.command.*unreadable"):
+        kb._resolve_worker_config(str(tmp_path))
 
 
 @pytest.mark.parametrize("value", ["unknown", "", "7", "null"])
@@ -765,4 +782,4 @@ def test_posix_termination_falls_back_when_killpg_is_unavailable(monkeypatch):
 
     compat.terminate_process_tree(1234, force=True)
 
-    assert sent == [(1234, signal.SIGKILL)]
+    assert sent == [(1234, getattr(signal, "SIGKILL", signal.SIGTERM))]

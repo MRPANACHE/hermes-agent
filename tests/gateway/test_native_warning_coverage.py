@@ -155,7 +155,7 @@ async def test_buzz_missing_upload_fallback_and_real_upload_receipts(policy, tmp
 
     adapter._run_message_send = record
     result = await adapter.send_image_file("chat", str(tmp_path / "missing.png"), caption="requested caption")
-    assert frames == []
+    assert not frames  # A missing local attachment must never become a text/path delivery.
     assert not result.success and result.error == "Image attachment is unavailable"
     path = tmp_path / "image.png"
     path.write_bytes(b"fixture")

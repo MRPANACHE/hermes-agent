@@ -4,13 +4,14 @@ import os
 import psutil
 
 
-def assert_initial_threads_suspended(pid):
+def assert_initial_threads_suspended(pid, *, expected_parent=None):
     """Read the prior kernel suspend count and restore it without running a thread."""
     import ctypes
     from ctypes import wintypes
 
     process = psutil.Process(pid)
-    assert process.ppid() == os.getpid(), 'not this test owner\'s child'
+    parent = os.getpid() if expected_parent is None else expected_parent
+    assert process.ppid() == parent, f'expected parent {parent}, got {process.ppid()}'
     threads = process.threads()
     assert threads, 'the newly created child has no initial thread'
     api = ctypes.WinDLL('kernel32', use_last_error=True)

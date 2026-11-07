@@ -94,6 +94,7 @@ async def run(params, board_db):
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
+                await asyncio.to_thread(_record_owner_transport_loss, board_db, params)
                 raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
         else:
             return _exit_code(receipt, params, board_db)
@@ -101,6 +102,19 @@ async def run(params, board_db):
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
+
+
+def _record_owner_transport_loss(board_db, params):
+    """Bewaar de transportoorzaak vóór exit de gebonden interpreter beëindigt."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing(Path(board_db)) as conn, kb.write_txn(conn):
+        row = conn.execute('SELECT current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?',
+                           (params['task_id'],)).fetchone()
+        if row and tuple(row) == (params['run_id'], params['claim_lock'], os.getpid()):
+            kb._append_event(conn, params['task_id'], 'owner_transport_lost',
+                             {'reason': 'owner_unreachable', 'claim_lock': params['claim_lock'],
+                              'run_id': params['run_id']}, run_id=params['run_id'])
 
 
 def _restartable(exc):

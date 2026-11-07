@@ -100,6 +100,32 @@ def test_unreadable_registered_accounting_does_not_grant_new_run(board, tmp_path
     assert kb.get_task(board, tid).status == "ready"
 
 
+def test_historical_limit_decision_preserves_blocked_lifecycle(board):
+    tid = kb.create_task(board, title="Retained historical coordinator task", assignee="otto",
+                         created_by="coordinator", body="No MCP ingress metadata.")
+    for _ in range(5):
+        attempt(board, tid)
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "limit_hit", {
+            "limit_key": "task_runs_without_outcome", "enforced": True,
+            "action": "blocked_new_run", "run_ids": task_series(board, tid)["run_ids"],
+            "outcome_event_id": task_series(board, tid)["outcome_event_id"],
+        })
+    event_id = hits(board, tid)[0][0].id
+    assert kb.block_task(board, tid, reason="Retained historical limit", kind="needs_input")
+    decision = disposition(board, tid, "new_series", limit_event_id=event_id)
+    assert native_decision(board, tid, decision)["ok"] is True
+    assert list(supervisor_decisions(board, tid))[-1][1] == decision
+    assert kb.get_task(board, tid).status == "blocked"
+    assert kb.unblock_task(board, tid)
+    for _ in range(5):
+        attempt(board, tid)
+    assert kb.claim_task(board, tid) is not None
+    again = disposition(board, tid, "new_series", limit_event_id=event_id)
+    assert "binding_invalid" in native_decision(board, tid, again)["error"]
+    assert len(list(supervisor_decisions(board, tid))) == 1
+
+
 def test_native_coordinator_card_needs_no_extra_series_decision(board):
     tid = kb.create_task(board, title="Native coordinator task", assignee="otto",
                          created_by="coordinator", body="No MCP ingress metadata.")

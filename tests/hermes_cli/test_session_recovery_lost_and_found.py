@@ -236,7 +236,7 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     message = str(excinfo.value)
     assert "sessions" in message and "messages" in message
     assert "sqlite3" in message
-    assert ".recover" in message
+    assert "page-level salvage" in message and "sqlite.org" in message
     assert not output.exists()
 
 

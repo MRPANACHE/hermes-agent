@@ -30,7 +30,10 @@ def execution_runs(conn, *, task_id=None, after_event_id=0, work_only=False):
                   "AND w.run_id=r.id AND w.kind='scheduled' "
                   "AND json_extract(w.payload,'$.wait_only')=1)")
     return conn.execute(
-        "SELECT r.*, MIN(e.id) AS spawn_event_id FROM task_runs r "
+        "SELECT r.*, MIN(e.id) AS spawn_event_id, "
+        "(SELECT MIN(w.created_at) FROM task_events w WHERE w.task_id=r.task_id AND w.run_id=r.id "
+        "AND w.kind='worker_lost' AND w.created_at>=r.started_at "
+        "AND json_extract(w.payload,'$.claim_lock')=r.claim_lock) AS worker_lost_at FROM task_runs r "
         "JOIN task_events e ON e.task_id=r.task_id AND e.run_id=r.id AND e.kind='spawned' "
         "WHERE e.id>? " + where + " GROUP BY r.id ORDER BY r.id",
         (after_event_id, task_id) if task_id is not None else (after_event_id,),
@@ -42,7 +45,8 @@ def _runtime_seconds(conn, now, window, assignee=None):
     if assignee is not None:
         own = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE assignee=?", (assignee,))}
         rows = [row for row in rows if row["task_id"] in own]
-    return sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now)
+    return sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now,
+                         row["worker_lost_at"] if row["worker_lost_at"] is not None else now)
                    - max(window["start"], row["started_at"])) for row in rows)
 
 
