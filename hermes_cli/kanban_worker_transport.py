@@ -39,6 +39,7 @@ def pin_worker_tree(env, command):
     if command in ([sys.executable, "-m", "hermes_cli.kanban_worker_client"],
                    [sys.executable, "-P", "-m", "hermes_cli.kanban_command_worker"]):
         from pathlib import Path
+        from hermes_cli._startup_fast import project_root_str
         from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-        return pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+        return pin_hermes_tree_on_pythonpath(env, Path(project_root_str()))
     return env

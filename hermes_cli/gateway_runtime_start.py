@@ -98,7 +98,7 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
         raise RuntimeStartError(reason) from exc
 
 
-def request_absent_gateway(home: Path, *, deadline: float, idle_exit: bool):
+def request_absent_gateway(home: Path, *, deadline: float, idle_exit: bool, waiting: dict[Path, None]):
     """One native start decision; a service still stopping raises its drain verdict.
 
     Recheck ownership after service discovery. A profile served by a multiplexer
@@ -115,11 +115,14 @@ def request_absent_gateway(home: Path, *, deadline: float, idle_exit: bool):
     if service is None and target == home and (host := implied_host_root(home)) is not None:
         target = host
         service = discover_existing_gateway_service(target, deadline=deadline)
-    if runtime.discover_gateway_endpoint(home, timeout=remaining(deadline)).state != "absent":
+    observed = runtime.discover_gateway_endpoint(home, timeout=remaining(deadline))
+    if observed.state != "absent":
+        if observed.state == "starting":
+            waiting[home] = None
         return None
     if service is not None:
         start_existing_gateway_service(service, deadline=deadline)
-        return home, 0, None
+        return target, 0, None
     offset = stdio_log_size(target)
     child = spawn_unmanaged_gateway(target, deadline=deadline, idle_exit=idle_exit)
     return target, offset, child

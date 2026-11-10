@@ -1062,7 +1062,8 @@ def _load_bundled_skill_payload(
     except Exception:
         return None
 
-    bundled_root = Path(__file__).resolve().parents[1] / "skills"
+    from hermes_cli._startup_fast import project_root_str
+    bundled_root = Path(project_root_str()) / "skills"
     skill_dir = bundled_root / rel_dir
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.is_file():
