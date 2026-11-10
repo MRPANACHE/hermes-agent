@@ -22,8 +22,9 @@ from tools.process_registry import (
 
 
 @pytest.fixture()
-def registry():
-    """Create a fresh ProcessRegistry."""
+def registry(monkeypatch):
+    """A fresh ProcessRegistry. Fake Popen pids never reach the owner-death supervisor: a live pgid would start it."""
+    monkeypatch.setattr("hermes_cli.process_identity._update_supervised_pgids", lambda verb, pgids: None)
     return ProcessRegistry()
 
 
@@ -1146,13 +1147,6 @@ class TestPopenLeakOnSetupFailure:
 
         assert terminate.call_count == 1, "post-Popen setup failure must terminate the orphan"
         assert terminate.call_args[0][0] == 9999
-
-# =========================================================================
-# Spawn rewrite regression (issue #68915)
-# =========================================================================
-
-
-
 
 # =========================================================================
 # Checkpoint
