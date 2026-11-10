@@ -5,7 +5,7 @@
 // plain `check` gives that. This is the same selection rule the old CI matrix
 // used, so the set of commands is unchanged. Only the schedule is different.
 //
-// This is not `npm run --ws check`, because that command is serial and stops
+// This is not `pnpm -r run check`, because that command stops
 // at the first workspace that fails. This runs every unit and fails at the
 // end with the full list.
 //
@@ -18,25 +18,31 @@
 // `--partition I/N` divides checks and the desktop UI's native Vitest shards.
 
 import { execFileSync, spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { availableParallelism } from 'node:os'
+import { join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import path from 'node:path'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
-const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+const PNPM = 'pnpm'
 
 /** @returns {{pkg: string, script: string}[]} */
 function discoverUnits() {
-  const raw = execFileSync(NPM, ['query', '.workspace'], {
+  const raw = execFileSync(PNPM, ['ls', '--recursive', '--depth', '-1', '--json'], {
     encoding: 'utf-8',
     shell: process.platform === 'win32',
   })
-  /** @type {{location: string, scripts?: Record<string,string>}[]} */
-  const pkgs = JSON.parse(raw)
+  /** @type {{path: string}[]} */
+  const projects = JSON.parse(raw)
+  const root = process.cwd()
 
   /** @type {{pkg: string, script: string}[]} */
   const units = []
-  for (const pkg of pkgs) {
+  for (const project of projects) {
+    const location = relative(root, project.path).split('\\').join('/')
+    // The root's `check` runs every workspace's check: it is not a unit.
+    if (!location) continue
+    const pkg = { location, ...JSON.parse(readFileSync(join(project.path, 'package.json'), 'utf-8')) }
     const scripts = pkg.scripts || {}
     const subs = Object.keys(scripts).filter((s) => /^check:.+$/.test(s))
     if (subs.length > 0) {
@@ -56,7 +62,7 @@ export function partitionUnits(units, partition) {
   if (!match || Number(match[1]) > Number(match[2])) throw new Error('Invalid check partition')
   const [, index, count] = match.map(Number)
   const expanded = units.flatMap(unit => unit.pkg === 'apps/desktop' && unit.script === 'check:test:ui'
-    ? Array.from({ length: count }, (_, i) => ({ ...unit, args: ['--', '--', `--shard=${i + 1}/${count}`, '--maxWorkers=2'] }))
+    ? Array.from({ length: count }, (_, i) => ({ ...unit, args: [`--shard=${i + 1}/${count}`, '--maxWorkers=2'] }))
     : [unit])
   return expanded.filter((_, i) => i % count === index - 1)
 }
@@ -65,7 +71,7 @@ export function partitionUnits(units, partition) {
 function runUnit(unit) {
   return new Promise((resolve) => {
     const started = Date.now()
-    const child = spawn(NPM, ['run', '--prefix', unit.pkg, unit.script, ...(unit.args || [])], {
+    const child = spawn(PNPM, ['--dir', unit.pkg, 'run', unit.script, ...(unit.args || [])], {
       // Buffer, and do not inherit. Children that share one stdout
       // interleave their lines, and a failure is then hard to read.
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -157,4 +163,4 @@ async function main() {
   console.log(`\nall ${results.length} checks passed`)
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main()
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main()

@@ -11,7 +11,7 @@ on:
 
 jobs:
   workspaces:
-    name: List npm checks and test the WhatsApp bridge
+    name: List pnpm checks and test the WhatsApp bridge
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
@@ -28,7 +28,7 @@ jobs:
           test-environment: 'true'
       - uses: ./.github/actions/retry
         with:
-          command: npm ci --ignore-scripts --no-audit --no-fund
+          command: just js-install
       # Restore the existing per-check matrix rather than running the former
       # 32-core payload on one standard runner. Discovery remains source-owned.
       - name: List the complete existing check set
@@ -54,9 +54,9 @@ jobs:
       - name: Install WhatsApp bridge dependencies
         uses: ./.github/actions/retry
         with:
-          command: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/whatsapp-bridge
+          command: just js-install-whatsapp-bridge
       - name: Run WhatsApp bridge node tests
-        run: node --test scripts/whatsapp-bridge/*.test.mjs
+        run: just test-whatsapp-bridge
       - name: Check the checkout is clean
         uses: ./.github/actions/check-clean-worktree
 
@@ -86,6 +86,21 @@ jobs:
           sudo apt-get install -y zsh xvfb \
             libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
             xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+
+      # setup-pm caches pnpm's store, not the installed workspace tree.
+      # The job then links the full workspace node_modules
+      # again and runs the native postinstalls again. Electron's binary is
+      # prepared explicitly below. This caches the installed tree itself, keyed on the
+      # lockfile, and skips ``pnpm install`` on an exact hit. There are no
+      # restore-keys: a partial hit leaves a stale tree, so anything other
+      # than an exact lockfile match reinstalls from the start.
+      #
+      # This install runs WITH scripts, so the tree holds native lifecycle
+      # artifacts and the explicitly prepared Electron dist, both inside the cached tree.
+      #
+      # The ~/.cache/electron download cache stays out of the key on purpose.
+      # ``pnpm install`` is skipped on a hit, so nothing reads that cache. It only
+      # makes the archive larger.
       - name: Restore node_modules
         id: node-modules-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -97,7 +112,7 @@ jobs:
             ui-tui/packages/*/node_modules
             tests-js/node_modules
             web/node_modules
-          key: node-modules-scripts-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-npm${{ steps.node.outputs.npm-version }}-${{ hashFiles('package-lock.json') }}
+          key: node-modules-scripts-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-pnpm${{ steps.node.outputs.pnpm-version }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}
 
       # Vitest records each file's duration and result under
       # node_modules/.vite/vitest and orders the next run from it, longest first.
@@ -108,12 +123,14 @@ jobs:
       - name: Drop vitest run history from the restored tree
         run: rm -rf node_modules/.vite/vitest apps/*/node_modules/.vite/vitest ui-tui/node_modules/.vite/vitest ui-tui/packages/*/node_modules/.vite/vitest tests-js/node_modules/.vite/vitest web/node_modules/.vite/vitest
 
+      # No --trust-lockfile: this install is the gate that checks every locked
+      # version against pnpm-workspace.yaml's release-age policy.
       - uses: ./.github/actions/retry
         if: steps.node-modules-cache.outputs.cache-hit != 'true'
         with:
-          command: npm ci
+          command: just js-install
       - name: Prepare locked Electron runtime before checks
-        run: node scripts/build/electron-runtime.mjs --source .
+        run: just electron-runtime
       - name: Run the native workspace check
         env:
           CHECK_PACKAGE: ${{ matrix.package }}
@@ -121,10 +138,10 @@ jobs:
           CHECK_SHARD: ${{ matrix.shard }}
         run: |
           if [ -n "$CHECK_SHARD" ]; then
-            # check:test:ui delegates to npm run test:ui; preserve both argument boundaries.
-            npm run --prefix "$CHECK_PACKAGE" "$CHECK_SCRIPT" -- -- --shard="$CHECK_SHARD"
+            # pnpm forwards script arguments through the nested pnpm run test:ui.
+            pnpm --dir "$CHECK_PACKAGE" run "$CHECK_SCRIPT" --shard="$CHECK_SHARD"
           else
-            npm run --prefix "$CHECK_PACKAGE" "$CHECK_SCRIPT"
+            pnpm --dir "$CHECK_PACKAGE" run "$CHECK_SCRIPT"
           fi
       - name: Check the checkout is clean
         uses: ./.github/actions/check-clean-worktree

@@ -13,7 +13,7 @@ test('partitions preserve every discovered check and cover each native UI shard 
   const all = partitions.flat()
   expect(all.filter(unit => !unit.args)).toEqual(units.slice(1))
   expect(all.filter(unit => unit.args).map(unit => unit.args).sort()).toEqual(
-    Array.from({ length: 4 }, (_, i) => ['--', '--', `--shard=${i + 1}/4`, '--maxWorkers=2']),
+    Array.from({ length: 4 }, (_, i) => [`--shard=${i + 1}/4`, '--maxWorkers=2']),
   )
   expect(new Set(all.map(unit => JSON.stringify(unit))).size).toBe(all.length)
   expect(partitions.every(partition => partition.length > 0)).toBe(true)
