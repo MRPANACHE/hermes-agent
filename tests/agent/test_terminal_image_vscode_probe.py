@@ -32,8 +32,9 @@ _CHILD = textwrap.dedent("""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+    print("PROMPT_READY", flush=True)
     leaked = b""
-    while select.select([fd], [], [], 0.3)[0]:
+    while b"hi" not in leaked and select.select([fd], [], [], 15)[0]:
         leaked += os.read(fd, 256)
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
     install_ignored_terminal_sequences()
@@ -61,7 +62,7 @@ def _run(reply: bytes, delay: float) -> str:
                             stderr=subprocess.PIPE, env=env, cwd=_REPO)
     os.close(slave)
     out = b""
-    answered = False
+    answered = typed = False
     try:
         while select.select([master], [], [], 15)[0]:
             try:
@@ -74,9 +75,10 @@ def _run(reply: bytes, delay: float) -> str:
             if not answered and b"\x1b[c" in out:
                 time.sleep(delay)  # health: allow HX013 -- the late reply IS the scenario under test
                 os.write(master, reply)
-                time.sleep(0.02)  # health: allow HX013 -- the user's keys arrive after the reply
-                os.write(master, b"hi")
                 answered = True
+            if answered and not typed and b"PROMPT_READY" in out:
+                os.write(master, b"hi")
+                typed = True
     finally:
         os.close(master)
         proc.wait(timeout=15)
