@@ -204,6 +204,11 @@ tab through its REST evaluate endpoint, only when `CAMOFOX_URL` is loopback or
 HTTPS. In the Hermes Desktop in-app Browser the fill goes to that exact tab
 through the Desktop's authenticated preview request channel, with the same
 origin checks; saved authenticator codes are bound to the login's origins too.
+When the login form sits in a cross-origin frame (a frameset or embedded
+sign-in, whether the browser runs it in its own process or in the page's), the
+password or code goes into that frame only if the frame's own origin is the
+saved one, checked again inside the frame before the write; the surrounding
+page's origin never counts, and two such frames are refused as ambiguous.
 
 **Does not:** protect against the page itself. Once a password is typed into a
 site, that site (and any script it runs) has it, exactly as when you type it

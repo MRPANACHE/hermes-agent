@@ -2,7 +2,7 @@
 (a plugin backend's lock/snapshot/manager session).
 
 Order, for every backend: the item's metadata is read and the page origin checked against it
-(``_bound_page_origin``) BEFORE the context is entered, so a page on the wrong origin never opens a
+(``_bound_write_target``) BEFORE the context is entered, so a page on the wrong origin never opens a
 backend's manager session or lock. Inside the context a backend with its own ``fill_context`` has the
 item re-read, so the origins checked and the secret resolved come from one snapshot.
 

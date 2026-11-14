@@ -211,18 +211,28 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = 10.0) -> dict[str, Any]:
+                         await_promise: bool = True, timeout: float = 10.0,
+                         session_id: Optional[str] = None, context_id: Optional[int] = None) -> dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
-        semantics); non-serializable objects come back as a description string."""
+        semantics); non-serializable objects come back as a description string.
+        ``session_id`` / ``context_id`` evaluate inside a frame found by :meth:`focus_frame`: an
+        out-of-process iframe's session, or the page session plus the isolated-world context of an
+        in-process frame. The session must still be a tracked OOPIF session or the focused page session,
+        else nothing runs; a context that died with a navigation makes Chrome refuse the call."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
         with self._state_lock:
-            active, session_id = self._active, self._page_session_id
+            active = self._active
+            frame_live = session_id is None or session_id == self._page_session_id or any(
+                f.is_oopif and f.cdp_session_id == session_id for f in self._frames.values())
+            session_id = session_id or self._page_session_id
         if not active:
             return _fail("supervisor is not active")
+        if not frame_live:
+            return _fail("frame session is no longer attached")
         if not session_id:
             return _fail("supervisor has no attached page session")
 
@@ -230,6 +240,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
+            if context_id:
+                params["contextId"] = context_id
             coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
             return _schedule(coro, loop, timeout=timeout + 1)
 
@@ -276,28 +288,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
 
-        async def _attach(target_id: str) -> str:
-            attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
-            sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
-            return sid
-
         async def _focus() -> dict[str, Any]:
-            from agent.vault_store import normalize_origin
-            targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
-            candidates = []
-            for t in targets:
-                url = str(t.get("url") or "")
-                try:
-                    # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
-                    if t.get("type") == "page" and url.startswith(("http://", "https://")) \
-                            and (not origin or normalize_origin(url) == origin):
-                        candidates.append((t["targetId"], url))
-                except Exception:
-                    continue
+            candidates = await self._http_page_targets(origin, timeout=timeout)
             for target_id, url in candidates:
-                sid = await _attach(target_id)
+                sid = await self._attach_page_target(target_id, timeout=timeout)
                 if accept:
                     probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
                                             session_id=sid, timeout=timeout)
@@ -313,6 +307,85 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _schedule(_focus(), loop, timeout=timeout + 1)
         except Exception as exc:
             return _err(exc)
+
+    def focus_frame(self, origins: list[str], *, accept: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
+        """Find the frames (out-of-process iframes, and cross-origin frames in the tab's own process via
+        an isolated world) whose own ``location.origin`` (read inside the frame) is exactly one of
+        ``origins`` and where ``accept`` is truthy inside that frame: for a login form that lives in a
+        cross-origin frame of a frameset/embedding page. Frames of the focused tab are
+        checked first; if none match, every open http(s) tab is attached (as :meth:`focus_page` does)
+        and its frames checked. When exactly one frame matches, its tab becomes the page session.
+        Returns ``{"ok": True, "frames": [{frame_id, session_id, context_id, origin, url}, ...]}`` (more than one
+        means ambiguous; focus then stays as it was) or ``{"ok": False, "error"}``."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return _fail("supervisor loop is not running")
+        wanted = {o for o in origins if o}
+        if not wanted:
+            return _fail("no origin to match a frame against")
+
+        async def _find() -> dict[str, Any]:
+            with self._state_lock:
+                current = self._page_session_id
+            if current and (found := await self._frames_matching(current, wanted, accept, timeout=timeout)):
+                return {"ok": True, "frames": found}
+            # The focused tab was just checked; re-attaching it would re-key its tracked frames to a session
+            # that is detached again below, breaking browser_cdp(frame_id=) routing for that tab.
+            current_target = None
+            if current:
+                with contextlib.suppress(Exception):
+                    current_target = (await self._cdp("Target.getTargetInfo", session_id=current, timeout=timeout)
+                                      ).get("result", {}).get("targetInfo", {}).get("targetId")
+            per_tab: list[tuple[str, list[dict[str, Any]]]] = []
+            for target_id, _url in await self._http_page_targets("", timeout=timeout):
+                if target_id == current_target:
+                    continue
+                sid = await self._attach_page_target(target_id, timeout=timeout)
+                found = await self._frames_matching(sid, wanted, accept, timeout=timeout)
+                if found:
+                    per_tab.append((sid, found))
+                else:
+                    await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+            frames = [f for _, tab in per_tab for f in tab]
+            if len(frames) == 1:
+                with self._state_lock:
+                    self._page_session_id = per_tab[0][0]
+            else:  # ambiguous: nothing gets focused, so none of the fresh sessions is kept
+                for sid, _ in per_tab:
+                    await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+            if frames:
+                return {"ok": True, "frames": frames}
+            return _fail(f"no frame on {', '.join(sorted(wanted))}" + (" with the expected form" if accept else ""))
+
+        try:
+            # Each tab costs an attach plus one probe per frame; the whole search gets a few call budgets.
+            return _schedule(_find(), loop, timeout=timeout * 3 + 1)
+        except Exception as exc:
+            return _err(exc)
+
+    async def _http_page_targets(self, origin: str, *, timeout: float) -> list[tuple[str, str]]:
+        """(target_id, url) of open http(s) tabs, limited to ``origin`` when it is set."""
+        from agent.vault_store import normalize_origin
+        targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
+        candidates = []
+        for t in targets:
+            url = str(t.get("url") or "")
+            try:
+                # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
+                if t.get("type") == "page" and url.startswith(("http://", "https://")) \
+                        and (not origin or normalize_origin(url) == origin):
+                    candidates.append((t["targetId"], url))
+            except Exception:
+                continue
+        return candidates
+
+    async def _attach_page_target(self, target_id: str, *, timeout: float) -> str:
+        """Attach a fresh flattened session to a tab; its OOPIFs auto-attach (and are tracked) on it."""
+        attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+        sid = attach["result"]["sessionId"]
+        await self._enable_page_domains(sid, timeout=timeout)
+        await self._install_dialog_bridge(sid)
+        return sid
 
     # ── Supervisor loop internals ────────────────────────────────────────────
 

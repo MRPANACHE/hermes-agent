@@ -21,6 +21,8 @@ FRAME_TREE_MAX_ENTRIES = 30
 FRAME_TREE_MAX_OOPIF_DEPTH = 2
 
 _AUTO_ATTACH_PARAMS = {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True}
+# Isolated world the vault probes / fills in-process cross-origin frames in (own globals, shared DOM).
+VAULT_WORLD_NAME = "hermes-vault"
 
 
 @dataclass
@@ -36,6 +38,9 @@ class FrameInfo:
     is_oopif: bool
     cdp_session_id: Optional[str] = None
     name: str = ""
+    # OOPIFs: the session the child target was auto-attached on (the page or a parent OOPIF), so a
+    # frame can be tied to the tab it lives in. Not part of the frame_tree payload.
+    parent_session_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = {"frame_id": self.frame_id, "url": self.url, "origin": self.origin, "is_oopif": self.is_oopif}
@@ -75,6 +80,7 @@ class FrameTrackingMixin:
                 origin=str(frame.get("securityOrigin") or frame.get("origin") or ""),
                 parent_frame_id=frame.get("parentId") or old.parent_frame_id, is_oopif=old.is_oopif,
                 cdp_session_id=old.cdp_session_id, name=str(frame.get("name") or old.name),
+                parent_session_id=old.parent_session_id,
             )
 
     def _on_frame_detached(self, params: dict[str, Any], session_id: Optional[str]) -> None:
@@ -105,6 +111,7 @@ class FrameTrackingMixin:
                 self._frames[target_id] = FrameInfo(
                     frame_id=target_id, url=str(info.get("url") or ""), origin="", is_oopif=True, cdp_session_id=sid,
                     parent_frame_id=old.parent_frame_id if old else None, name=str(info.get("title") or (old.name if old else "")),
+                    parent_session_id=session_id,
                 )
         # Enable child domains off-loop: awaiting the replies here would deadlock
         # because only the reader can resolve those Futures.
@@ -128,6 +135,81 @@ class FrameTrackingMixin:
         with self._state_lock:
             self._frames.update({fid: replace(f, cdp_session_id=None) for fid, f in self._frames.items()
                                  if f.cdp_session_id == sid})
+
+    def _oopifs_on_page_locked(self, page_session_id: str) -> list[FrameInfo]:
+        """OOPIFs with a live session that belong to the tab behind ``page_session_id`` (must hold
+        state lock): their auto-attach chain leads back to that page session within
+        FRAME_TREE_MAX_OOPIF_DEPTH hops. Frames of other tabs, or of sessions since replaced, are left out."""
+        live = {f.cdp_session_id: f for f in self._frames.values() if f.is_oopif and f.cdp_session_id}
+        out = []
+        for frame in live.values():
+            sid, depth = frame.parent_session_id, 1
+            while sid and sid != page_session_id and depth < FRAME_TREE_MAX_OOPIF_DEPTH:
+                sid = live[sid].parent_session_id if sid in live else None
+                depth += 1
+            if sid and sid == page_session_id:
+                out.append(frame)
+        return out
+
+    async def _frames_matching(self, page_session_id: str, origins: set[str], accept: Optional[str], *,
+                               timeout: float) -> list[dict[str, Any]]:
+        """Frames of that tab whose IN-FRAME ``location.origin`` is exactly one of ``origins`` and where
+        ``accept`` (a JS expression) is truthy inside the frame: out-of-process iframes (own session,
+        ``context_id`` None) and cross-origin frames running in the tab's own process (same-site, e.g.
+        ``secure`` vs ``secure20`` of one domain), reached through an isolated world on the page session
+        (``context_id`` set). Tracked urls are not trusted for the origin: the frame itself answers."""
+        probe = "({origin: window.location.origin, form: !!(%s)})" % (accept or "true")
+        with self._state_lock:
+            oopifs = self._oopifs_on_page_locked(page_session_id)
+            oopif_ids = {fid for fid, f in self._frames.items() if f.is_oopif}
+        candidates = [(f.frame_id, f.cdp_session_id, None, f.url) for f in oopifs]
+        for frame in await self._in_process_child_frames(page_session_id, timeout=timeout):
+            if frame["id"] in oopif_ids:
+                continue
+            try:
+                world = await self._cdp("Page.createIsolatedWorld", {"frameId": frame["id"], "worldName": VAULT_WORLD_NAME},
+                                        session_id=page_session_id, timeout=timeout)
+            except Exception as exc:
+                logger.debug("isolated world for frame %s failed: %s", str(frame["id"])[:16], exc)
+                continue
+            context_id = (world.get("result") or {}).get("executionContextId")
+            if context_id:
+                candidates.append((frame["id"], page_session_id, context_id, str(frame.get("url") or "")))
+        found: list[dict[str, Any]] = []
+        for frame_id, session_id, context_id, url in candidates:
+            params: dict[str, Any] = {"expression": probe, "returnByValue": True}
+            if context_id:
+                params["contextId"] = context_id
+            try:
+                reply = await self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
+            except Exception as exc:
+                logger.debug("frame probe on %s failed: %s", str(frame_id)[:16], exc)
+                continue
+            seen = ((reply.get("result") or {}).get("result") or {}).get("value")
+            if isinstance(seen, dict) and seen.get("form") is True and seen.get("origin") in origins:
+                found.append({"frame_id": frame_id, "session_id": session_id, "context_id": context_id,
+                              "origin": seen["origin"], "url": url})
+        return found
+
+    async def _in_process_child_frames(self, page_session_id: str, *, timeout: float) -> list[dict[str, Any]]:
+        """Child frames in the tab's own frame tree (``Page.getFrameTree``; the top frame excluded), breadth
+        first, at most FRAME_TREE_MAX_OOPIF_DEPTH levels deep and FRAME_TREE_MAX_ENTRIES frames."""
+        try:
+            reply = await self._cdp("Page.getFrameTree", session_id=page_session_id, timeout=timeout)
+        except Exception as exc:
+            logger.debug("frame tree on %s failed: %s", str(page_session_id)[:16], exc)
+            return []
+        root = (reply.get("result") or {}).get("frameTree") or {}
+        queue = [(child, 1) for child in root.get("childFrames") or []]
+        frames: list[dict[str, Any]] = []
+        while queue and len(frames) < FRAME_TREE_MAX_ENTRIES:
+            node, depth = queue.pop(0)
+            frame = node.get("frame") or {}
+            if frame.get("id"):
+                frames.append(frame)
+            if depth < FRAME_TREE_MAX_OOPIF_DEPTH:
+                queue.extend((child, depth + 1) for child in node.get("childFrames") or [])
+        return frames
 
     def _build_frame_tree_locked(self) -> dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

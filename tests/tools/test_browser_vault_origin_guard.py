@@ -53,6 +53,9 @@ class _FakePage:
     def focus_page(self, origin: str, accept=None) -> dict:
         return {"ok": bool(origin) and normalize_origin(self.href) == origin, "url": self.href}
 
+    def focus_frame(self, origins: list[str], accept=None) -> dict:
+        return {"ok": False, "error": "no frame"}  # one tab, no cross-origin frames
+
     def evaluate_runtime(self, expression: str) -> dict:
         if expression.strip() == "window.location.href":
             return {"ok": True, "result": self.href}
