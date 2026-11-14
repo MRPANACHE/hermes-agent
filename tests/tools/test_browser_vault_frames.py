@@ -3,6 +3,8 @@
 A frameset login (top page on one origin, the form in a frame on another) is only reachable inside the
 frame. These tests pin the security model of that path:
 
+- this holds for out-of-process iframes (own CDP session) and for cross-origin frames in the page's own
+  process (same-site, reached through an isolated world on the page session);
 - the frame's OWN origin (read inside the frame) must exactly equal a saved origin of the item;
 - the top page's origin never authorises the write, and the write never runs in the top page;
 - the fill script re-asserts the expected origin inside that frame right before writing;
@@ -63,13 +65,17 @@ class FakeBrowser:
     """Stands in for the supervisor: a top page plus OOPIF contexts keyed by session id. Executes the
     inspection and the fill script far enough to honour the in-script origin assert."""
 
-    def __init__(self, top_origin, top_controls=(), frames=None):
+    def __init__(self, top_origin, top_controls=(), frames=None, in_process=None):
         self.top = _Context(top_origin, list(top_controls))
         self.frames = {sid: _Context(o, list(c)) for sid, (o, c) in (frames or {}).items()}
+        # in-process cross-origin frames: isolated-world context id on the page session -> content
+        self.in_process = {cid: _Context(o, list(c)) for cid, (o, c) in (in_process or {}).items()}
         self.calls: list[tuple[str, str]] = []  # (where, what)
         self.written: list[tuple[str, str]] = []  # (where, expression) of fill scripts that wrote
 
-    def _ctx(self, session_id):
+    def _ctx(self, session_id, context_id=None):
+        if context_id:
+            return self.in_process[context_id]
         return self.frames[session_id] if session_id else self.top
 
     def focus_page(self, origin, *, accept=None, timeout=10.0):
@@ -79,17 +85,24 @@ class FakeBrowser:
 
     def focus_frame(self, origins, *, accept=None, timeout=10.0):
         want_otp = bool(accept and "one-time-code" in accept)
-        found = [{"frame_id": f"F-{sid}", "session_id": sid, "origin": ctx.origin, "url": ctx.origin + "/v1login"}
-                 for sid, ctx in self.frames.items()
-                 if ctx.origin in origins and any(
-                     (c["autocomplete"] == "one-time-code") if want_otp else (c["type"] == "password") for c in ctx.controls)]
+
+        def holds_form(ctx):
+            return ctx.origin in origins and any(
+                (c["autocomplete"] == "one-time-code") if want_otp else (c["type"] == "password") for c in ctx.controls)
+
+        found = [{"frame_id": f"F-{sid}", "session_id": sid, "context_id": None, "origin": ctx.origin,
+                  "url": ctx.origin + "/v1login"} for sid, ctx in self.frames.items() if holds_form(ctx)]
+        found += [{"frame_id": f"IP-{cid}", "session_id": "PAGE", "context_id": cid, "origin": ctx.origin,
+                   "url": ctx.origin + "/v1login"} for cid, ctx in self.in_process.items() if holds_form(ctx)]
         return {"ok": True, "frames": found} if found else {"ok": False, "error": "no frame"}
 
-    def evaluate_runtime(self, expression, *, session_id=None, **_):
-        where = session_id or "top"
-        if session_id and session_id not in self.frames:
+    def evaluate_runtime(self, expression, *, session_id=None, context_id=None, **_):
+        where = f"{session_id}#{context_id}" if context_id else (session_id or "top")
+        if context_id and (session_id != "PAGE" or context_id not in self.in_process):
+            return {"ok": False, "error": "Cannot find context with specified id"}
+        if session_id and not context_id and session_id not in self.frames:
             return {"ok": False, "error": "frame session is no longer attached"}
-        ctx = self._ctx(session_id)
+        ctx = self._ctx(session_id, context_id)
         if expression == "window.location.href":
             self.calls.append((where, "href"))
             return {"ok": True, "result": ctx.origin + "/bh/"}
@@ -272,6 +285,84 @@ class TestFillInCrossOriginFrame:
         assert browser.written == []
 
 
+class TestFillInInProcessFrame:
+    """Same-site cross-origin frames (frameset page on secure.*, login frame on secure20.*) run in the page's
+    process: no own session, reached through an isolated world on the page session."""
+
+    def test_matching_in_process_frame_fills_in_its_own_context(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        browser = FakeBrowser(TOP, in_process={7: (LOGIN, PASSWORD_CONTROLS)})
+        _, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id), browser, store)
+        assert out["success"] is True and out["origin"] == LOGIN and out["in_frame"] is True
+        assert ("PAGE#7", "inspect") in browser.calls and ("top", "inspect") not in browser.calls
+        (where, expr), = browser.written
+        assert where == "PAGE#7"
+        assert f'const expectedOrigin = "{LOGIN}";' in expr and TOP not in expr
+
+    def test_in_process_frame_on_a_different_origin_is_refused(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        browser = FakeBrowser(TOP, in_process={7: (OTHER, PASSWORD_CONTROLS)})
+        _, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id), browser, store)
+        assert out["success"] is False and out["error_type"] == "origin_mismatch"
+        assert browser.written == [] and not any(what == "fill" for _, what in browser.calls)
+
+    def test_one_oopif_plus_one_in_process_match_is_ambiguous(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        browser = FakeBrowser(TOP, frames={"S-login": (LOGIN, PASSWORD_CONTROLS)}, in_process={7: (LOGIN, PASSWORD_CONTROLS)})
+        _, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id), browser, store)
+        assert out["success"] is False and out["error_type"] == "ambiguous_frame"
+        assert browser.written == [] and not any(what in {"inspect", "fill"} for _, what in browser.calls)
+
+    def test_in_process_frame_that_navigated_before_the_write_gets_nothing(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        browser = FakeBrowser(TOP, in_process={7: (LOGIN, PASSWORD_CONTROLS)})
+        real_eval = browser.evaluate_runtime
+
+        def navigate_then_eval(expression, **kw):
+            if "expectedOrigin" in expression:
+                browser.in_process[7].origin = OTHER
+            return real_eval(expression, **kw)
+
+        browser.evaluate_runtime = navigate_then_eval
+        _, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id), browser, store)
+        assert out["error_type"] == "origin_changed" and browser.written == []
+
+    def test_in_process_context_destroyed_before_the_write_refuses(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        browser = FakeBrowser(TOP, in_process={7: (LOGIN, PASSWORD_CONTROLS)})
+        real_eval = browser.evaluate_runtime
+
+        def reload_then_eval(expression, **kw):
+            if "expectedOrigin" in expression:
+                browser.in_process.pop(7)  # the frame reloaded: its isolated world is gone
+            return real_eval(expression, **kw)
+
+        browser.evaluate_runtime = reload_then_eval
+        _, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id), browser, store)
+        assert out["success"] is False and browser.written == []
+
+    def test_enter_code_goes_into_a_matching_in_process_frame(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin=LOGIN, otp=True)
+        browser = FakeBrowser(TOP, in_process={7: (LOGIN, OTP_CONTROLS)})
+        raw, out = _run(lambda: browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"), browser, store)
+        assert out["success"] is True and out["origin"] == LOGIN and out["in_frame"] is True
+        (where, expr), = browser.written
+        assert where == "PAGE#7" and f'const expectedOrigin = "{LOGIN}";' in expr
+        assert re.search(r'"value": "(\d{6})"', expr).group(1) not in raw
+
+
 # ---------------------------------------------------------------------------
 # browser_vault enter_code
 # ---------------------------------------------------------------------------
@@ -362,15 +453,24 @@ def _oopif(frame_id, sid, parent_sid, url=""):
 class _FakeCDP:
     """Answers the frame probe per session from ``in_frame`` = {sid: (origin, has_form)}."""
 
-    def __init__(self, in_frame, targets=(), on_attach=None, current_target=None):
+    def __init__(self, in_frame, targets=(), on_attach=None, current_target=None, frame_trees=None):
         self.in_frame, self.targets, self.on_attach = in_frame, list(targets), on_attach
         self.current_target = current_target
+        self.frame_trees = frame_trees or {}  # page session -> Page.getFrameTree frameTree
+        self.worlds: dict[int, str] = {}       # isolated-world context id -> frame id
         self.calls: list[tuple[str, str | None, dict]] = []
 
     async def __call__(self, method, params=None, *, session_id=None, timeout=10.0):
         self.calls.append((method, session_id, params or {}))
+        if method == "Page.getFrameTree":
+            return {"result": {"frameTree": self.frame_trees.get(session_id, {"frame": {"id": "TOPFRAME"}})}}
+        if method == "Page.createIsolatedWorld":
+            context_id = 100 + len(self.worlds)
+            self.worlds[context_id] = params["frameId"]
+            return {"result": {"executionContextId": context_id}}
         if method == "Runtime.evaluate" and "form: !!(" in (params or {}).get("expression", ""):
-            origin, form = self.in_frame[session_id]
+            key = ("frame", self.worlds[params["contextId"]]) if "contextId" in params else session_id
+            origin, form = self.in_frame[key]
             return {"result": {"result": {"type": "object", "value": {"origin": origin, "form": form}}}}
         if method == "Runtime.evaluate":
             return {"result": {"result": {"type": "number", "value": 1}}}
@@ -473,6 +573,41 @@ class TestSupervisorFrameSelection:
         assert len(out["frames"]) == 2 and focused == "PAGE"
         assert sorted(detached) == ["NEWPAGE-T2", "NEWPAGE-T3"]
 
+    def test_in_process_frames_are_probed_in_an_isolated_world_on_the_page_session(self):
+        def node(fid, url, *children):
+            return {"frame": {"id": fid, "url": url}, "childFrames": list(children)}
+
+        tree = node("TOPFRAME", TOP + "/bh/",
+                    node("MENU", TOP + "/menu"),
+                    node("MAIN", LOGIN + "/v1login", node("DEEP", LOGIN + "/x", node("DEEPER", LOGIN + "/y"))),
+                    node("F1", LOGIN + "/oopif"))  # also tracked as an OOPIF: probed once, via its own session
+        cdp = _FakeCDP({("frame", "MENU"): (TOP, True), ("frame", "MAIN"): (LOGIN, True),
+                        ("frame", "DEEP"): (LOGIN, False), "S1": (OTHER, True)},
+                       frame_trees={"PAGE": tree})
+        sup = _supervisor(cdp)
+        try:
+            sup._frames = {"F1": _oopif("F1", "S1", "PAGE")}
+            out = sup.focus_frame([LOGIN], accept="!!document.querySelector('input[type=password]')")
+        finally:
+            _stop(sup)
+        assert [(f["frame_id"], f["session_id"]) for f in out["frames"]] == [("MAIN", "PAGE")]
+        context_id = out["frames"][0]["context_id"]
+        assert cdp.worlds[context_id] == "MAIN"
+        worlds = [p["frameId"] for m, _, p in cdp.calls if m == "Page.createIsolatedWorld"]
+        assert worlds == ["MENU", "MAIN", "DEEP"]  # top frame, the OOPIF and depth 3 are not entered
+        assert all(sid == "PAGE" for m, sid, _ in cdp.calls if m == "Page.createIsolatedWorld")
+
+    def test_oopif_and_in_process_matches_are_counted_together(self):
+        tree = {"frame": {"id": "TOPFRAME"}, "childFrames": [{"frame": {"id": "MAIN", "url": LOGIN + "/v1login"}}]}
+        cdp = _FakeCDP({("frame", "MAIN"): (LOGIN, True), "S1": (LOGIN, True)}, frame_trees={"PAGE": tree})
+        sup = _supervisor(cdp)
+        try:
+            sup._frames = {"F1": _oopif("F1", "S1", "PAGE")}
+            out = sup.focus_frame([LOGIN], accept="true")
+        finally:
+            _stop(sup)
+        assert sorted(f["frame_id"] for f in out["frames"]) == ["F1", "MAIN"]
+
     def test_no_match_leaves_focus_and_reports_failure(self):
         cdp = _FakeCDP({"S1": (OTHER, True)})
         sup = _supervisor(cdp)
@@ -491,12 +626,13 @@ class TestSupervisorFrameSelection:
             sup._frames = {"F1": _oopif("F1", "S1", "PAGE")}
             ok = sup.evaluate_runtime("1", session_id="S1")
             gone = sup.evaluate_runtime("1", session_id="S-unknown")
+            in_process = sup.evaluate_runtime("1", session_id="PAGE", context_id=101)
             top = sup.evaluate_runtime("1")
         finally:
             _stop(sup)
-        assert ok["ok"] is True and gone["ok"] is False and top["ok"] is True
-        sessions = [sid for m, sid, _ in cdp.calls if m == "Runtime.evaluate"]
-        assert sessions == ["S1", "PAGE"]  # the unknown session never reached the wire
+        assert ok["ok"] and not gone["ok"] and in_process["ok"] and top["ok"]
+        evals = [(sid, p.get("contextId")) for m, sid, p in cdp.calls if m == "Runtime.evaluate"]
+        assert evals == [("S1", None), ("PAGE", 101), ("PAGE", None)]  # the unknown session never reached the wire
 
     def test_target_attached_records_the_parent_session(self):
         from tools.browser_supervisor import CDPSupervisor

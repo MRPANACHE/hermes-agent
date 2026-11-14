@@ -55,23 +55,23 @@ def _check_vault_available() -> bool:
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
 
-def _eval_js(task_id: str, expression: str, frame_session_id: Optional[str] = None) -> dict[str, Any]:
+def _eval_js(task_id: str, expression: str, frame: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
     agent-browser CLI ``eval`` command. Never use this for expressions that
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
-    ``frame_session_id`` evaluates inside that out-of-process iframe; the CLI
-    cannot reach a frame, so there is no fallback for it.
+    ``frame`` (``{"session_id", "context_id"}`` from :func:`_resolve_write_target`) evaluates
+    inside that frame; the CLI cannot reach a frame, so there is no fallback for it.
     """
-    if frame_session_id:
+    if frame:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
         supervisor = SUPERVISOR_REGISTRY.get(task_id)
         if supervisor is None:
             return {"success": False, "error": "the browser supervisor that found the frame is gone"}
-        sup = supervisor.evaluate_runtime(expression, session_id=frame_session_id)
+        sup = supervisor.evaluate_runtime(expression, session_id=frame["session_id"], context_id=frame.get("context_id"))
         if sup.get("ok"):
             return {"success": True, "result": sup.get("result")}
         return {"success": False, "error": str(sup.get("error") or "eval failed")}
@@ -130,9 +130,9 @@ def _ensure_supervisor(task_id: str):
         return None
 
 
-def _eval_js_secret(task_id: str, expression: str, frame_session_id: Optional[str] = None) -> dict[str, Any]:
+def _eval_js_secret(task_id: str, expression: str, frame: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
-    ``frame_session_id`` runs it inside that out-of-process iframe instead of the top page.
+    ``frame`` runs it inside that frame (OOPIF session, or isolated world of an in-process frame).
 
     Fails closed: there is deliberately NO fallback to the agent-browser CLI
     ``eval`` path, because that places the expression — and therefore the
@@ -170,8 +170,8 @@ def _eval_js_secret(task_id: str, expression: str, frame_session_id: Optional[st
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
-    sup = (supervisor.evaluate_runtime(expression, session_id=frame_session_id) if frame_session_id
-           else supervisor.evaluate_runtime(expression))
+    sup = (supervisor.evaluate_runtime(expression, session_id=frame["session_id"], context_id=frame.get("context_id"))
+           if frame else supervisor.evaluate_runtime(expression))
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -230,8 +230,8 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
 
 
 def _focus_bound_frames(task_id: str, allowed: list[str], kind: str) -> list[dict[str, Any]]:
-    """Out-of-process iframes whose own origin is exactly one of ``allowed`` and that hold a ``kind`` form
-    (checked inside each frame). A frameset login (e-Boekhouden: top page on one origin, the form in a frame
+    """Frames (out-of-process, or cross-origin in the tab's own process) whose own origin is exactly one of
+    ``allowed`` and that hold a ``kind`` form (checked inside each frame). A frameset login (e-Boekhouden: top page on one origin, the form in a frame
     on another) is only reachable this way. Empty when there is no supervisor or no such frame."""
     try:
         supervisor = _ensure_supervisor(task_id)
@@ -244,28 +244,30 @@ def _focus_bound_frames(task_id: str, allowed: list[str], kind: str) -> list[dic
 
 
 def _resolve_write_target(task_id: str, allowed: list[str], kind: str) -> dict[str, Any]:
-    """Where a vault write for an item bound to ``allowed`` may go: ``{"origin", "frame_session_id"}``
-    (``frame_session_id`` None = the top page), or ``{"error", "error_type"?}``.
+    """Where a vault write for an item bound to ``allowed`` may go: ``{"origin", "frame"}`` (``frame`` None =
+    the top page, else ``{"session_id", "context_id"}``), or ``{"error", "error_type"?}``.
 
-    Order: an open tab on a saved origin holding the form; else ONE out-of-process frame on a saved origin
-    holding the form; else the current page when its own origin is saved (it then reports what it lacks).
+    Order: an open tab on a saved origin holding the form; else ONE frame on a saved origin holding the form
+    (out-of-process and in-process frames counted together); else the current page when its own origin is
+    saved (it then reports what it lacks).
     The top page's origin never authorises a frame write: the frame's origin is what must match, and the
     fill script asserts it again inside that frame right before writing. Two matching frames are refused
     as ambiguous. An item saved for both the frameset page and its login frame lands in the frame, because
     only the frame holds the form."""
     for candidate in allowed:
         if _focus_bound_origin(task_id, candidate, kind):
-            return {"origin": candidate, "frame_session_id": None}
+            return {"origin": candidate, "frame": None}
     frames = _focus_bound_frames(task_id, allowed, kind)
     if len(frames) == 1:
-        return {"origin": frames[0]["origin"], "frame_session_id": frames[0]["session_id"]}
+        return {"origin": frames[0]["origin"],
+                "frame": {"session_id": frames[0]["session_id"], "context_id": frames[0].get("context_id")}}
     if len(frames) > 1:
         return {"error_type": "ambiguous_frame",
                 "error": (f"Refused: {len(frames)} frames on {', '.join(sorted({f['origin'] for f in frames}))} hold the "
                           "form, so it is unclear which one to fill. Close the extra tab or frame and retry.")}
     page_origin = _current_page_origin(task_id)
     if page_origin and page_origin in allowed:
-        return {"origin": page_origin, "frame_session_id": None}
+        return {"origin": page_origin, "frame": None}
     if not page_origin:
         return {"error": "Could not determine the current page origin. Navigate to the login page first."}
     return {"error_type": "origin_mismatch",
@@ -276,7 +278,7 @@ def _resolve_write_target(task_id: str, allowed: list[str], kind: str) -> dict[s
 
 def _in_frame(target: dict[str, Any]) -> dict[str, Any]:
     """Keyword args routing an eval into the target's frame (none for the top page)."""
-    return {"frame_session_id": target["frame_session_id"]} if target.get("frame_session_id") else {}
+    return {"frame": target["frame"]} if target.get("frame") else {}
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +428,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     else:
         # No saved login: the user types the code they see, for the page they are on.
         _focus_bound_origin(effective_task_id, "", "otp")
-        target = {"origin": _current_page_origin(effective_task_id), "frame_session_id": None}
+        target = {"origin": _current_page_origin(effective_task_id), "frame": None}
         if not target["origin"]:
             return json.dumps({"success": False, "error": "No page with a code field is open."})
     origin = target["origin"]
@@ -477,7 +479,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
     out = {"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
            "next": "Submit the form (many sites auto-submit when the last digit lands)."}
-    if target.get("frame_session_id"):
+    if target.get("frame"):
         out["in_frame"] = True
     return json.dumps(out)
 
@@ -628,7 +630,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if target.get("frame_session_id"):
+    if target.get("frame"):
         out["in_frame"] = True
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"

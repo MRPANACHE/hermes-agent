@@ -212,19 +212,21 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
                          await_promise: bool = True, timeout: float = 10.0,
-                         session_id: Optional[str] = None) -> dict[str, Any]:
+                         session_id: Optional[str] = None, context_id: Optional[int] = None) -> dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string.
-        ``session_id`` evaluates inside an out-of-process iframe instead (a session from
-        :meth:`focus_frame`); it must still be a tracked OOPIF session, else nothing runs."""
+        ``session_id`` / ``context_id`` evaluate inside a frame found by :meth:`focus_frame`: an
+        out-of-process iframe's session, or the page session plus the isolated-world context of an
+        in-process frame. The session must still be a tracked OOPIF session or the focused page session,
+        else nothing runs; a context that died with a navigation makes Chrome refuse the call."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
         with self._state_lock:
             active = self._active
-            frame_live = session_id is None or any(
+            frame_live = session_id is None or session_id == self._page_session_id or any(
                 f.is_oopif and f.cdp_session_id == session_id for f in self._frames.values())
             session_id = session_id or self._page_session_id
         if not active:
@@ -238,6 +240,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
+            if context_id:
+                params["contextId"] = context_id
             coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
             return _schedule(coro, loop, timeout=timeout + 1)
 
@@ -305,12 +309,13 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _err(exc)
 
     def focus_frame(self, origins: list[str], *, accept: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
-        """Find the out-of-process iframes whose own ``location.origin`` (read inside the frame) is
-        exactly one of ``origins`` and where ``accept`` is truthy inside that frame: for a login form
-        that lives in a cross-origin frame of a frameset/embedding page. Frames of the focused tab are
+        """Find the frames (out-of-process iframes, and cross-origin frames in the tab's own process via
+        an isolated world) whose own ``location.origin`` (read inside the frame) is exactly one of
+        ``origins`` and where ``accept`` is truthy inside that frame: for a login form that lives in a
+        cross-origin frame of a frameset/embedding page. Frames of the focused tab are
         checked first; if none match, every open http(s) tab is attached (as :meth:`focus_page` does)
         and its frames checked. When exactly one frame matches, its tab becomes the page session.
-        Returns ``{"ok": True, "frames": [{frame_id, session_id, origin, url}, ...]}`` (more than one
+        Returns ``{"ok": True, "frames": [{frame_id, session_id, context_id, origin, url}, ...]}`` (more than one
         means ambiguous; focus then stays as it was) or ``{"ok": False, "error"}``."""
         loop = self._loop
         if loop is None or not loop.is_running():
