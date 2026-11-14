@@ -36,6 +36,9 @@ class FrameInfo:
     is_oopif: bool
     cdp_session_id: Optional[str] = None
     name: str = ""
+    # OOPIFs: the session the child target was auto-attached on (the page or a parent OOPIF), so a
+    # frame can be tied to the tab it lives in. Not part of the frame_tree payload.
+    parent_session_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = {"frame_id": self.frame_id, "url": self.url, "origin": self.origin, "is_oopif": self.is_oopif}
@@ -75,6 +78,7 @@ class FrameTrackingMixin:
                 origin=str(frame.get("securityOrigin") or frame.get("origin") or ""),
                 parent_frame_id=frame.get("parentId") or old.parent_frame_id, is_oopif=old.is_oopif,
                 cdp_session_id=old.cdp_session_id, name=str(frame.get("name") or old.name),
+                parent_session_id=old.parent_session_id,
             )
 
     def _on_frame_detached(self, params: dict[str, Any], session_id: Optional[str]) -> None:
@@ -105,6 +109,7 @@ class FrameTrackingMixin:
                 self._frames[target_id] = FrameInfo(
                     frame_id=target_id, url=str(info.get("url") or ""), origin="", is_oopif=True, cdp_session_id=sid,
                     parent_frame_id=old.parent_frame_id if old else None, name=str(info.get("title") or (old.name if old else "")),
+                    parent_session_id=session_id,
                 )
         # Enable child domains off-loop: awaiting the replies here would deadlock
         # because only the reader can resolve those Futures.
@@ -128,6 +133,43 @@ class FrameTrackingMixin:
         with self._state_lock:
             self._frames.update({fid: replace(f, cdp_session_id=None) for fid, f in self._frames.items()
                                  if f.cdp_session_id == sid})
+
+    def _oopifs_on_page_locked(self, page_session_id: str) -> list[FrameInfo]:
+        """OOPIFs with a live session that belong to the tab behind ``page_session_id`` (must hold
+        state lock): their auto-attach chain leads back to that page session within
+        FRAME_TREE_MAX_OOPIF_DEPTH hops. Frames of other tabs, or of sessions since replaced, are left out."""
+        live = {f.cdp_session_id: f for f in self._frames.values() if f.is_oopif and f.cdp_session_id}
+        out = []
+        for frame in live.values():
+            sid, depth = frame.parent_session_id, 1
+            while sid and sid != page_session_id and depth < FRAME_TREE_MAX_OOPIF_DEPTH:
+                sid = live[sid].parent_session_id if sid in live else None
+                depth += 1
+            if sid and sid == page_session_id:
+                out.append(frame)
+        return out
+
+    async def _frames_matching(self, page_session_id: str, origins: set[str], accept: Optional[str], *,
+                               timeout: float) -> list[dict[str, Any]]:
+        """OOPIFs of that tab whose IN-FRAME ``location.origin`` is exactly one of ``origins`` and where
+        ``accept`` (a JS expression) is truthy inside the frame. The tracked url is not trusted for the
+        origin: the frame itself answers."""
+        with self._state_lock:
+            frames = self._oopifs_on_page_locked(page_session_id)
+        probe = "({origin: window.location.origin, form: !!(%s)})" % (accept or "true")
+        found: list[dict[str, Any]] = []
+        for frame in frames:
+            try:
+                reply = await self._cdp("Runtime.evaluate", {"expression": probe, "returnByValue": True},
+                                        session_id=frame.cdp_session_id, timeout=timeout)
+            except Exception as exc:
+                logger.debug("frame probe on %s failed: %s", str(frame.cdp_session_id)[:16], exc)
+                continue
+            seen = ((reply.get("result") or {}).get("result") or {}).get("value")
+            if isinstance(seen, dict) and seen.get("form") is True and seen.get("origin") in origins:
+                found.append({"frame_id": frame.frame_id, "session_id": frame.cdp_session_id,
+                              "origin": seen["origin"], "url": frame.url})
+        return found
 
     def _build_frame_tree_locked(self) -> dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

@@ -113,7 +113,12 @@ vault:
 tool results, logs, the session database, or the CLI arguments of any process.
 Fills happen over the supervised browser session's direct CDP socket and are
 refused unless the page origin exactly matches the saved origin, checked again
-inside the page immediately before the write.
+inside the page immediately before the write. When the login form sits in a
+cross-origin frame (a frameset or embedded sign-in), the password or code goes
+into that frame only if the frame's own origin is the saved one, checked again
+inside the frame before the write; the surrounding page's origin never counts,
+and two such frames are refused as ambiguous. With a saved login, a two-factor
+code follows the same origin rule.
 
 **Does not:** protect against the page itself. Once a password is typed into a
 site, that site (and any script it runs) has it, exactly as when you type it

@@ -220,6 +220,15 @@ agent uses `contentWindow`/`contentDocument` from a top-level
 `Runtime.evaluate` instead — the supervisor surfaces an error pointing at that
 fallback when `frame_id` belongs to a non-OOPIF.
 
+`browser_vault` reaches a login form in an OOPIF the same way, without the
+agent picking a frame: `focus_frame(origins, accept=)` returns the OOPIFs of
+the focused tab (falling back to the other open tabs) whose auto-attach session
+chain leads to that tab within OOPIF depth 2, whose `location.origin` read
+inside the frame is exactly a saved origin, and where `accept` is truthy inside
+the frame. `evaluate_runtime(expr, session_id=)` then runs in that frame, and
+only while the session is still a tracked OOPIF session. More than one match
+is refused by the vault as ambiguous.
+
 On Browserbase, this is the only reliable path for iframe interaction —
 stateless CDP connections (opened per `browser_cdp` call) hit signed-URL
 expiry, while the supervisor's long-lived connection keeps a valid session.
