@@ -43,10 +43,12 @@ from hermes_constants import get_hermes_home
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """cwd to stamp on a new session row (``hermes -c`` / ``--resume``), or None.
 
-    Only local CLI sessions record one: gateway/cron/remote backends (non-"local" ``TERMINAL_ENV``) have no
-    stable host cwd for the agent's tools.
+    Local CLI and native kanban workers record their actual launch directory. Kanban
+    workers are launched in an isolated task workspace; dropping it loses the native
+    session's repo binding. Other gateway/cron sources and remote terminal backends
+    have no stable host cwd for the agent's tools.
     """
-    if source not in CLI_FAMILY_SOURCES or (os.environ.get("TERMINAL_ENV") or "local").strip().lower() not in ("", "local"):
+    if source not in CLI_FAMILY_SOURCES | {"kanban"} or (os.environ.get("TERMINAL_ENV") or "local").strip().lower() not in ("", "local"):
         return None
     try:
         return os.getcwd()
