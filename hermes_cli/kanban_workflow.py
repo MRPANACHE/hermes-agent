@@ -125,7 +125,7 @@ DEFAULT_WORKFLOW = Workflow(
     manual=_frozen_manual({
         "triage": ("todo", "ready"),
         "todo": ("triage", "scheduled", "ready"),
-        "scheduled": ("triage", "todo", "ready"),
+        "scheduled": ("triage", "todo", "ready", "done"),
         "ready": ("triage", "todo", "scheduled", "blocked", "review", "done"),
         "running": ("triage", "todo", "scheduled", "ready", "blocked", "review", "done"),
         "blocked": ("triage", "todo", "scheduled", "ready", "done"),
