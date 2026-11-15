@@ -1715,6 +1715,21 @@ class LocalEnvironment(BaseEnvironment):
 
     _profile_scoped_passthrough = True
 
+    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+        """Keep dispatcher/child identity per invocation, not in shell state.
+
+        Native children share this backend with their parent. The subprocess
+        builder supplies the current identity (and scrubs child ownership),
+        but sourcing an older shell snapshot must not override that decision.
+        BaseEnvironment saves/restores these names around source and omits
+        them from dumps, including when profile multiplexing is inactive.
+        """
+        from agent.delegation_context import KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER
+
+        return tuple(sorted(set(super()._snapshot_excluded_passthrough_names()) | {
+            *KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER,
+        }))
+
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
