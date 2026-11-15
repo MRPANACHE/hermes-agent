@@ -3686,7 +3686,12 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Raises AuthError if no Codex tokens are stored.
     """
     if _lock:
-        with _auth_store_lock():
+        # A reader can arrive while another process refreshes the single-use
+        # token. Use the same transaction deadline as that refresh writer.
+        refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+        with _auth_store_lock(
+            timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
+        ):
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
