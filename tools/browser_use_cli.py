@@ -618,6 +618,9 @@ _OWN_DURING_CALL_S = 0.5
 # Harness daemons this process drove: each latches BU_CDP_* at start and outlives every call, so a backend
 # swap (/browser connect|disconnect) leaves later calls in the old browser until these are stopped.
 _driven_daemons: dict[tuple[str, ...], str] = {}  # daemon identity -> home
+# Daemon identity -> the task ids that drove it. A daemon lives as long as one of them is open: sessions
+# on one BU_NAME share it, and the session whose close removes the last driver stops it (stop_session_daemons).
+_daemon_drivers: dict[tuple[str, ...], set[str]] = {}
 _driven_daemons_lock = threading.Lock()
 _live_generation = functools.partial(_lazy_call, "tools.browser_session_cdp", "live_cdp_generation", 0,
                                      "live CDP generation lookup failed")  # this profile's publish count
@@ -636,7 +639,40 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
         daemons = sorted(key for key, home in _driven_daemons.items() if home_key in (None, home))
         for key in daemons:
             _driven_daemons.pop(key, None)
+            _daemon_drivers.pop(key, None)
     _reload_daemons(daemons)
+
+
+def stop_session_daemons(task_ids) -> None:
+    """A session ended for good: drop ``task_ids`` as drivers and stop each harness daemon left with none.
+    A daemon another open session of this process drove stays; per-turn cleanup never calls this, so a
+    daemon persists across the turns of an open session. Only a daemon this process spawned is reloaded
+    (``_daemon_is_ours``); one another process started, and still uses, just loses our record. A daemon
+    shared with another process of ours is stopped when its last driver here closes: that process's next
+    browser_exec respawns one on the same endpoint."""
+    closed = {task for task in task_ids if task}
+    with _driven_daemons_lock:
+        candidates = sorted(key for key, drivers in _daemon_drivers.items() if drivers & closed)
+        for drivers in _daemon_drivers.values():
+            drivers -= closed
+    for daemon in candidates:
+        with _driven_daemons_lock:
+            if _daemon_drivers.get(daemon):
+                continue  # another session of this process drove it since: it keeps the daemon
+            _daemon_drivers.pop(daemon, None)
+            _driven_daemons.pop(daemon, None)
+        if _daemon_is_ours(daemon):
+            _reload_daemons([daemon])
+
+
+def _daemon_is_ours(daemon: tuple[str, ...]) -> bool:
+    """Whether this process spawned the live daemon of this identity: it owns its group, or the pid the
+    harness published carries a spawn tag naming this process (the tag is checked, never the pid file alone)."""
+    with _owned_daemon_groups_lock:
+        if daemon in _owned_daemon_groups:
+            return True
+    pid = _published_daemon_pid(daemon_env({}, daemon))
+    return pid is not None and spawned_by_this_process(pid)
 
 
 def _published_daemon_pid(env: dict) -> Optional[int]:
@@ -651,8 +687,8 @@ def _published_daemon_pid(env: dict) -> Optional[int]:
 
 def _own_harness_daemon_until_owned(env: dict) -> Optional[bool]:
     """Periodic check while browser_exec runs: own the daemon as soon as it publishes its pid, then
-    stop (False). It also stops once the daemon can never be ours (Windows, a managed worker, a daemon
-    another Hermes started), instead of re-checking every tick for the whole call."""
+    stop (False). It also stops once the daemon can never be ours (Windows, a daemon another Hermes
+    started), instead of re-checking every tick for the whole call."""
     return None if _own_harness_daemon(env) is None else False
 
 
@@ -689,15 +725,13 @@ def _own_harness_daemon(env: dict) -> Optional[bool]:
     Runs after every browser_exec (and while a long one runs, until the daemon is owned): a pid
     already owned for this daemon costs one file read.
 
-    Returns True once the daemon is owned, False when it can never be (Windows, a managed worker, a
-    daemon another Hermes started), None when there is nothing to own yet."""
+    A managed worker owns it too: its clean exit stops the daemon (atexit), and a killed worker must not
+    leave it behind in the gateway's cgroup; the next turn's worker respawns one.
+
+    Returns True once the daemon is owned, False when it can never be (Windows, a daemon another Hermes
+    started), None when there is nothing to own yet."""
     if os.name != "posix":
         return False  # Windows: the harness daemon is outside this process's job; nothing to register.
-    from agent.runtime_session_store import is_worker_process
-    if is_worker_process():
-        # A managed per-turn worker never owns it, so a killed worker does not take the browser the
-        # next turn's worker drives along (its clean exit still runs the atexit browser cleanup).
-        return False
     import psutil
 
     daemon = daemon_identity(env)
@@ -762,6 +796,7 @@ def _reload_if_republished(env: dict, generation: int) -> None:
     daemon = daemon_identity(env)
     with _driven_daemons_lock:
         _driven_daemons.pop(daemon, None)
+        _daemon_drivers.pop(daemon, None)
     _reload_daemons([daemon])
 
 
@@ -849,6 +884,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
+            _daemon_drivers.setdefault(daemon, set()).add(task_id or "default")
         # The first call starts the daemon and may run long (navigation, user code): own it as soon as
         # it publishes its pid, so a Hermes killed mid-call takes it along (the call's end owns it too).
         from agent.periodic_scheduler import schedule
