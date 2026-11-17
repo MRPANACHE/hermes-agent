@@ -125,6 +125,14 @@ class ClientLifecycleMixin:
             from tools.computer_use.tool import release_computer_use_session
             release_computer_use_session(task_id)
 
+        def stop_browser_daemons() -> None:
+            # cleanup_browser frees the browser per turn; the harness daemon belongs to the session and
+            # ends only here, unless another open session of this process still drives it. Only the task
+            # ids this agent ran turns under: a temporary agent on the live session's id (gateway hygiene,
+            # /compress) never ran one and must not stop the daemon its session still drives.
+            from tools.browser_use_cli import stop_session_daemons
+            stop_session_daemons(getattr(self, "_process_owner_task_ids", ()))
+
         def forget_file_state() -> None:
             # File tools key their read stamps / writer claims by the per-turn task_id (cron:
             # ``cron:<job>:<uuid>``, subagents: ``subagent-N-xxxx``), which differs from session_id;
@@ -135,7 +143,7 @@ class ClientLifecycleMixin:
                     clear_file_ops_cache(owner)
 
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
-                     release_computer_use, forget_file_state):
+                     stop_browser_daemons, release_computer_use, forget_file_state):
             _quietly(step)
 
     def _client_log_context(self) -> str:

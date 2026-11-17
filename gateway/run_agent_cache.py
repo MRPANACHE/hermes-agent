@@ -889,6 +889,19 @@ class GatewayAgentCacheMixin:
         transcript is committed (``on_session_end``) before its clients go; a plain evict is not."""
         self._evict_cached_agent(session_key, commit_memory=True)
 
+    def _stop_session_browser_daemons(self, session_key: str, session_ids) -> None:
+        """A session ended for good (its last viewer closed it): stop the harness daemons only it drove.
+        Eviction is soft because a session may resume; this one will not. The ids are the session's own and
+        every task id its cached agent served (compression rotates the session id). Runs on a release thread
+        in the owning profile's scope: ``--reload`` waits on the daemon."""
+        from tools.browser_use_cli import stop_session_daemons
+        _lock = getattr(self, "_agent_cache_lock", None)
+        with _lock if _lock else nullcontext():
+            agent = _first_agent(self._agent_cache.get(session_key))
+        ids = {*session_ids, getattr(agent, "session_id", None), *getattr(agent, "_process_owner_task_ids", ())}
+        self._spawn_release_thread(stop_session_daemons, (ids,), f"browser-daemons-{str(session_key)[:24]}",
+                                   inline_fallback=True, session_key=session_key)
+
     def _spawn_release_thread(self, target, args: tuple, name: str, *, inline_fallback: bool,
                               session_key: Optional[str] = None) -> None:
         """Run a release on a daemon thread. ``inline_fallback`` runs it inline (best-effort) when no
