@@ -378,6 +378,10 @@ async def _run_close_lifecycle(authority, live, target, platform, reason):
     memory providers' end-of-session commit (the cached agent is evicted at a boundary, as a
     gateway ``/new`` does) and the finalize hooks under the owning profile's scope."""
     runner = authority.runner
+    # The eviction below is soft, and a resumed session builds a fresh agent, so the daemons go now: a
+    # resumable close (orphan reaps included) just meets a respawned daemon on its next browser_exec.
+    if (stop_daemons := getattr(runner, '_stop_session_browser_daemons', None)) is not None:
+        stop_daemons(live.route, (target,))
     evict = getattr(runner, '_evict_cached_agent_at_boundary', None)
     if evict is not None:
         evict(live.route)
