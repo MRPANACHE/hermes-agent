@@ -236,15 +236,15 @@ def test_a_long_first_browser_exec_owns_its_daemon_before_the_call_returns(monke
     assert owned_during_call.is_set(), "the daemon was only owned after the CLI call returned"
 
 
-def test_a_managed_worker_never_owns_its_harness_daemon(fake_daemon, registered, monkeypatch):
-    """A managed per-turn worker keeps its browser between turns (agent/managed_worker.py); owning
-    the daemon would kill it with every turn's worker, as _owns_job already avoids for jobs."""
+def test_a_managed_worker_owns_its_harness_daemon_like_any_process(fake_daemon, registered, monkeypatch):
+    """A managed worker's clean exit stops its daemons (atexit), so the supervisor only matters for a
+    killed one: it must not leave a daemon behind in the gateway's cgroup."""
     from agent import runtime_session_store
     proc, runtime = fake_daemon
     _publish(runtime, "bu", proc.pid)
     monkeypatch.setattr(runtime_session_store, "_worker_process", True)
 
     env = {"BH_RUNTIME_DIR": str(runtime), "BU_NAME": "work"}
-    assert browser_use_cli._own_harness_daemon_until_owned(env) is False  # and the in-call check stops
+    assert browser_use_cli._own_harness_daemon_until_owned(env) is False  # owned: the in-call check stops
 
-    assert registered == []
+    assert registered == [("register", [proc.pid])]
