@@ -27,7 +27,8 @@ def profile_b(tmp_path, monkeypatch):
     served = launch / "profiles" / "b"
     served.mkdir(parents=True)
     (served / "config.yaml").write_text(
-        "terminal:\n  backend: docker\n  docker_image: b-image\n", encoding="utf-8")
+        "terminal:\n  backend: docker\n  docker_image: b-image\n  home_mode: profile\n",
+        encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
     monkeypatch.setenv("HERMES_HOME", str(launch))
     monkeypatch.setenv("TERMINAL_ENV", "local")  # ambient launch-profile policy
@@ -36,7 +37,7 @@ def profile_b(tmp_path, monkeypatch):
 
 
 def test_worker_profile_scope_installs_the_assigned_profiles_terminal_policy(profile_b):
-    """The toolset-resolution seam (``bind_home=True``) reads config under B's own policy."""
+    """The toolset-resolution seam reads config under B's own policy."""
     with kanban_db_dispatch._worker_profile_scope(str(profile_b)):
         scope = get_terminal_scope() or {}
     assert scope.get("TERMINAL_ENV") == "docker"
@@ -46,7 +47,8 @@ def test_worker_profile_scope_installs_the_assigned_profiles_terminal_policy(pro
 
 def _spawn_env_for_profile_b(monkeypatch, tmp_path):
     """Run ``_default_spawn`` far enough to capture the worker env, never spawning anything."""
-    from hermes_cli.kanban_db import Task
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import process_registry
 
     captured: list[dict] = []
@@ -57,13 +59,26 @@ def _spawn_env_for_profile_b(monkeypatch, tmp_path):
 
     monkeypatch.setattr(process_registry, "systemd_user_bus_env", _capture)
 
-    task = Task(
-        id="t1", title="t", body=None, assignee="b", status="claimed", priority=0,
-        created_by=None, created_at=0, started_at=None, completed_at=None,
-        workspace_kind="dir", workspace_path=None, claim_lock=None, claim_expires=None,
-        tenant=None)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="profile-scope env projection",
+            assignee="b",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        task = kb.claim_task(conn, task_id, claimer="terminal-scope-test")
+    assert task is not None and task.current_run_id is not None
+
+    # This file checks env projection only. Restart-safe admission is exercised by
+    # test_kanban_gateway_restart_handoff.py; keep that topology seam out of these
+    # four cases while still passing a native claimed task/run to _default_spawn.
+    monkeypatch.setattr(kanban_db_dispatch, "_restart_safe_worker_argv", lambda _task, command: command)
     with pytest.raises(_StopSpawn):
-        kanban_db_dispatch._default_spawn(task, str(tmp_path / "ws"))
+        kanban_db_dispatch._default_spawn(task, str(workspace))
     assert captured, "_default_spawn never built a worker env"
     return captured[0]
 
@@ -85,7 +100,8 @@ def test_launch_profiles_own_worker_keeps_its_credentials(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(launch))
     monkeypatch.setenv("OPENAI_API_KEY", "dispatcher-launch-key")
 
-    from hermes_cli.kanban_db import Task
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import process_registry
 
     captured: list[dict] = []
@@ -95,13 +111,24 @@ def test_launch_profiles_own_worker_keeps_its_credentials(tmp_path, monkeypatch)
         raise _StopSpawn
 
     monkeypatch.setattr(process_registry, "systemd_user_bus_env", _capture)
-    task = Task(
-        id="t1", title="t", body=None, assignee="default", status="claimed", priority=0,
-        created_by=None, created_at=0, started_at=None, completed_at=None,
-        workspace_kind="dir", workspace_path=None, claim_lock=None, claim_expires=None,
-        tenant=None)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="launch profile env projection",
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        task = kb.claim_task(conn, task_id, claimer="terminal-scope-test")
+    assert task is not None and task.current_run_id is not None
+    # Restart-safe admission has dedicated coverage; this control checks only
+    # that the launch profile keeps its own credential during env projection.
+    monkeypatch.setattr(kanban_db_dispatch, "_restart_safe_worker_argv", lambda _task, command: command)
     with pytest.raises(_StopSpawn):
-        kanban_db_dispatch._default_spawn(task, str(tmp_path / "ws"))
+        kanban_db_dispatch._default_spawn(task, str(workspace))
 
     assert captured and captured[0].get("OPENAI_API_KEY") == "dispatcher-launch-key"
 
@@ -114,3 +141,47 @@ def test_worker_for_another_profile_can_still_import_hermes(profile_b, tmp_path,
     monkeypatch.setenv("PYTHONPATH", str(repo_root))
     env = _spawn_env_for_profile_b(monkeypatch, tmp_path)
     assert str(repo_root) in env.get("PYTHONPATH", "").split(os.pathsep)
+
+
+
+def test_worker_for_another_profile_keeps_the_instance_config_deployment(profile_b, tmp_path, monkeypatch):
+    """The config backend's deployment usually arrives in the launch profile's ``.env``, which is
+    launch residue for B's worker. It is the instance's, so B's worker (and the gateway it may
+    cold-start for B) keeps it; anything else from that ``.env`` does not reach B. The selected
+    backend names the deployment (``deployment_env_names``); the file backend names none, so a
+    stand-in backend names one here, through the real dispatch path."""
+    from hermes_cli import config_backend
+
+    launch = Path(os.environ["HERMES_HOME"])
+    (launch / ".env").write_text("FIXTURE_CONFIG_PLANE=plane-1\nFIXTURE_PLANE_TOKEN=secret\n", encoding="utf-8")
+    monkeypatch.setenv("FIXTURE_CONFIG_PLANE", "plane-1")
+    monkeypatch.setenv("FIXTURE_PLANE_TOKEN", "secret")
+    monkeypatch.setattr(config_backend, "deployment_env_names", lambda: frozenset({"FIXTURE_CONFIG_PLANE"}))
+    env = _spawn_env_for_profile_b(monkeypatch, tmp_path)
+    assert env.get("FIXTURE_CONFIG_PLANE") == "plane-1", "B's worker lost the instance's config deployment"
+    assert "FIXTURE_PLANE_TOKEN" not in env, "B's worker inherited the launch profile's .env credential"
+
+
+def test_worker_profile_scope_reports_the_assigned_profiles_home_mode(profile_b):
+    """``terminal.home_mode`` must survive the profile projection as a terminal policy value.
+
+    ``TERMINAL_HOME_MODE`` is the variable ``hermes_constants.get_subprocess_home`` reads, so a
+    mode the profile pins in its own ``config.yaml`` has to reach the bound scope the dispatcher
+    reads through; otherwise the profile's isolation silently is not policy at all (#146103).
+    """
+    with kanban_db_dispatch._worker_profile_scope(str(profile_b)):
+        scope = get_terminal_scope() or {}
+    assert scope.get("TERMINAL_HOME_MODE") == "profile", (
+        f"the profile's own home_mode is missing from its terminal policy: {scope!r}")
+
+
+def test_served_child_env_for_another_profile_drops_the_launch_home_mode(profile_b, monkeypatch):
+    """A child acting for B (``hermes -p b`` workers, ``key_cmd`` helpers, browser drivers) must not
+    inherit the LAUNCH profile's bridged ``TERMINAL_HOME_MODE``: B's child bridges its own
+    ``terminal.home_mode``, and an inherited one wins wherever B's config leaves it unset (#146103)."""
+    from tools.environments.local import served_profile_child_env
+
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")  # what the dispatcher's bridge exported
+    env = served_profile_child_env(target_home=str(profile_b))
+    assert "TERMINAL_HOME_MODE" not in env, (
+        f"B's child inherited the launch profile's home mode: {env['TERMINAL_HOME_MODE']!r}")
