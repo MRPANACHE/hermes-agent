@@ -244,19 +244,25 @@ def test_profile_without_command_keeps_native_agent_argv(spawn_env):
     assert captured["env"]["HERMES_HOME"] == str(root / "profiles" / "engine")
 
 
-def test_profile_without_command_keeps_native_profile_scoped_environment(
-    spawn_env, monkeypatch
+@pytest.mark.parametrize("profile_env", ["", "PROFILE_OWNED_SETTING=profile-value\n"])
+def test_profile_without_command_uses_isolated_native_owner_client_environment(
+    spawn_env, monkeypatch, profile_env
 ):
     root, workspace, captured = spawn_env
     _write_profile(root, "engine", "toolsets:\n  - hermes-cli\n")
+    (root / "profiles" / "engine" / ".env").write_text(profile_env, encoding="utf-8")
     monkeypatch.setenv("OPENAI_API_KEY", "native-worker-secret")
     monkeypatch.setenv("NATIVE_WORKER_SENTINEL", "preserve-me")
+    host_lock_dir = str(root / "locks")
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", host_lock_dir)
 
     kb._default_spawn(_make_task(), str(workspace))
 
     assert "OPENAI_API_KEY" not in captured["env"]
+    assert "NATIVE_WORKER_SENTINEL" not in captured["env"]
+    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_worker_client"]
     assert captured["env"]["HERMES_HOME"] == str(root / "profiles" / "engine")
-    assert captured["env"]["NATIVE_WORKER_SENTINEL"] == "preserve-me"
+    assert captured["env"]["HERMES_GATEWAY_LOCK_DIR"] == host_lock_dir
 
 
 @pytest.mark.parametrize(
