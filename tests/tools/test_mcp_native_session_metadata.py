@@ -29,6 +29,9 @@ def shared_connection(monkeypatch):
     session.send_request = send_request
     server = SimpleNamespace(session=session, _rpc_lock=asyncio.Lock())
     monkeypatch.setitem(mcp_tool._servers, "native-session-test", server)
+    # This fixture is the sole trust seam for the in-memory fake; production
+    # servers still enter the normal untrusted-server approval gate.
+    monkeypatch.setitem(mcp_tool._server_trust_levels, "native-session-test", "full")
     monkeypatch.setattr(mcp_tool_loop, "_run_on_mcp_loop", lambda factory, **kwargs: loop.run_until_complete(factory()))
     registry = ToolRegistry()
     registry.register(
