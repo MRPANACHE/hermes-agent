@@ -19,8 +19,10 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ## Kanban hard run limits
 
 `kanban.hard_run_limits` defaults to `false`. When enabled on the claiming
-runtime, admission retains the twenty run-hour limit across boards per
-Europe/Amsterdam calendar day. There is no per-card five-run stop and no
+runtime, admission uses the [shared daily run-hour budget](./features/kanban.md#exact-date-run-hour-budgets)
+for the Europe/Amsterdam calendar day. `kanban.daily_run_hours` sets the
+permanent cap on the dispatcher profile; without it the native default is
+twenty run-hours. There is no per-card five-run stop and no
 supervisor reset requirement. Running workers finish. Explicit `wait_only`
 scheduling receipts distinguish diagnostic work-attempt counts, but all runtime
 still consumes the daily budget. Source-bound native incident/daily-work
