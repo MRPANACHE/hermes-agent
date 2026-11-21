@@ -1885,6 +1885,8 @@ DEFAULT_CONFIG = {
         "failure_limit": 2,
         # Admission-only; activation uses the existing qualified updater route.
         "hard_run_limits": False,
+        # Optional permanent cap in whole hours for this dispatcher's shared budget.
+        "daily_run_hours": None,
         # Operator-approved overrides expire with their exact Amsterdam date.
         "daily_run_hours_overrides": {},
         # Integer percent of the day budget one profile may use, e.g. {"otto": 25}.
