@@ -22,16 +22,6 @@ from typing import Optional
 # ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
 # gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
 OWNER_WAIT_S = 180.0
-_TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
-# In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
-# retired authority's successor holds the admission the next connection reads.
-_TRANSIENT_RPC_REASONS = frozenset({'runtime_draining', 'runtime_retired'})
-# Control-socket answers a restarting owner gives (an ``inaccessible`` owner's reason, from
-# discovery or the ticket fetch): a reset or half-written answer, or a replaced owner refusing a
-# stale instance. Unsafe nodes or peers, a refused authorization, a bad pointer or a failed start
-# stay final.
-_RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_control_response',
-                                      'invalid_control_response'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
@@ -59,6 +49,7 @@ class _Claim:
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
     from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
+    from hermes_cli.gateway_owner_restart import restartable
     from websockets.exceptions import WebSocketException
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
@@ -87,7 +78,7 @@ async def run(params, board_db):
         # A restart also surfaces as a refused or reset dial, a failed handshake, or an answer
         # that never came.
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
-            if not _restartable(exc):
+            if not restartable(exc):
                 raise
             if claim.silent_for() >= OWNER_WAIT_S:
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
@@ -115,18 +106,6 @@ def _record_owner_transport_loss(board_db, params):
             kb._append_event(conn, params['task_id'], 'owner_transport_lost',
                              {'reason': 'owner_unreachable', 'claim_lock': params['claim_lock'],
                               'run_id': params['run_id']}, run_id=params['run_id'])
-
-
-def _restartable(exc):
-    """False when *exc* is the owner's own final answer; True for a restarting owner or a lost transport."""
-    from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
-    if isinstance(exc, GatewayRPCError):
-        return str(exc) in _TRANSIENT_RPC_REASONS
-    if isinstance(exc, GatewayUnavailableError):
-        return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
-    return True
-
-
 async def _discard(events):
     while True:
         await events.get()
