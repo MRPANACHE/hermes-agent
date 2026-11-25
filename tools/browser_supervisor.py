@@ -68,8 +68,11 @@ def _schedule(coro, loop, *, timeout: float):
     return fut.result(timeout=timeout)
 
 
-def _fail(error: str) -> dict[str, Any]:
-    return {"ok": False, "error": error}
+def _fail(error: str, *, code: str = "") -> dict[str, Any]:
+    return {"ok": False, "error": error, **({"code": code} if code else {})}
+
+
+_SESSION_CHANGED = "the page session changed since it was validated"
 
 
 def _err(exc: BaseException) -> dict[str, Any]:
@@ -127,6 +130,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._pending_calls: dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        # Per page session: how many top-level documents it has committed (``Page.frameNavigated``).
+        # ``evaluate_runtime`` reports the count its script was sent under; ``insert_text`` refuses
+        # once it moved, so a keystroke checked on one document never lands in the next one.
+        self._documents: dict[str, int] = {}
+        # The tab the task's browser_exec daemon last drove (``set_driven_target``); ``focus_page`` prefers it.
+        self._driven_target_id: Optional[str] = None
         # Dialog auto-dismiss watchdog handles (per dialog id) + id generator.
         self._dialog_watchdogs: dict[str, asyncio.TimerHandle] = {}
         self._dialog_seq = 0
@@ -214,21 +223,27 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                          await_promise: bool = True, timeout: float = 10.0,
                          session_id: Optional[str] = None, context_id: Optional[int] = None) -> dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
-        Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
+        Returns ``{"ok": True, "result", "result_type", "document"}`` or ``{"ok": False, "error"}``;
+        ``document`` names the top-level document the script was sent to (see ``insert_text``).
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string.
         ``session_id`` / ``context_id`` evaluate inside a frame found by :meth:`focus_frame`: an
         out-of-process iframe's session, or the page session plus the isolated-world context of an
         in-process frame. The session must still be a tracked OOPIF session or the focused page session,
-        else nothing runs; a context that died with a navigation makes Chrome refuse the call."""
+        else nothing runs; a context that died with a navigation makes Chrome refuse the call.
+        ``session_id`` pins the call to a page session the caller validated
+        (``current_page_session``), as ``insert_text`` does: it is refused once the supervisor
+        has moved to another session. None = the session the supervisor is on now."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
         with self._state_lock:
             active = self._active
-            frame_live = session_id is None or session_id == self._page_session_id or any(
-                f.is_oopif and f.cdp_session_id == session_id for f in self._frames.values())
-            session_id = session_id or self._page_session_id
+            current = self._page_session_id
+            frame_live = session_id is None or session_id == current or (
+                current is not None and any(f.cdp_session_id == session_id
+                                            for f in self._oopifs_on_page_locked(current)))
+            session_id = session_id or current
         if not active:
             return _fail("supervisor is not active")
         if not frame_live:
@@ -236,17 +251,22 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if not session_id:
             return _fail("supervisor has no attached page session")
 
-        def _run_eval(by_value: bool) -> dict[str, Any]:
+        async def _eval(params: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            # The document count is read on the loop BEFORE the script is sent: a navigation whose
+            # event lands later (before or after the script ran) moves the count past it.
+            document = self._document_of(session_id)
+            return await self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout), document
+
+        def _run_eval(by_value: bool) -> tuple[dict[str, Any], int]:
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
             if context_id:
                 params["contextId"] = context_id
-            coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
-            return _schedule(coro, loop, timeout=timeout + 1)
+            return _schedule(_eval(params), loop, timeout=timeout + 1)
 
         try:
-            response = _run_eval(return_by_value)
+            response, document = _run_eval(return_by_value)
         except Exception as exc:
             # Deep-serializing live DOM nodes / NodeLists / Window can blow past
             # CDP's recursion guard (``Object reference chain is too long``).
@@ -254,7 +274,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             if not (return_by_value and "reference chain is too long" in str(exc).lower()):
                 return _err(exc)
             try:
-                response = _run_eval(False)
+                response, document = _run_eval(False)
             except Exception as exc2:
                 return _err(exc2)
 
@@ -275,32 +295,132 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         else:
             # Non-serializable (functions, DOM nodes…) — give the model the browser's description.
             value = result_obj.get("description") or result_obj.get("unserializableValue")
-        return {"ok": True, "result": value, "result_type": result_type}
+        return {"ok": True, "result": value, "result_type": result_type, "document": document}
+
+    def _document_of(self, session_id: Optional[str]) -> int:
+        with self._state_lock:
+            return self._documents.get(session_id or "", 0)
+
+    def current_page_session(self) -> Optional[str]:
+        """The CDP session id of the page the supervisor is attached to now (None: none attached).
+
+        A caller that validates a page (``insert_text``'s focus check) pins this id and passes it
+        back, so a later ``focus_page`` or reconnect cannot silently move the keystrokes elsewhere.
+        """
+        with self._state_lock:
+            return self._page_session_id if self._active else None
+
+    def insert_text(self, text: str, *, session_id: str, document: int, timeout: float = 5.0) -> dict[str, Any]:
+        """Type ``text`` into the element that holds focus in page session ``session_id``, as TRUSTED
+        browser input.
+
+        ``Input.insertText`` is the CDP-level equivalent of a user keystroke: the page sees the
+        same ``input`` events a human would trigger, so framework-controlled inputs (React/Vue/MUI)
+        accept the value instead of reverting it — and a page cannot tell the value apart from
+        a human typing it.
+
+        TRUSTED INPUT IS ADDRESSED TO WHATEVER HOLDS FOCUS. This method does not know which
+        element that is and does not check: the caller MUST assert focus first (see
+        ``agent.vault_login_classifier.build_focus_js``) and abort if the focus is not the
+        intended field. Typing a secret into the wrong focused element leaks it.
+
+        ``session_id`` is the page session the caller validated (``current_page_session``). The
+        frame is sent on that session only, and refused when the supervisor has since moved to
+        another page session: the focus check no longer describes the page that would get the text.
+        ``document`` is what the focus check's ``evaluate_runtime`` reported: once that session has
+        committed another top-level document (a redirect, a submit) the text is refused too. Both are
+        checked on the supervisor loop immediately before the frame is sent. What remains is the
+        browser's side of the socket: a navigation that commits after the frame left, or whose event is
+        still in flight, is not seen here; the caller's read-back (origin-guarded) reports it after.
+
+        Returns ``{"ok": True}`` or ``{"ok": False, "error": <str>, "code"?}`` (``session_changed`` /
+        ``document_changed`` when the page moved). Never raises.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return _fail("supervisor loop is not running")
+        with self._state_lock:
+            active, current = self._active, self._page_session_id
+        if not active:
+            return _fail("supervisor is not active")
+        if not session_id or session_id != current:
+            return _fail(_SESSION_CHANGED, code="session_changed")
+
+        async def _type() -> Optional[dict[str, Any]]:
+            with self._state_lock:
+                moved = self._page_session_id != session_id or self._documents.get(session_id, 0) != document
+            if moved:
+                return None
+            return await self._cdp("Input.insertText", {"text": text}, session_id=session_id, timeout=timeout)
+
+        try:
+            response = _schedule(_type(), loop, timeout=timeout + 1)
+            if response is None:
+                return _fail("the page navigated or moved since it was checked", code="document_changed")
+        except Exception as exc:  # health: allow BLE001 -- trusted typing must report failure, never raise into a fill
+            return _err(exc)
+        if isinstance(response, dict) and response.get("error"):
+            return _fail(f"Input.insertText failed: {response['error']}")
+        return {"ok": True}
+
+    def set_driven_target(self, target_id: Optional[str]) -> None:
+        """Record the CDP target the task's browser_exec session drives (None: unknown)."""
+        with self._state_lock:
+            self._driven_target_id = target_id
 
     def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
         that open their own tabs (browser_exec) put the login form somewhere else. With
         ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
-        so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        so a login and a checkout tab on one site resolve to the right one. When the tab browser_exec
+        drives (``set_driven_target``) is on ``origin`` it is the only candidate, probe or not: on a shared
+        CDP browser the first same-origin tab can be another session's or a stale one. Returns
+        ``{"ok": True, "url", "session_id"}`` (the session it attached, for the caller to pin) or
+        ``{"ok": False, "error"}``; on failure the previous session stays."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
 
+        async def _attach(target_id: str) -> str:
+            attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+            sid = attach["result"]["sessionId"]
+            await self._enable_page_domains(sid, timeout=timeout)
+            await self._install_dialog_bridge(sid)
+            return sid
+
         async def _focus() -> dict[str, Any]:
-            candidates = await self._http_page_targets(origin, timeout=timeout)
+            from agent.vault_store import normalize_origin
+            targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
+            candidates = []
+            for t in targets:
+                url = str(t.get("url") or "")
+                try:
+                    # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
+                    if t.get("type") == "page" and url.startswith(("http://", "https://")) \
+                            and (not origin or normalize_origin(url) == origin):
+                        candidates.append((t["targetId"], url))
+                except Exception:
+                    continue
+            with self._state_lock:
+                driven = self._driven_target_id
+            probe = accept
+            if own := [c for c in candidates if c[0] == driven]:
+                # Focus our own tab even before its form renders (the fill then finds no field) rather
+                # than let the probe fall through to another session's tab on the same origin.
+                candidates, probe = own, None
             for target_id, url in candidates:
-                sid = await self._attach_page_target(target_id, timeout=timeout)
-                if accept:
-                    probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
+                sid = await _attach(target_id)
+                if probe:
+                    probed = await self._cdp("Runtime.evaluate", {"expression": probe, "returnByValue": True},
                                             session_id=sid, timeout=timeout)
-                    if not probe.get("result", {}).get("result", {}).get("value"):
+                    if not probed.get("result", {}).get("result", {}).get("value"):
                         await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
                         continue
                 with self._state_lock:
                     self._page_session_id = sid
-                return {"ok": True, "url": url}
+                    self._documents.setdefault(sid, 0)
+                return {"ok": True, "url": url, "session_id": sid}
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
 
         try:
@@ -350,6 +470,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             if len(frames) == 1:
                 with self._state_lock:
                     self._page_session_id = per_tab[0][0]
+                    self._documents.setdefault(per_tab[0][0], 0)
             else:  # ambiguous: nothing gets focused, so none of the fresh sessions is kept
                 for sid, _ in per_tab:
                     await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
@@ -383,6 +504,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         """Attach a fresh flattened session to a tab; its OOPIFs auto-attach (and are tracked) on it."""
         attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
         sid = attach["result"]["sessionId"]
+        self._documents.setdefault(sid, 0)
         await self._enable_page_domains(sid, timeout=timeout)
         await self._install_dialog_bridge(sid)
         return sid
@@ -518,6 +640,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
         self._page_session_id = sid = attach["result"]["sessionId"]
+        self._documents.setdefault(sid, 0)
         await self._enable_page_domains(sid, timeout=10.0)
         await self._install_dialog_bridge(sid)
 
