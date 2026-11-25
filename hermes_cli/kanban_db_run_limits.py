@@ -6,6 +6,7 @@ import json
 from zoneinfo import ZoneInfo
 
 DECISION_SCHEMA = "mrpanache.run-limit-decision.v1"
+DEFAULT_DAY_HOURS = 20
 
 
 def day_window(now: int, timezone: str = "Europe/Amsterdam") -> dict:
@@ -16,6 +17,16 @@ def day_window(now: int, timezone: str = "Europe/Amsterdam") -> dict:
     return {"timezone": timezone, "local_date": day.isoformat(),
             "window_start": start.isoformat(), "window_end": end.isoformat(),
             "start": int(start.timestamp()), "end": int(end.timestamp())}
+
+
+def day_budget_hours(config: dict, date: str) -> int:
+    """Resolve the date override, then the dispatcher profile's permanent cap."""
+    overrides = config.get("daily_run_hours_overrides")
+    override = overrides.get(date) if isinstance(overrides, dict) else None
+    for value in (override, config.get("daily_run_hours")):
+        if type(value) is int and value > 0:
+            return value
+    return DEFAULT_DAY_HOURS
 
 
 def execution_runs(conn, *, task_id=None, after_event_id=0, work_only=False):
@@ -321,11 +332,7 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
     # start a second five-run approval loop.
     hits = []
     usage = daily_usage(conn, now)
-    overrides = config.get("daily_run_hours_overrides", {})
-    budget = overrides.get(usage["local_date"], 20) if isinstance(overrides, dict) else 20
-    # Invalid input never disables or raises the cost brake.
-    if type(budget) is not int or budget <= 0:
-        budget = 20
+    budget = day_budget_hours(config, usage["local_date"])
     if usage["runtime_seconds"] >= budget * 3600:
         exception = _exception(conn, task_id)
         daily = {"limit_key": "daily_run_hours", "observed": usage["hours"], "threshold": budget, "unit": "hours",
