@@ -1,6 +1,6 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 
 import { registerFloatingComposer } from '@/app/chat/composer/floating-target'
 import { $reactionsEnabled } from '@/store/reactions-enabled'
@@ -61,5 +61,10 @@ describe('assistant reaction picker', () => {
 
     expect(screen.queryByRole('button', { name: '👍' })).not.toBeNull()
     expect(trigger?.getAttribute('data-state')).toBe('open')
+
+    const picker = screen.getByRole('dialog')
+    const restoreFocus = vi.fn()
+    picker.addEventListener('focusScope.autoFocusOnUnmount', restoreFocus, { once: true })
+    onTestFinished(() => expect(restoreFocus).toHaveBeenCalledTimes(1))
   })
 })

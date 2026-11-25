@@ -1,4 +1,6 @@
-import { configure } from '@testing-library/react'
+import { setTimeout as waitForTimer } from 'node:timers/promises'
+
+import { cleanup, configure } from '@testing-library/react'
 import { afterEach } from 'vitest'
 
 import { clearPlaybackSourceCache } from './src/lib/playback-source-cache'
@@ -81,6 +83,13 @@ if ('Element' in globalThis) {
 // genuinely hung await still surfaces as this assertion, not a test timeout.
 configure({ asyncUtilTimeout: 12_000 })
 
-// Resolved stream URLs outlive a mount on purpose; a test file reusing one path must not
-// inherit the previous case's source.
-afterEach(() => clearPlaybackSourceCache())
+afterEach(async () => {
+  // Radix restores focus in a zero-delay timer on unmount. Let it dispatch
+  // against the current jsdom window before Vitest restores Node's globals.
+  // Use a real timer so this also settles when a test used fake timers.
+  cleanup()
+  await waitForTimer(0)
+
+  // Resolved stream URLs outlive a mount; do not carry them into the next test.
+  clearPlaybackSourceCache()
+})
