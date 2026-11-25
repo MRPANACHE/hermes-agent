@@ -5,6 +5,25 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+
+def would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """True iff parent_id is already a descendant of child_id."""
+    seen = set()
+    stack = [child_id]
+    while stack:
+        node = stack.pop()
+        if node == parent_id:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        rows = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (node,)
+        ).fetchall()
+        stack.extend(r["child_id"] for r in rows)
+    return False
+
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
     created_at: int,
