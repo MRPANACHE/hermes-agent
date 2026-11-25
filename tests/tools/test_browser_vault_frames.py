@@ -37,6 +37,7 @@ TOP = "https://books.example.test"        # frameset page
 LOGIN = "https://login20.example.test"    # the item's saved origin: the login frame
 OTHER = "https://ads.example.test"
 PASSWORD = "synthetic-pw-7c1e"
+_WRITE = "let filled = 0"
 
 PASSWORD_CONTROLS = [
     {"autocomplete": "username", "formIndex": 0, "index": 0, "label": "", "name": "user", "type": "text"},
@@ -77,12 +78,15 @@ class FakeBrowser:
     def _ctx(self, session_id, context_id=None):
         if context_id:
             return self.in_process[context_id]
-        return self.frames[session_id] if session_id else self.top
+        return self.frames[session_id] if session_id not in (None, "PAGE") else self.top
+
+    def current_page_session(self):
+        return "PAGE"
 
     def focus_page(self, origin, *, accept=None, timeout=10.0):
         has_form = any(c["type"] == "password" or c["autocomplete"] == "one-time-code" for c in self.top.controls)
         ok = (not origin or origin == self.top.origin) and has_form
-        return {"ok": True, "url": self.top.origin + "/"} if ok else {"ok": False, "error": "no open page"}
+        return {"ok": True, "url": self.top.origin + "/", "session_id": "PAGE"} if ok else {"ok": False, "error": "no open page"}
 
     def focus_frame(self, origins, *, accept=None, timeout=10.0):
         want_otp = bool(accept and "one-time-code" in accept)
@@ -98,20 +102,25 @@ class FakeBrowser:
         return {"ok": True, "frames": found} if found else {"ok": False, "error": "no frame"}
 
     def evaluate_runtime(self, expression, *, session_id=None, context_id=None, **_):
-        where = f"{session_id}#{context_id}" if context_id else (session_id or "top")
+        where = f"{session_id}#{context_id}" if context_id else ("top" if session_id in (None, "PAGE") else session_id)
         if context_id and (session_id != "PAGE" or context_id not in self.in_process):
             return {"ok": False, "error": "Cannot find context with specified id"}
-        if session_id and not context_id and session_id not in self.frames:
+        if session_id not in (None, "PAGE") and not context_id and session_id not in self.frames:
             return {"ok": False, "error": "frame session is no longer attached"}
         ctx = self._ctx(session_id, context_id)
         if expression == "window.location.href":
             self.calls.append((where, "href"))
             return {"ok": True, "result": ctx.origin + "/bh/"}
-        if "expectedOrigin" in expression:
-            self.calls.append((where, "fill"))
-            expected = json.loads(re.search(r"const expectedOrigin = (\"[^\"]*\");", expression).group(1))
+        guard = re.search(r'window\.location\.origin !== ("[^"]*")', expression)
+        if guard and (_WRITE in expression or "let landed = 0" in expression):
+            expected = json.loads(guard.group(1))
             if expected != ctx.origin:  # the in-frame assert
                 return {"ok": True, "result": json.dumps({"refused": "origin_changed", "found": ctx.origin})}
+            if "let landed = 0" in expression:
+                held = next((script for target, script in reversed(self.written) if target == where), "")
+                landed = len(re.findall(r'"index":', held))
+                return {"ok": True, "result": json.dumps({"landed": landed, "reverted": 0, "missing": []})}
+            self.calls.append((where, "fill"))
             self.written.append((where, expression))
             return {"ok": True, "result": json.dumps({"filled": len(re.findall(r'"index":', expression))})}
         if "querySelectorAll" in expression:
@@ -143,7 +152,7 @@ class TestFillInCrossOriginFrame:
 
         meta = _add_login(store)
         browser = FakeBrowser(TOP, frames={"S-login": (LOGIN, PASSWORD_CONTROLS)})
-        raw, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id), browser, store)
+        raw, out = _run(lambda: browser_vault_tool.browser_vault_fill(meta.id, with_identifier=False), browser, store)
         assert out["success"] is True and out["filled_fields"] == 1
         assert out["origin"] == LOGIN and out["in_frame"] is True
         # inspection and the write both ran in the frame; the top page only answered its origin
@@ -151,7 +160,7 @@ class TestFillInCrossOriginFrame:
         assert ("top", "inspect") not in browser.calls and ("top", "fill") not in browser.calls
         (where, expr), = browser.written
         assert where == "S-login"
-        assert f'const expectedOrigin = "{LOGIN}";' in expr and TOP not in expr
+        assert f'window.location.origin !== "{LOGIN}"' in expr and TOP not in expr
         assert PASSWORD in expr  # the secret went to the page, not the result
 
     def test_frame_on_a_different_origin_is_refused(self, store):
@@ -233,7 +242,7 @@ class TestFillInCrossOriginFrame:
         real_eval = browser.evaluate_runtime
 
         def navigate_then_eval(expression, **kw):
-            if "expectedOrigin" in expression:
+            if _WRITE in expression:
                 browser.frames["S-login"].origin = OTHER
             return real_eval(expression, **kw)
 
@@ -250,7 +259,7 @@ class TestFillInCrossOriginFrame:
         real_eval = browser.evaluate_runtime
 
         def detach_then_eval(expression, **kw):
-            if "expectedOrigin" in expression:
+            if _WRITE in expression:
                 browser.frames.pop("S-login")
             return real_eval(expression, **kw)
 
@@ -303,7 +312,7 @@ class TestFillInInProcessFrame:
         assert ("PAGE#7", "inspect") in browser.calls and ("top", "inspect") not in browser.calls
         (where, expr), = browser.written
         assert where == "PAGE#7"
-        assert f'const expectedOrigin = "{LOGIN}";' in expr and TOP not in expr
+        assert f'window.location.origin !== "{LOGIN}"' in expr and TOP not in expr
 
     def test_in_process_frame_on_a_different_origin_is_refused(self, store):
         from tools import browser_vault_tool
@@ -331,7 +340,7 @@ class TestFillInInProcessFrame:
         real_eval = browser.evaluate_runtime
 
         def navigate_then_eval(expression, **kw):
-            if "expectedOrigin" in expression:
+            if _WRITE in expression:
                 browser.in_process[7].origin = OTHER
             return real_eval(expression, **kw)
 
@@ -358,7 +367,7 @@ class TestFillInInProcessFrame:
         real_eval = browser.evaluate_runtime
 
         def reload_then_eval(expression, **kw):
-            if "expectedOrigin" in expression:
+            if _WRITE in expression:
                 browser.in_process.pop(7)  # the frame reloaded: its isolated world is gone
             return real_eval(expression, **kw)
 
@@ -374,7 +383,7 @@ class TestFillInInProcessFrame:
         raw, out = _run(lambda: browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"), browser, store)
         assert out["success"] is True and out["origin"] == LOGIN and out["in_frame"] is True
         (where, expr), = browser.written
-        assert where == "PAGE#7" and f'const expectedOrigin = "{LOGIN}";' in expr
+        assert where == "PAGE#7" and f'window.location.origin !== "{LOGIN}"' in expr
         assert re.search(r'"value": "(\d{6})"', expr).group(1) not in raw
 
 
@@ -415,7 +424,7 @@ class TestEnterCodeOrigin:
         assert out["success"] is True and out["source"] == "local"
         assert out["origin"] == LOGIN and out["in_frame"] is True
         (where, expr), = browser.written
-        assert where == "S-login" and f'const expectedOrigin = "{LOGIN}";' in expr
+        assert where == "S-login" and f'window.location.origin !== "{LOGIN}"' in expr
         code = re.search(r'"value": "(\d{6})"', expr).group(1)
         assert code not in raw
 
@@ -443,11 +452,10 @@ class TestEnterCodeOrigin:
 def _supervisor(cdp_fn, page_sid="PAGE"):
     from tools.browser_supervisor import CDPSupervisor
 
-    sup = object.__new__(CDPSupervisor)
-    sup._state_lock = threading.Lock()
+    sup = CDPSupervisor("fixture", "ws://example.invalid")
     sup._active = True
     sup._page_session_id = page_sid
-    sup._frames = {}
+
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True)
     thread.start()
