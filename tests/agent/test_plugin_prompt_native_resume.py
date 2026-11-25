@@ -13,16 +13,17 @@ from agent.system_prompt import (
 )
 from hermes_cli import plugins
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
-from hermes_state import SessionDB
+from persistence_assembly import open_persistence, profile_scope
 from run_agent import AIAgent
+from tests.fixtures.storage_seed import seed_session
 
 
-def _agent(session_id, db=None):
+def _agent(session_id, store=None):
     return AIAgent(
         api_key="test-key", base_url="https://openrouter.ai/api/v1",
         model="test/model", provider="openrouter", platform="cli",
         quiet_mode=True, skip_context_files=True, skip_memory=True,
-        session_id=session_id, session_db=db,
+        session_id=session_id, persistence=store,
     )
 
 
@@ -53,16 +54,15 @@ def test_real_renderer_resume_restores_original_sections_before_rebuild(profile_
         return state["generation"]
 
     _section(monkeypatch, render)
-    db = SessionDB(db_path=profile_home / "state.db")
-    try:
-        db.ensure_session("native-section-resume", source="cli", model="test/model")
-        first = _agent("native-section-resume", db)
+    with open_persistence(profile_scope(home=profile_home)) as store:
+        seed_session(store, "native-section-resume", "cli", model="test/model")
+        first = _agent("native-section-resume", store)
         _restore_or_build_system_prompt(first, None, [])
         original = first._cached_system_prompt
         assert _active_profile_line(first) in original
         state["generation"] = "current B"
 
-        resumed = _agent("native-section-resume", db)
+        resumed = _agent("native-section-resume", store)
         _restore_or_build_system_prompt(resumed, None, [{"role": "user", "content": "continue"}])
         assert resumed._cached_system_prompt == original
         assert [section.content for section in resumed._plugin_system_prompt_sections_snapshot] == ["original A 🌱"]
@@ -74,8 +74,7 @@ def test_real_renderer_resume_restores_original_sections_before_rebuild(profile_
         rebuilt = build_system_prompt(resumed)
         assert "current B" in rebuilt
         assert state["calls"] == 2
-    finally:
-        db.close()
+
 
 
 def test_legacy_tail_and_rejected_profile_frame_and_length(profile_home, monkeypatch):
