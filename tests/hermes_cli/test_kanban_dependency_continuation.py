@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_graph as graph
 from hermes_cli.kanban import kanban_command
 from hermes_cli.kanban_parser import build_parser
 
@@ -216,7 +217,7 @@ class DependencyContinuation(unittest.TestCase):
     def test_superseded_event_stops_later_promotion_and_claim(self):
         obsolete = kb.create_task(self.conn, title="fixture obsolete", assignee="builder")
         successor = kb.create_task(self.conn, title="fixture successor", assignee="builder")
-        self.assertTrue(kb.supersede_task(self.conn, obsolete, successor))
+        self.assertTrue(graph.supersede_task(self.conn, obsolete, successor))
         self.assertEqual(self.task_status(obsolete), "ready")
 
         # Model a stale status restore: durable supersession still gates every native start path.
@@ -242,7 +243,7 @@ class DependencyContinuation(unittest.TestCase):
         for successor in (obsolete, "missing-successor"):
             with self.subTest(successor=successor):
                 with self.assertRaises(ValueError):
-                    kb.supersede_task(self.conn, obsolete, successor)
+                    graph.supersede_task(self.conn, obsolete, successor)
                 self.assertEqual(self.task_status(obsolete), "ready")
                 self.assertEqual(
                     [(event.id, event.kind) for event in kb.list_events(self.conn, obsolete)],
@@ -250,15 +251,15 @@ class DependencyContinuation(unittest.TestCase):
                 )
 
         successor = kb.create_task(self.conn, title="fixture replacement", assignee="builder")
-        self.assertTrue(kb.supersede_task(self.conn, obsolete, successor))
-        self.assertTrue(kb.supersede_task(self.conn, obsolete, successor))
+        self.assertTrue(graph.supersede_task(self.conn, obsolete, successor))
+        self.assertTrue(graph.supersede_task(self.conn, obsolete, successor))
         self.assertEqual(
             sum(event.kind == "superseded" for event in kb.list_events(self.conn, obsolete)),
             1,
         )
         successor_events = [(event.id, event.kind) for event in kb.list_events(self.conn, successor)]
         with self.assertRaisesRegex(ValueError, "supersession would create a cycle"):
-            kb.supersede_task(self.conn, successor, obsolete)
+            graph.supersede_task(self.conn, successor, obsolete)
         self.assertEqual(
             [(event.id, event.kind) for event in kb.list_events(self.conn, successor)],
             successor_events,
@@ -271,7 +272,7 @@ class DependencyContinuation(unittest.TestCase):
         self.assertIsNotNone(run)
 
         with self.assertRaisesRegex(ValueError, "stop its worker through the native lifecycle first"):
-            kb.supersede_task(self.conn, obsolete, successor)
+            graph.supersede_task(self.conn, obsolete, successor)
 
         self.assertEqual(self.task_status(obsolete), "running")
         self.assertNotIn("superseded", [event.kind for event in kb.list_events(self.conn, obsolete)])
@@ -279,7 +280,7 @@ class DependencyContinuation(unittest.TestCase):
     def test_supersession_survives_event_retention(self):
         obsolete = kb.create_task(self.conn, title="obsolete", assignee="builder")
         successor = kb.create_task(self.conn, title="replacement", assignee="builder")
-        kb.supersede_task(self.conn, obsolete, successor)
+        graph.supersede_task(self.conn, obsolete, successor)
         kb.archive_task(self.conn, obsolete)
         self.conn.execute("UPDATE task_events SET created_at=1 WHERE task_id=?", (obsolete,))
         self.conn.commit()

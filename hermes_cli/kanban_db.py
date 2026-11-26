@@ -3924,20 +3924,6 @@ def specify_triage_task(
 
 
 
-def supersede_task(conn: sqlite3.Connection, task_id: str, successor_id: str) -> bool:
-    """Record a replacement without changing task status, links, or successor state."""
-    from hermes_cli.kanban_db_graph import record_task_supersession
-
-    with write_txn(conn):
-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if row is None:
-            return False
-        if row["status"] == "running":
-            raise ValueError("cannot supersede a running task; stop its worker through the native lifecycle first")
-        record_task_supersession(conn, task_id, successor_id)
-    return True
-
-
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
@@ -4185,17 +4171,6 @@ def _to_epoch(val) -> Optional[int]:
         return int(dt.timestamp())
     except (ValueError, OSError):
         return None
-
-
-def task_age(task: Task) -> dict:
-    """Return age metrics for a single task. All values are seconds or None."""
-    now = int(time.time())
-    _c, _s, _co = task.created_at, task.started_at, task.completed_at  # from_row coerced
-    return {
-        "created_age_seconds": now - _c if _c is not None else None,
-        "started_age_seconds": now - _s if _s is not None else None,
-        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
-    }
 
 
 # --- Retention + garbage collection ---

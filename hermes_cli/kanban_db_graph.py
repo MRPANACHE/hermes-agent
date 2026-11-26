@@ -15,6 +15,20 @@ def is_task_superseded(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is not None
 
 
+def supersede_task(conn: sqlite3.Connection, task_id: str, successor_id: str) -> bool:
+    """Record a replacement without changing task status, links, or successor state."""
+    from hermes_cli.kanban_db import write_txn
+
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "running":
+            raise ValueError("cannot supersede a running task; stop its worker through the native lifecycle first")
+        record_task_supersession(conn, task_id, successor_id)
+    return True
+
+
 def _recorded_successor(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     events = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'superseded' ORDER BY id",

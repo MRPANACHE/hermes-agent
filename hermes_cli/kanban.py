@@ -1147,8 +1147,10 @@ def _cmd_archive(args: argparse.Namespace) -> int:
 
 
 def _cmd_supersede(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_db_graph import supersede_task
+
     with kbc.connect_closing() as conn:
-        if not kb.supersede_task(conn, args.task_id, args.successor_id):
+        if not supersede_task(conn, args.task_id, args.successor_id):
             return _err(f"no such task: {args.task_id}")
     print(f"Superseded {args.task_id} by {args.successor_id}")
     return 0
