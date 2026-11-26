@@ -2105,7 +2105,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries, "
             "block_kind, block_recurrences, current_run_id "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND NOT EXISTS (SELECT 1 FROM task_events e "
+            "WHERE e.task_id = tasks.id AND e.kind = 'superseded')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2185,6 +2187,10 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    from hermes_cli.kanban_db_graph import is_task_superseded
+
+    if is_task_superseded(conn, task_id):
+        return None
     from hermes_cli.kanban_db_run_limits import enforce_run_limits
     if not enforce_run_limits(conn, task_id, source_status, now):
         return None
@@ -3564,9 +3570,13 @@ def promote_task(
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
     Refused while a parent is unfinished; ``dry_run`` only validates.
     Returns ``(ok, reason)``."""
+    from hermes_cli.kanban_db_graph import is_task_superseded
+
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
+    if is_task_superseded(conn, task_id):
+        return False, f"task {task_id} has been superseded"
 
     if cur_status not in ("todo", "blocked"):
         return False, (
@@ -4163,17 +4173,6 @@ def _to_epoch(val) -> Optional[int]:
         return None
 
 
-def task_age(task: Task) -> dict:
-    """Return age metrics for a single task. All values are seconds or None."""
-    now = int(time.time())
-    _c, _s, _co = task.created_at, task.started_at, task.completed_at  # from_row coerced
-    return {
-        "created_age_seconds": now - _c if _c is not None else None,
-        "started_age_seconds": now - _s if _s is not None else None,
-        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
-    }
-
-
 # --- Retention + garbage collection ---
 
 def _retention_seconds(older_than_seconds: int) -> int:
@@ -4193,7 +4192,7 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune old done/archived events, retaining graph identity until task deletion.
 
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
@@ -4201,7 +4200,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed', 'superseded') AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)

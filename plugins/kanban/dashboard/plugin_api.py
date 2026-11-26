@@ -178,12 +178,23 @@ BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
+def _task_age(task: kanban_db.Task) -> dict:
+    """Return age metrics for a single task. All values are seconds or None."""
+    now = int(time.time())
+    _c, _s, _co = task.created_at, task.started_at, task.completed_at
+    return {
+        "created_age_seconds": now - _c if _c is not None else None,
+        "started_age_seconds": now - _s if _s is not None else None,
+        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
+    }
+
+
 def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
                current_run_started_at: Optional[int] = None) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
-        d["age"] = kanban_db.task_age(task)
+        d["age"] = _task_age(task)
     except Exception:
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
