@@ -1,9 +1,71 @@
-"""Task graph initialization and atomic decomposition persistence."""
+"""Task graph state, supersession, and atomic decomposition persistence."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from typing import Any, Optional
+
+
+def is_task_superseded(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether the task has a durable native supersession event."""
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'superseded' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def _recorded_successor(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'superseded' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    if not events:
+        return None
+    recorded = None
+    for event in events:
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"task {task_id} has a malformed supersession event") from exc
+        successor_id = payload.get("successor_id") if isinstance(payload, dict) else None
+        if not isinstance(successor_id, str) or not successor_id:
+            raise ValueError(f"task {task_id} has a malformed supersession event")
+        if recorded is not None and recorded != successor_id:
+            raise ValueError(f"task {task_id} has conflicting supersession events")
+        recorded = successor_id
+    return recorded
+
+
+def record_task_supersession(
+    conn: sqlite3.Connection, task_id: str, successor_id: str,
+) -> bool:
+    """Append the task's one-to-one replacement relation inside the caller's txn."""
+    if not isinstance(successor_id, str) or not successor_id.strip():
+        raise ValueError("successor task id is required")
+    if task_id == successor_id:
+        raise ValueError("a task cannot supersede itself")
+    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (successor_id,)).fetchone() is None:
+        raise ValueError(f"unknown successor task: {successor_id}")
+
+    recorded = _recorded_successor(conn, task_id)
+    if recorded is not None:
+        if recorded == successor_id:
+            return False
+        raise ValueError(f"task {task_id} is already superseded by {recorded}")
+
+    visited = {task_id}
+    current = successor_id
+    while current is not None:
+        if current in visited:
+            raise ValueError("supersession would create a cycle")
+        visited.add(current)
+        current = _recorded_successor(conn, current)
+
+    from hermes_cli.kanban_db import _append_event
+
+    _append_event(conn, task_id, "superseded", {"successor_id": successor_id})
+    return True
 
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,

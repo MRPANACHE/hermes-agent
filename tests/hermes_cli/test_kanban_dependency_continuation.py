@@ -3,13 +3,16 @@
 Run with the owner checkout on PYTHONPATH and its Python interpreter. No live
 board, guard, dispatcher, profile, or model is used.
 """
-from pathlib import Path
+import argparse
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban import kanban_command
+from hermes_cli.kanban_parser import build_parser
 
 
 class DependencyContinuation(unittest.TestCase):
@@ -32,6 +35,12 @@ class DependencyContinuation(unittest.TestCase):
         self.path_home.stop()
         self.env.stop()
         self.tmp.cleanup()
+
+    def task_status(self, task_id):
+        task = kb.get_task(self.conn, task_id)
+        if task is None:
+            raise AssertionError(f"missing fixture task: {task_id}")
+        return task.status
 
     def waiting(self):
         parent = kb.create_task(self.conn, title="fixture release", assignee="owner")
@@ -146,6 +155,139 @@ class DependencyContinuation(unittest.TestCase):
         self.conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (int(kb.time.time()) - 5, tid))
         self.conn.commit()
         self.assertEqual(kb.check_respawn_guard(self.conn, tid), "recent_success")
+
+    def test_archiving_parent_skips_replaced_dependency_and_preserves_successor_hold(self):
+        parent = kb.create_task(self.conn, title="fixture superseded parent", assignee="owner")
+        obsolete = kb.create_task(
+            self.conn, title="fixture replaced dependent", assignee="builder", parents=(parent,),
+        )
+        kb.add_comment(self.conn, obsolete, author="owner", body="Superseded by the replacement task.")
+        history_before = [(event.id, event.kind) for event in kb.list_events(self.conn, obsolete)]
+        comments_before = [(comment.id, comment.body) for comment in kb.list_comments(self.conn, obsolete)]
+        dependencies_before = kb.unsatisfied_parents(self.conn, obsolete)
+
+        hold = kb.create_task(self.conn, title="fixture operator hold", assignee="owner")
+        self.assertTrue(kb.block_task(self.conn, hold, reason="fixture hold", kind="needs_input"))
+        successor = kb.create_task(
+            self.conn, title="fixture successor", assignee="builder", parents=(hold,),
+        )
+        valid_child = kb.create_task(
+            self.conn, title="fixture valid dependent", assignee="builder", parents=(parent,),
+        )
+        self.assertEqual(self.task_status(obsolete), "todo")
+        self.assertEqual(self.task_status(successor), "todo")
+        self.assertEqual(self.task_status(valid_child), "todo")
+
+        parser = argparse.ArgumentParser()
+        build_parser(parser.add_subparsers())
+        args = parser.parse_args(["kanban", "supersede", obsolete, successor])
+        self.assertEqual(kanban_command(args), 0)
+        self.assertEqual(self.task_status(obsolete), "todo")
+        self.assertEqual(kb.unsatisfied_parents(self.conn, obsolete), dependencies_before)
+
+        events = kb.list_events(self.conn, obsolete)
+        self.assertEqual(
+            [(event.id, event.kind) for event in events[:len(history_before)]],
+            history_before,
+        )
+        self.assertEqual(events[-1].kind, "superseded")
+        self.assertEqual(events[-1].payload, {"successor_id": successor})
+        self.assertEqual(
+            comments_before,
+            [(comment.id, comment.body) for comment in kb.list_comments(self.conn, obsolete)],
+        )
+
+        # Ordinary archived-parent semantics remain intact for non-replaced work.
+        self.assertTrue(kb.archive_task(self.conn, parent))
+        self.assertEqual(self.task_status(valid_child), "ready")
+        self.assertIn("promoted", [event.kind for event in kb.list_events(self.conn, valid_child)])
+        self.assertEqual(self.task_status(obsolete), "todo")
+        self.assertNotIn("promoted", [event.kind for event in kb.list_events(self.conn, obsolete)])
+
+        # The replacement's independent blocked parent remains a hold.
+        self.assertEqual(self.task_status(hold), "blocked")
+        self.assertEqual(self.task_status(successor), "todo")
+        self.assertEqual(kb.unsatisfied_parents(self.conn, successor), [(hold, "blocked")])
+        self.assertNotIn("promoted", [event.kind for event in kb.list_events(self.conn, successor)])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id IN (?, ?)", (obsolete, successor),
+        ).fetchone()[0], 0)
+
+    def test_superseded_event_stops_later_promotion_and_claim(self):
+        obsolete = kb.create_task(self.conn, title="fixture obsolete", assignee="builder")
+        successor = kb.create_task(self.conn, title="fixture successor", assignee="builder")
+        self.assertTrue(kb.supersede_task(self.conn, obsolete, successor))
+        self.assertEqual(self.task_status(obsolete), "ready")
+
+        # Model a stale status restore: durable supersession still gates every native start path.
+        self.conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (obsolete,))
+        self.conn.commit()
+        self.assertEqual(kb.recompute_ready(self.conn), 0)
+        self.assertEqual(self.task_status(obsolete), "todo")
+        promoted, reason = kb.promote_task(self.conn, obsolete, actor="fixture")
+        self.assertFalse(promoted)
+        self.assertIn("superseded", reason)
+
+        self.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (obsolete,))
+        self.conn.commit()
+        self.assertIsNone(kb.claim_task(self.conn, obsolete))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (obsolete,),
+        ).fetchone()[0], 0)
+        self.assertNotIn("claimed", [event.kind for event in kb.list_events(self.conn, obsolete)])
+
+    def test_supersession_requires_a_distinct_existing_successor_atomically(self):
+        obsolete = kb.create_task(self.conn, title="fixture invalid supersession", assignee="builder")
+        before = [(event.id, event.kind) for event in kb.list_events(self.conn, obsolete)]
+        for successor in (obsolete, "missing-successor"):
+            with self.subTest(successor=successor):
+                with self.assertRaises(ValueError):
+                    kb.supersede_task(self.conn, obsolete, successor)
+                self.assertEqual(self.task_status(obsolete), "ready")
+                self.assertEqual(
+                    [(event.id, event.kind) for event in kb.list_events(self.conn, obsolete)],
+                    before,
+                )
+
+        successor = kb.create_task(self.conn, title="fixture replacement", assignee="builder")
+        self.assertTrue(kb.supersede_task(self.conn, obsolete, successor))
+        self.assertTrue(kb.supersede_task(self.conn, obsolete, successor))
+        self.assertEqual(
+            sum(event.kind == "superseded" for event in kb.list_events(self.conn, obsolete)),
+            1,
+        )
+        successor_events = [(event.id, event.kind) for event in kb.list_events(self.conn, successor)]
+        with self.assertRaisesRegex(ValueError, "supersession would create a cycle"):
+            kb.supersede_task(self.conn, successor, obsolete)
+        self.assertEqual(
+            [(event.id, event.kind) for event in kb.list_events(self.conn, successor)],
+            successor_events,
+        )
+
+    def test_running_task_must_be_stopped_before_supersession(self):
+        obsolete = kb.create_task(self.conn, title="fixture active obsolete", assignee="builder")
+        successor = kb.create_task(self.conn, title="fixture replacement", assignee="builder")
+        run = kb.claim_task(self.conn, obsolete)
+        self.assertIsNotNone(run)
+
+        with self.assertRaisesRegex(ValueError, "stop its worker through the native lifecycle first"):
+            kb.supersede_task(self.conn, obsolete, successor)
+
+        self.assertEqual(self.task_status(obsolete), "running")
+        self.assertNotIn("superseded", [event.kind for event in kb.list_events(self.conn, obsolete)])
+
+    def test_supersession_survives_event_retention(self):
+        obsolete = kb.create_task(self.conn, title="obsolete", assignee="builder")
+        successor = kb.create_task(self.conn, title="replacement", assignee="builder")
+        kb.supersede_task(self.conn, obsolete, successor)
+        kb.archive_task(self.conn, obsolete)
+        self.conn.execute("UPDATE task_events SET created_at=1 WHERE task_id=?", (obsolete,))
+        self.conn.commit()
+        kb.gc_events(self.conn, older_than_seconds=0)
+        self.assertEqual([e.kind for e in kb.list_events(self.conn, obsolete)], ["superseded"])
+        self.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (obsolete,))
+        self.conn.commit()
+        self.assertIsNone(kb.claim_task(self.conn, obsolete))
 
 
 if __name__ == "__main__":

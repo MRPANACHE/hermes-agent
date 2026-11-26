@@ -209,7 +209,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "promote", "supersede", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1146,6 +1146,14 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_supersede(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        if not kb.supersede_task(conn, args.task_id, args.successor_id):
+            return _err(f"no such task: {args.task_id}")
+    print(f"Superseded {args.task_id} by {args.successor_id}")
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
@@ -1343,7 +1351,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "supersede": _cmd_supersede, "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
