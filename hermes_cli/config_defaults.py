@@ -1883,10 +1883,9 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
-        # Admission-only; activation uses the existing qualified updater route.
-        "hard_run_limits": False,
-        # Operator-approved overrides expire with their exact Amsterdam date.
-        "daily_run_hours_overrides": {},
+        "hard_run_limits": False,  # Admission-only; activation uses the qualified updater.
+        "daily_run_hours": None,  # Optional permanent cap in whole hours for this dispatcher.
+        "daily_run_hours_overrides": {},  # Operator-approved, exact Amsterdam date only.
         # Integer percent of the day budget one profile may use, e.g. {"otto": 25}.
         "daily_run_share_per_assignee": {},
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more

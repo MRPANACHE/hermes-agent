@@ -148,3 +148,72 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
             store._outbox_owner.close()
     finally:
         db.close()
+
+
+def test_committed_sidecar_with_lost_ack_recovers_exactly_once(tmp_path):
+    """A late owner reply must not strand an already committed sidecar patch."""
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+
+    db = SessionDB(tmp_path / 'state.db')
+    db.create_session('owned', 'cli')
+    epoch = begin_runtime_epoch(db, instance_id='fixture')
+    scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
+    register_worker_execution(db, **scope, kind='compute', adoption_secret='fixture')
+    requests = []
+
+    def rpc(method, **params):
+        requests.append(params)
+        result = mutate_worker_execution(db, **params)
+        if len(requests) == 1:
+            raise TimeoutError('worker_receipt_timeout')
+        return result
+
+    store = RuntimeSessionStore(rpc, scope, tmp_path / 'outbox')
+    try:
+        store.patch_session_model_config('owned', {'_usage_anchor': {'fixture': 1}})
+        assert len(requests) == 2 and requests[0] == requests[1]
+        assert db._conn.execute('SELECT count(*) FROM worker_receipts').fetchone()[0] == 1
+        assert store.journal['pending'] == []
+        assert store.flush_token_counts()
+    finally:
+        store._outbox_owner.close()
+        db.close()
+
+
+@pytest.mark.parametrize('operation, message', [
+    ('turn.renew', 'worker_receipt_timeout'),
+    ('session.sidecars', 'unrelated_timeout'),
+])
+def test_other_ambiguous_operations_are_not_retried(tmp_path, operation, message):
+    calls = []
+    def rpc(method, **params):
+        calls.append(params)
+        raise TimeoutError(message)
+    store = RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'outbox')
+    try:
+        with pytest.raises(TimeoutError, match=message):
+            store._apply(operation, {})
+        assert len(calls) == 1
+        assert len(store.journal['pending']) == 1
+        with pytest.raises(WorkerPersistenceError, match=message):
+            store.flush_token_counts()
+    finally:
+        store._outbox_owner.close()
+
+
+def test_repeated_sidecar_timeout_remains_sticky_with_original_pending(tmp_path):
+    calls = []
+    def rpc(method, **params):
+        calls.append(params)
+        raise TimeoutError('worker_receipt_timeout')
+    store = RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'outbox')
+    try:
+        with pytest.raises(TimeoutError, match='worker_receipt_timeout'):
+            store.patch_session_model_config('s', {'_usage_anchor': {'fixture': 1}})
+        assert len(calls) == 2 and calls[0] == calls[1]
+        assert len(store.journal['pending']) == 1
+        with pytest.raises(WorkerPersistenceError, match='worker_receipt_timeout'):
+            store.flush_token_counts()
+    finally:
+        store._outbox_owner.close()

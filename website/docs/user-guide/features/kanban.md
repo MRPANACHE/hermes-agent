@@ -28,15 +28,20 @@ for `cli`; new gateway-only releases must use `gateway`. Invalid transport value
 refuse before worker start. Direct `worker.command` profiles are unchanged.
 Daily admission and restart-safe process supervision apply to both routes.
 
-### Exact-date run-hour budgets
+### Daily run-hour budgets {#exact-date-run-hour-budgets}
 
-With `kanban.hard_run_limits: true`, admission keeps the shared-board 20-hour
-Europe/Amsterdam calendar-day brake. Per-card run counts do not stop owner
-repairs. An operator-approved temporary budget uses
-`kanban.daily_run_hours_overrides`: exact `YYYY-MM-DD` dates mapped to positive
-integer hours. Only the matching local date receives an override; absent or
-invalid values retain 20 hours. Exhaustion defers claims without blocking cards
-or cancelling active runs. This setting is not execution authority.
+With `kanban.hard_run_limits: true`, the dispatcher limits new claims against
+the shared-board usage for the Europe/Amsterdam calendar day. Set
+`kanban.daily_run_hours` in the dispatcher's profile for an operator-approved
+permanent cap, as a positive whole number of hours. Without a valid setting the
+native cap remains 20 hours. `kanban.daily_run_hours_overrides` takes precedence
+on the matching local date only: map quoted `YYYY-MM-DD` dates to positive whole
+hours. Invalid entries are ignored. Any configured `kanban.daily_run_share_per_assignee`
+percentage applies to the effective cap for that day.
+
+Per-card run counts do not stop owner repairs. Daily exhaustion defers new
+claims without blocking cards or cancelling active runs. These settings do not
+grant execution authority.
 
 ### Completion checkpoints before the iteration cap
 

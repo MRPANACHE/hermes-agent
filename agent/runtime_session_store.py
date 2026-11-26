@@ -328,7 +328,14 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self.failure = str(exc)
                 raise
             self.journal = candidate
-            return self.retry_pending()[0]
+            try:
+                return self.retry_pending()[0]
+            except TimeoutError as exc:
+                if operation != 'session.sidecars' or str(exc) != 'worker_receipt_timeout':
+                    raise
+                # Sidecar receipts are durable and have no post-commit hook or lease result.
+                # Retry the frozen sequence once; every other ambiguous operation stays sticky.
+                return self.retry_pending()[0]
 
     def retry_pending(self):
         with self.lock:
