@@ -166,3 +166,72 @@ def test_twenty_hours_stop_new_ready_and_review_leave_running_untouched(board):
     assert p["window_end"] == "2026-11-01T00:00:00+01:00"
     with patch("hermes_cli.kanban_db.time.time", return_value=now + 2 * 3600):
         assert kb.claim_task(board, ready) is not None
+
+
+def alarm_config(**limit):
+    return {"kanban": {"hard_run_limits": True, "alarm_run_limit": limit or {"created_by": ["alarm-bot"], "daily_hours": 4}}}
+
+
+def alarm_card(conn):
+    return kb.create_task(conn, title="Fixture alarm card", assignee="owner", created_by="alarm-bot")
+
+
+def claim_at(conn, tid, now, config):
+    with patch("hermes_cli.config.load_config_readonly", return_value=config), \
+            patch("hermes_cli.kanban_db.time.time", return_value=now):
+        return kb.claim_task(conn, tid)
+
+
+def test_alarm_card_starts_above_a_spent_day_budget_and_ordinary_cards_do_not(board):
+    now = int(datetime.fromisoformat("2026-10-31T23:00:00+01:00").timestamp())
+    attempt(board, card(board), start=now - 21 * 3600, end=now)
+    ordinary, alarm = card(board), alarm_card(board)
+    assert claim_at(board, ordinary, now, alarm_config()) is None
+    assert claim_at(board, alarm, now, alarm_config()) is not None
+    _, payload = hits(board, alarm)[0]
+    assert (payload["limit_key"], payload["action"], payload["exception_class"]) == (
+        "daily_run_hours", "exception_allowed", "alarm_card")
+    assert (payload["observed"], payload["threshold"], payload["alarm_threshold"]) == (21, 20, 4)
+    assert hits(board, ordinary)[0][1]["action"] == "blocked_new_run"
+
+
+def test_alarm_cards_stop_at_their_own_cap_even_with_day_budget_left(board):
+    now = int(datetime.fromisoformat("2026-10-31T23:00:00+01:00").timestamp())
+    attempt(board, alarm_card(board), start=now - 4 * 3600, end=now)
+    assert claim_at(board, alarm_card(board), now - 1, alarm_config()) is not None
+    waiting = alarm_card(board)
+    assert claim_at(board, waiting, now, alarm_config()) is None
+    assert claim_at(board, waiting, now, alarm_config()) is None
+    assert kb.get_task(board, waiting).status == "ready"
+    assert len(hits(board, waiting)) == 1
+    _, payload = hits(board, waiting)[0]
+    assert (payload["limit_key"], payload["action"], payload["observed"], payload["threshold"]) == (
+        "daily_alarm_run_hours", "blocked_new_run", 4, 4)
+    assert claim_at(board, card(board), now, alarm_config()) is not None
+    assert claim_at(board, waiting, now + 2 * 3600, alarm_config()) is not None
+
+
+def test_ordinary_runtime_does_not_spend_the_alarm_cap_but_alarm_runtime_counts_for_everyone(board):
+    now = int(datetime.fromisoformat("2026-10-31T23:00:00+01:00").timestamp())
+    attempt(board, card(board), start=now - 17 * 3600, end=now)
+    attempt(board, alarm_card(board), start=now - 3 * 3600, end=now)
+    ledger = Path(board.execute("PRAGMA database_list").fetchone()[2]).parent / "kanban" / "session-usage.jsonl"
+    ledger.parent.mkdir(exist_ok=True)
+    ledger.write_text(json.dumps({"profile": "owner", "started_at": now - 3600, "ended_at": now}) + "\n")
+    assert daily_usage(board, now, creators=frozenset({"alarm-bot"}))["runtime_seconds"] == 3 * 3600
+    assert claim_at(board, card(board), now, alarm_config()) is None
+    assert claim_at(board, alarm_card(board), now, alarm_config()) is not None
+
+
+@pytest.mark.parametrize("limit", [
+    {"created_by": ["alarm-bot"]}, {"daily_hours": 4}, {"created_by": [], "daily_hours": 4},
+    {"created_by": "alarm-bot", "daily_hours": 4}, {"created_by": [""], "daily_hours": 4},
+    {"created_by": ["alarm-bot"], "daily_hours": 0}, {"created_by": ["alarm-bot"], "daily_hours": 21},
+    {"created_by": ["alarm-bot"], "daily_hours": "4"}, {"created_by": ["alarm-bot"], "daily_hours": True},
+])
+def test_invalid_alarm_setting_never_lifts_the_day_budget(board, limit):
+    now = int(datetime.fromisoformat("2026-10-31T23:00:00+01:00").timestamp())
+    attempt(board, card(board), start=now - 20 * 3600, end=now)
+    alarm = alarm_card(board)
+    assert claim_at(board, alarm, now, alarm_config(**limit)) is None
+    assert hits(board, alarm)[0][1]["limit_key"] == "daily_run_hours"

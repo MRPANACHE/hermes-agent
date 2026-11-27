@@ -39,6 +39,27 @@ on the matching local date only: map quoted `YYYY-MM-DD` dates to positive whole
 hours. Invalid entries are ignored. Any configured `kanban.daily_run_share_per_assignee`
 percentage applies to the effective cap for that day.
 
+Alarm cards can have a cap of their own, so a spent day budget does not hold
+them back:
+
+```yaml
+kanban:
+  alarm_run_limit:
+    created_by: [pb-ace-silence]
+    daily_hours: 4
+```
+
+A card whose `created_by` is listed is admitted while the runs of such cards
+stayed below `daily_hours` today (a positive whole number, at most 20), whatever
+the shared budget or an assignee share says; at that cap it waits like any other
+card. Its runtime still counts in the shared budget, so ordinary cards keep the
+same limit. A start above a spent shared budget is recorded on the card as
+`exception_allowed`. An absent or invalid setting leaves every card on the
+ordinary limit. `created_by` is whatever the creator of the card passed, so the
+alarm cap is the bound on this route. Like the shared budget it is checked when a
+card is claimed, so cards claimed together can end above it. A supervisor's
+incident classification lifts the shared budget, not the alarm cap.
+
 Per-card run counts do not stop owner repairs. Daily exhaustion defers new
 claims without blocking cards or cancelling active runs. These settings do not
 grant execution authority.
