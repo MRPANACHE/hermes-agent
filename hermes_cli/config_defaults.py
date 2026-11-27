@@ -1886,8 +1886,8 @@ DEFAULT_CONFIG = {
         "hard_run_limits": False,  # Admission-only; activation uses the qualified updater.
         "daily_run_hours": None,  # Optional permanent cap in whole hours for this dispatcher.
         "daily_run_hours_overrides": {},  # Operator-approved, exact Amsterdam date only.
-        # Integer percent of the day budget one profile may use, e.g. {"otto": 25}.
-        "daily_run_share_per_assignee": {},
+        "daily_run_share_per_assignee": {},  # Percent of the day budget one profile may use, e.g. {"otto": 25}.
+        "alarm_run_limit": {},  # Own day cap for alarm cards: {"created_by": [...], "daily_hours": N}.
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

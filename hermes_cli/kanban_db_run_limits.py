@@ -29,6 +29,21 @@ def day_budget_hours(config: dict, date: str) -> int:
     return DEFAULT_DAY_HOURS
 
 
+def alarm_run_limit(config: dict):
+    """Alarm cards' own day cap as ``(creators, hours)``, or None.
+
+    Invalid input leaves every card on the ordinary brake; it never lifts a cap.
+    """
+    raw = config.get("alarm_run_limit")
+    if not isinstance(raw, dict):
+        return None
+    creators, hours = raw.get("created_by"), raw.get("daily_hours")
+    if (type(hours) is not int or not 0 < hours <= DEFAULT_DAY_HOURS or not isinstance(creators, list)
+            or not creators or not all(isinstance(item, str) and item.strip() for item in creators)):
+        return None
+    return frozenset(creators), hours
+
+
 def execution_runs(conn, *, task_id=None, after_event_id=0, work_only=False):
     """Actual worker starts; only explicit wait-only receipts spare task attempts.
 
@@ -51,10 +66,14 @@ def execution_runs(conn, *, task_id=None, after_event_id=0, work_only=False):
     ).fetchall()
 
 
-def _runtime_seconds(conn, now, window, assignee=None):
+def _runtime_seconds(conn, now, window, assignee=None, creators=None):
     rows = execution_runs(conn)
     if assignee is not None:
         own = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE assignee=?", (assignee,))}
+        rows = [row for row in rows if row["task_id"] in own]
+    if creators is not None:
+        marks = ",".join("?" * len(creators))
+        own = {r[0] for r in conn.execute(f"SELECT id FROM tasks WHERE created_by IN ({marks})", tuple(creators))}
         rows = [row for row in rows if row["task_id"] in own]
     return sum(max(0, min(now, window["end"], row["ended_at"] if row["ended_at"] is not None else now,
                          row["worker_lost_at"] if row["worker_lost_at"] is not None else now)
@@ -82,8 +101,10 @@ def _session_runtime_seconds(path, now, window, assignee=None):
     return seconds
 
 
-def daily_usage(conn, now: int, assignee: str | None = None) -> dict:
+def daily_usage(conn, now: int, assignee: str | None = None, creators: frozenset | None = None) -> dict:
     """Fleet total over the native shared-board registry, not the caller's pin.
+
+    With ``creators`` only the runs of cards those creators made count; sessions are not cards.
 
     Open other boards read-only: a worker's HERMES_KANBAN_DB/current-board
     binding must neither hide those boards nor cause the same DB to count twice.
@@ -101,7 +122,7 @@ def daily_usage(conn, now: int, assignee: str | None = None) -> dict:
     if own:
         info = Path(own).stat()
         seen.add((info.st_dev, info.st_ino))
-    seconds = _runtime_seconds(conn, now, window, assignee)
+    seconds = _runtime_seconds(conn, now, window, assignee, creators)
     accounted = [own or ":memory:"]
     paths = [kb.kanban_home() / "kanban.db"]
     pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
@@ -123,12 +144,12 @@ def daily_usage(conn, now: int, assignee: str | None = None) -> dict:
         other = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         other.row_factory = sqlite3.Row
         try:
-            seconds += _runtime_seconds(other, now, window, assignee)
+            seconds += _runtime_seconds(other, now, window, assignee, creators)
             accounted.append(str(path.resolve()))
         finally:
             other.close()
     ledger = kb.kanban_home() / "kanban" / "session-usage.jsonl"
-    session_seconds = _session_runtime_seconds(ledger, now, window, assignee)
+    session_seconds = _session_runtime_seconds(ledger, now, window, assignee) if creators is None else 0
     seconds += session_seconds
     return {**window, "runtime_seconds": seconds, "hours": seconds / 3600,
             "accounting_scope": "shared_boards", "accounted_boards": accounted,
@@ -316,6 +337,31 @@ def _assignee_share_hits(conn, task_id, now, config, budget, exception):
     return [hit]
 
 
+def _admit_alarm_card(conn, task_id: str, now: int, creators: frozenset, cap: int, budget: int) -> bool:
+    """An alarm card answers to its own day cap instead of the fleet cap and profile shares.
+
+    Its runtime still counts in the fleet total, so ordinary cards keep the same brake.
+    """
+    own = daily_usage(conn, now, creators=creators)
+    fleet = daily_usage(conn, now)
+
+    def hit(usage, limit_key, threshold, suffix, **extras):
+        _record_hit(conn, task_id, {
+            "limit_key": limit_key, "observed": usage["hours"], "threshold": threshold, "unit": "hours",
+            **{k: usage[k] for k in ("timezone", "local_date", "window_start", "window_end")},
+            "accounting_scope": usage["accounting_scope"], "board_count": len(usage["accounted_boards"]),
+            "episode_key": f"{suffix}:{usage['local_date']}:{task_id}", "enforced": True, **extras})
+
+    if own["runtime_seconds"] >= cap * 3600:
+        hit(own, "daily_alarm_run_hours", cap, "alarm", action="blocked_new_run")
+        return False
+    if fleet["runtime_seconds"] >= budget * 3600:
+        hit(fleet, "daily_run_hours", budget, "alarm-exempt", action="exception_allowed",
+            exception_class="alarm_card", exception_reason="alarm card within its own day cap",
+            alarm_observed=own["hours"], alarm_threshold=cap)
+    return True
+
+
 def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool:
     """In the native ready/review claim transaction; never cancel running workers."""
     from hermes_cli.config import load_config_readonly
@@ -323,10 +369,15 @@ def enforce_run_limits(conn, task_id: str, source_status: str, now: int) -> bool
     config = (load_config_readonly() or {}).get("kanban", {})
     if config.get("hard_run_limits", False) is not True:
         return True
-    task = conn.execute("SELECT status,claim_lock,worker_pid,current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+    task = conn.execute("SELECT status,claim_lock,worker_pid,current_run_id,created_by FROM tasks WHERE id=?",
+                        (task_id,)).fetchone()
     if (not task or task["status"] != source_status or task["claim_lock"] is not None
             or task["worker_pid"] is not None or task["current_run_id"] is not None):
         return False
+    alarm = alarm_run_limit(config)
+    if alarm and task["created_by"] in alarm[0]:
+        budget = day_budget_hours(config, day_window(now)["local_date"])
+        return _admit_alarm_card(conn, task_id, now, *alarm, budget)
     # Card-attempt budgets are retired. The native day-hours accountant below
     # remains the cost brake; comments and supervisor classifications cannot
     # start a second five-run approval loop.
