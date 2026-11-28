@@ -60,6 +60,25 @@ def _seeded_link(machine: Path) -> Path:
     return machine / "wheels-v6" / "pypi" / "pkg" / "1.0-abc123"
 
 
+def test_seed_bytes_counts_files_linked_to_the_payload_venv(payload_cache):
+    """A seed materializes a link out of the cache, so count the copied target bytes."""
+    payload = paths.store_root().parent
+    target = payload / ".venv" / "core.py"
+    target.parent.mkdir()
+    target.write_bytes(b"x" * 5000)
+    member = Path("archive-v0/bucket/core.py")
+    shipped = payload / "uv-cache" / member
+    _symlink_or_skip(os.path.relpath(target, shipped.parent), shipped)
+
+    pending = packages.uv_cache_seed_bytes()
+    assert not payload_cache.exists()
+    packages.uv_cache_dir()
+    copied = payload_cache / member
+    assert copied.read_bytes() == target.read_bytes()
+    assert not copied.is_symlink()
+    assert pending == 3 * 4096  # the fixture's module.py plus the copied 5,000-byte file
+
+
 def test_update_merges_the_new_payload_into_an_existing_seed(payload_cache, tmp_path, monkeypatch):
     """An update ships a payload cache for a new lock; its wheels must reach the machine cache.
 
@@ -189,6 +208,25 @@ def test_seed_preserves_a_link_at_the_payload_root(payload_cache):
     assert (link / "module.py").read_text(encoding="utf-8") == "seeded = True\n"
 
 
+def test_seed_copies_the_bytes_of_a_link_into_the_payload_venv(payload_cache):
+    """A bundle ships each unpacked-wheel file its venv holds as a link into the venv. Recreated
+    verbatim in the machine cache, that relative link points nowhere and uv cannot install it."""
+    payload = paths.store_root().parent
+    installed = payload / "venv" / "lib" / "site-packages" / "pkg" / "core.py"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("shipped once\n", encoding="utf-8")
+    shipped = payload / "uv-cache" / "archive-v0" / "bucket" / "pkg" / "core.py"
+    shipped.parent.mkdir(parents=True)
+    _symlink_or_skip(os.path.relpath(installed, shipped.parent), shipped)
+
+    packages.uv_cache_dir()
+
+    seeded = payload_cache / "archive-v0" / "bucket" / "pkg" / "core.py"
+    assert not seeded.is_symlink()
+    assert seeded.read_text(encoding="utf-8") == "shipped once\n"
+    assert (payload_cache / ".seeded").is_file()
+
+
 def test_seed_heals_a_directory_left_by_the_old_copy(payload_cache_with_wheel_link):
     """A volume poisoned by the pre-fix seed holds a directory where the link belongs."""
     machine = payload_cache_with_wheel_link
@@ -263,3 +301,18 @@ def test_seed_publishes_archives_before_the_links_into_them(payload_cache_with_w
 
     assert not _seeded_link(machine).is_symlink(), "a wheel link was published before its archive"
     assert not (machine / ".seeded").exists()
+
+
+def test_seed_bytes_measure_the_pending_merge_without_writing_it(payload_cache_with_wheel_link):
+    """A refresh sizes the merge before it starts it: what a seed would copy, and nothing once merged."""
+    machine = payload_cache_with_wheel_link
+
+    pending = packages.uv_cache_seed_bytes()
+    assert pending == 2 * 4096  # module.py and the .http entry, one block each; the link is no file
+    assert not machine.exists()  # measuring wrote nothing
+
+    packages.uv_cache_dir()
+    assert packages.uv_cache_seed_bytes() == 0
+    # uv can prune a merged cache; a matching marker still means the merge will not run.
+    (machine / "archive-v0" / "bucket" / "module.py").unlink()
+    assert packages.uv_cache_seed_bytes() == 0
