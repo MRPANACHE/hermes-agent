@@ -6,8 +6,8 @@ import pytest
 
 
 def test_setup_sql_is_interrupted_before_it_can_escape_the_browse_budget(tmp_path, monkeypatch):
-    import hermes_state_reconcile as reconcile
-    import hermes_state_repair as repair
+    from persistence.sqlite.admin import _reconcile as reconcile
+    from persistence.sqlite._state import repair
 
     path = tmp_path / "state.db"
     with sqlite3.connect(path) as conn:

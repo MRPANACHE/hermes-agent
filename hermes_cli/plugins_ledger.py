@@ -253,8 +253,9 @@ class PluginLedgerMixin:
         return manifest_key(plugin) if isinstance(plugin, PluginManifest) else str(plugin)
 
     def unload(self, plugin: str | PluginManifest | LoadedPlugin | None = None) -> bool:
-        """Unload registrations while excluding discovery/deferred loading."""
-        with self._discovery_lock, _plugin_home_scope(self.home_path):
+        """Unload registrations while excluding discovery/deferred loading. Unloading stops plugin work, so it still
+        runs once no profile name leads to the directory (``owner_home`` refuses then), under the directory."""
+        with self._discovery_lock, _plugin_home_scope(self._name_leading_here() or self.home_path):
             return self._unload_scoped(plugin)
 
     def _unload_scoped(self, plugin: str | PluginManifest | LoadedPlugin | None = None) -> bool:
@@ -299,6 +300,7 @@ class PluginLedgerMixin:
         from gateway.platform_registry import platform_registry
         for platform_name in tuple(self._plugin_platform_names):
             platform_registry.unregister(platform_name)
+        platform_registry.forget_failed_loads(self.scope_key)
         # Ledger-owned tool names are excluded: their handles already restored the previous entry, and blanket
         # deregistration would remove what the ledger just restored.
         ledger_tool_names = {r.key for r in registrations if r.kind == "tool"}
