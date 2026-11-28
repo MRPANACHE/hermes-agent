@@ -62,9 +62,9 @@ for word, and a test fails the build if the two drift apart.
    declines. Rule 3 and rule 9 problems are declines rather than bug-fix
    requests: the plugin has to change its design before it can be listed.
 
-Your plugin's page at `/docs/plugins/<name>` is built from the same file. The
-README at the pinned commit renders there by default, and `screenshots:` fills
-the gallery. There is no separate listing to maintain.
+Your plugin's [Marketplace](https://hermes-agent.nousresearch.com/marketplace) page at `/marketplace/<name>` is built from
+the same file. The README at the pinned commit renders there by default, and
+`screenshots:` fills the gallery. There is no separate listing to maintain.
 
 ## Admission rules
 
@@ -252,6 +252,11 @@ changed or removed, open a PR on its file. Owners keep control of their entries.
   fixed. When a new rule affects plugins that are already listed, their
   authors get an issue on their repository explaining the change and time to
   update before anything is removed.
+- **Dead entries are delisted automatically.** If your repository is deleted,
+  or the commit your entry pins disappears (a force-push that drops it), a
+  weekly check opens a PR deleting the entry, since it can no longer be
+  installed. Keep the pinned commit reachable; to come back, resubmit with a
+  live repository and pin.
 - **Removal** adds the plugin to
   [`removed.yaml`](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/README.md#removedyaml--the-blocklist),
   which is reserved for security and policy incidents. Installers refuse

@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-import hermes_state_reconcile as reconcile
+from persistence.sqlite.admin import _reconcile as reconcile
 
 
 def test_expired_progress_budget_at_begin_is_retryable_and_changes_nothing(tmp_path):
@@ -47,7 +47,7 @@ def test_durability_pragmas_are_inside_the_progress_budget(tmp_path, monkeypatch
             interrupted.append(str(exc))
         return False  # The existing durability helper is best-effort and swallows errors.
 
-    monkeypatch.setattr("hermes_state_repair._reapply_durability_barriers", durability)
+    monkeypatch.setattr("persistence.sqlite._state.repair._reapply_durability_barriers", durability)
     with pytest.raises(reconcile.BrowseBudgetExceeded):
         reconcile._apply_additive_schema(path, budget)
     assert interrupted == ["interrupted"]
