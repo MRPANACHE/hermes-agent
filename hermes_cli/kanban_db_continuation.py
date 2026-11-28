@@ -480,6 +480,7 @@ def _resolve_worker_config(
     """
     from hermes_cli.kanban_db import WorkerCommandConfig, _IS_WINDOWS, _WORKER_COMPLETION_MODES
     from hermes_cli.config_backend import ConfigBackendUnavailable, read_config_doc
+    from hermes_cli.kanban_worker_preflight import ProfileConfigUnavailable
     if not hermes_home:
         return None
     config_path = os.path.join(hermes_home, "config.yaml")
@@ -488,11 +489,11 @@ def _resolve_worker_config(
     except FileNotFoundError:
         return None
     except (OSError, ConfigBackendUnavailable) as exc:
-        raise RuntimeError(
+        raise ProfileConfigUnavailable(
             f"worker.command: profile config {config_path!r} is unreadable: {exc}"
         ) from exc
     except Exception as exc:
-        raise RuntimeError(
+        raise ProfileConfigUnavailable(
             f"worker.command: {config_path!r} does not parse as YAML; refusing "
             "to fall back to the native agent"
         ) from exc
