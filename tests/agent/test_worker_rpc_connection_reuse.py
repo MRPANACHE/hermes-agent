@@ -135,6 +135,30 @@ def test_reconnects_with_a_fresh_ticket_after_the_owner_drops_it(owner, tmp_path
     assert (owner.connections, owner.tickets) == (2, 2)
 
 
+def test_sidecar_timeout_redials_once_and_recovers_the_receipt(owner, tmp_path, monkeypatch):
+    from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC, _OwnerLink
+
+    receive = _OwnerLink.receive
+    dropped = []
+    def lost_reply(link, timeout):
+        result = receive(link, timeout)
+        if not dropped:
+            dropped.append(True)
+            raise TimeoutError('worker_receipt_timeout')
+        return result
+    monkeypatch.setattr(_OwnerLink, 'receive', lost_reply)
+    rpc = WorkerRPC(tmp_path)
+    store = RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'outbox')
+    try:
+        store.patch_session_model_config('s', {'_usage_anchor': {'fixture': 1}})
+        assert owner.requests == ['worker.persist', 'worker.persist']
+        assert (owner.connections, owner.tickets) == (2, 2)
+        assert store.journal['pending'] == []
+    finally:
+        store.close()
+        rpc.close()
+
+
 def test_in_flight_call_on_a_dropped_connection_fails_and_is_not_resent(owner, tmp_path):
     from websockets.exceptions import ConnectionClosed
     from agent.runtime_session_store import WorkerRPC
