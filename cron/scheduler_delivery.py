@@ -9,14 +9,15 @@ late-bound (``_sched`` / module refs at the bottom) so monkeypatching the defini
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
-import contextvars
 import logging
 import os
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, List, Optional
+
+from gateway.inbound_reply_context import record_cron_delivery, recording_cron_delivery
 
 
 # Log-record parity with the origin module.
@@ -65,6 +66,24 @@ def _resolve_cron_surface_mode(pconfig, logical_platform_name: str) -> str:
         if raw is not None and str(raw).strip().lower() == "in_channel":
             return "in_channel"
     return "thread"
+
+
+def _fresh_thread_overrides_origin_topic(pconfig) -> bool:
+    """``platforms.<p>.extra.cron_fresh_thread_per_run: true``: a continuable job created inside a
+    topic/thread opens a fresh thread per run instead of delivering back to its origin topic
+    (#76548). Off by default; any value but a boolean ``true`` keeps the origin topic and warns."""
+    extra = getattr(pconfig, "extra", None) or {}
+    raw = extra.get("cron_fresh_thread_per_run", False) if isinstance(extra, dict) else False
+    if isinstance(raw, bool):
+        return raw
+    logger.warning("cron_fresh_thread_per_run must be true or false, got %r; keeping the origin topic", raw)
+    return False
+
+
+def _origin_thread_is(job: dict, thread_id) -> bool:
+    """Whether ``thread_id`` is the thread/topic recorded on the job's own origin."""
+    origin_thread = (_resolve_origin(job) or {}).get("thread_id")
+    return origin_thread is not None and str(origin_thread) == str(thread_id)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -499,15 +518,56 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     return None
 
 
+def _home_target_order(named: list) -> list:
+    """*named* with ``_HOME_TARGET_PRIORITY`` members first, the rest in their given order."""
+    return [n for n in _HOME_TARGET_PRIORITY if n in named] + [n for n in named if n not in _HOME_TARGET_PRIORITY]
+
+
 def _iter_home_target_platforms():
     """Iterate plugin platform names that expose a home channel, ``_HOME_TARGET_PRIORITY`` first."""
     with contextlib.suppress(Exception):
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
-        named = [e.name for e in platform_registry.plugin_entries() if e.cron_deliver_env_var]
-        yield from (n for n in _HOME_TARGET_PRIORITY if n in named)
-        yield from (n for n in named if n not in _HOME_TARGET_PRIORITY)  # registry order, as before
+        yield from _home_target_order([e.name for e in platform_registry.plugin_entries() if e.cron_deliver_env_var])
+
+
+# Core-owned platforms a saved home channel may name without any plugin registering them.
+_CORE_HOME_PLATFORMS = _KNOWN_DELIVERY_PLATFORMS | _NON_PUSH_ORIGIN_PLATFORMS | {"local", "relay", "msgraph_webhook"}
+
+
+def _unloaded_home_platforms() -> list[str]:
+    """Platforms with a home chat saved in config.yaml (what ``/sethome`` writes) that no loaded plugin
+    registers in this profile (not installed, not enabled, failed to load). Read raw, because
+    ``load_gateway_config`` drops a block whose platform nothing registers, so ``origin``/``all`` would
+    otherwise skip that home without a word."""
+    from gateway.platform_registry import platform_registry
+    try:
+        blocks = (_sched.load_config() or {}).get("platforms") or {}
+    except Exception:
+        logger.debug("cron: config.yaml unreadable for saved home channels", exc_info=True)
+        return []
+    saved = sorted(
+        str(name).lower() for name, block in blocks.items()
+        if isinstance(block, dict) and isinstance(block.get("home_channel"), dict)
+        and block["home_channel"].get("chat_id"))
+    list(_iter_home_target_platforms())  # discovers plugins so the registry lookups below are final
+    return [n for n in saved if n not in _CORE_HOME_PLATFORMS and platform_registry.get(n) is None]
+
+
+def _unloaded_home_error(platform_name: str) -> str:
+    """Job-result text for a saved home channel skipped because its platform plugin is not loaded."""
+    from hermes_cli.left_core_migration import platform_install_hint
+    remedy = platform_install_hint(platform_name) or (
+        f". Install or enable the plugin that provides '{platform_name}' (`hermes plugins list`)")
+    return (f"{platform_name} home channel skipped: no loaded plugin provides the platform{remedy}, "
+            f"or remove platforms.{platform_name}.home_channel from config.yaml")
+
+
+def _note_unloaded_homes(names, skipped: Optional[list]) -> None:
+    for name in names:
+        if skipped is not None and (error := _unloaded_home_error(name)) not in skipped:
+            skipped.append(error)
 
 
 def _relay_fronted_delivery_platforms(connected: set) -> set:
@@ -591,14 +651,15 @@ def _home_target(platform_name: str, chat_id: str, resolved_from: Optional[str] 
 
 
 def _resolve_single_delivery_target(
-    job: dict, deliver_value: str, *, from_broadcast: bool = False
+    job: dict, deliver_value: str, *, from_broadcast: bool = False, skipped: Optional[list] = None
 ) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job.
 
     ``from_broadcast`` marks a bare-platform token that was produced by expanding a broadcast
     token (``all``) rather than written by the user; broadcast expansions carry no mirror
     provenance (fan-out is never continuable), while a user-written bare platform token is a
-    deliberate home-channel address and gets the ``home`` tag."""
+    deliberate home-channel address and gets the ``home`` tag. ``skipped`` collects the error of
+    each saved home the origin fallback passed over because its platform plugin is not loaded."""
     origin = _resolve_origin(job)
     if deliver_value == "local":
         return None
@@ -618,8 +679,14 @@ def _resolve_single_delivery_target(
                 "thread_id": _origin_delivery_thread(origin),
                 "_resolved_from": "origin",  # provenance for _target_mirror_eligible
             }
-        # No origin (API/script job): fall back to a home channel instead of silently dropping.
-        for platform_name in _iter_home_target_platforms():
+        # No origin (API/script job): fall back to a home channel instead of silently dropping. A saved
+        # home ranked ahead of the one chosen but whose plugin is not loaded is reported, not skipped silently.
+        deliverable = list(_iter_home_target_platforms())
+        unloaded = [n for n in _unloaded_home_platforms() if n not in deliverable]
+        for platform_name in _home_target_order(deliverable + unloaded):
+            if platform_name in unloaded:
+                _note_unloaded_homes([platform_name], skipped)
+                continue
             chat_id = _get_home_target_chat_id(platform_name)
             if chat_id:
                 logger.info(
@@ -632,7 +699,7 @@ def _resolve_single_delivery_target(
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
-        from tools.send_message_tool import prepare_send_message_platforms, resolve_send_target
+        from gateway.outbound.send import prepare_send_message_platforms, resolve_send_target
         prepare_send_message_platforms()
         # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
         # must reach the adapter as written or the job's output is silently lost.
@@ -641,9 +708,10 @@ def _resolve_single_delivery_target(
         if resolution_error:
             logger.warning("Invalid cron delivery target '%s': %s", deliver_value, resolution_error)
             return None
+        # Chat-only target on the origin chat adopts the origin lane where it is a durable place
+        # (Telegram topic, Slack thread); Matrix/Mattermost threads are per-message ids -> top-level.
         if (
-            thread_id is None
-            and platform_key == "slack"
+            thread_id is None and platform_key in ("telegram", "slack")
             and origin
             and str(origin.get("platform") or "").lower() == platform_key
             and str(origin.get("chat_id")) == str(chat_id)
@@ -671,6 +739,7 @@ def _resolve_single_delivery_target(
             "thread_id": origin.get("thread_id"),
         }
     if not _is_known_delivery_platform(platform_name):
+        _note_unloaded_homes([n for n in _unloaded_home_platforms() if n == platform_name.lower()], skipped)
         return None
     chat_id = _get_home_target_chat_id(platform_name)
     return _home_target(platform_name, chat_id, home_provenance) if chat_id else None
@@ -871,12 +940,31 @@ def _delivery_lane_value(job: dict, *, for_failure: bool = False):
     return job.get("deliver", "local")
 
 
-def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[dict]:
+def _snapshot_delivery_job(job: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture the fields used by normal target resolution so mid-run edits do not affect hooks."""
+    snapshot: dict[str, Any] = {
+        "id": str(job["id"]),
+        "name": str(job.get("name") or job["id"]),
+    }
+    if "deliver" in job:
+        deliver = job["deliver"]
+        snapshot["deliver"] = list(deliver) if isinstance(deliver, (list, tuple)) else deliver
+    if "origin" in job:
+        origin = job["origin"]
+        snapshot["origin"] = dict(origin) if isinstance(origin, Mapping) else origin
+    return snapshot
+
+
+def _resolve_delivery_targets(
+    job: dict, *, for_failure: bool = False, skipped: Optional[list] = None
+) -> list[dict]:
     """Resolve auto-delivery targets from comma-separated ``deliver``; ``all`` expands to every
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,
     thread_id). ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
-    ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
+    ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``.
+    ``skipped`` collects the error of each saved home channel ``all``/``origin`` could not reach
+    because its platform plugin is not loaded, so the run reports it."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver == "local":
         return []
@@ -888,8 +976,10 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[d
         if not raw:
             continue
         from_broadcast = raw.lower() in _ROUTING_TOKENS
+        if from_broadcast:
+            _note_unloaded_homes(_unloaded_home_platforms(), skipped)
         for part in _expand_routing_tokens(raw):
-            target = _resolve_single_delivery_target(job, part, from_broadcast=from_broadcast)
+            target = _resolve_single_delivery_target(job, part, from_broadcast=from_broadcast, skipped=skipped)
             if not target:
                 continue
             key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
@@ -910,81 +1000,6 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     """Resolve the concrete auto-delivery target for a cron job, if any."""
     targets = _resolve_delivery_targets(job)
     return targets[0] if targets else None
-
-
-# Audio routing is centralized in gateway.platforms.base.should_send_media_as_audio().
-_VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
-_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
-
-
-def _send_media_via_adapter(
-    adapter, chat_id: str, media_files: list, metadata: dict | None, loop, job: dict, platform=None,
-) -> list:
-    """Send MEDIA files as native attachments (routed by extension, as in
-    _process_message_background). Returns per-file error strings so a dropped attachment surfaces
-    in run status, not just the gateway log."""
-    from gateway.platforms.base import (
-        BasePlatformAdapter, should_send_media_as_audio, validate_media_delivery_path)
-    from agent.async_utils import safe_schedule_threadsafe
-    job_ref = {"id": job.get("id", "?")}
-    errors: list = []
-    requested = [(str(p), v) for p, v in (media_files or [])]
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    # Report paths the safety filter dropped (missing file, denied prefix, strict-mode miss).
-    kept = {p for p, _ in media_files}
-    for raw_path, _v in requested:
-        try:
-            dropped = validate_media_delivery_path(raw_path) not in kept
-        except Exception:
-            dropped = True
-        if dropped:
-            errors.append(f"attachment dropped by media path policy: {raw_path}")
-
-    route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-    for media_path, _is_voice in media_files:
-        try:
-            ext = _sched.Path(media_path).suffix.lower()
-            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                method, path_kw = "send_voice", "audio_path"
-            elif ext in _VIDEO_EXTS:
-                method, path_kw = "send_video", "video_path"
-            elif ext in _IMAGE_EXTS:
-                method, path_kw = "send_image_file", "image_path"
-            else:
-                method, path_kw = "send_document", "file_path"
-            # The voice sender decides bubble vs music-file from ``is_voice`` (Telegram
-            # transcodes non-Opus only when it is set), matching the gateway dispatch
-            # in BasePlatformAdapter._send_one.
-            extra = {"is_voice": _is_voice} if method == "send_voice" else {}
-            coro = getattr(adapter, method)(
-                chat_id=chat_id, metadata=metadata, **{path_kw: media_path}, **extra)
-            future = safe_schedule_threadsafe(coro, loop)
-            if future is None:
-                _note_target_error(
-                    job_ref, f"cannot send media {media_path}: gateway loop unavailable", errors)
-                return errors
-            try:
-                # Large attachments can exceed 30s; configurable via _get_media_send_timeout().
-                result = future.result(timeout=_script._get_media_send_timeout())
-            except TimeoutError:
-                future.cancel()
-                raise
-            raw = getattr(result, "raw_response", None)
-            if result and getattr(result, "success", False) and isinstance(raw, dict) and raw.get("ambiguous"):
-                # Sent but the ack was lost: possibly delivered, so never an error (a re-run
-                # would duplicate it); _live_send_media records the target as unverified.
-                job["_media_ack_lost"] = True
-            elif result and not getattr(result, "success", True):
-                _note_target_error(
-                    job_ref,
-                    f"media send failed for {media_path}: {getattr(result, 'error', 'unknown')}",
-                    errors,
-                )
-        except Exception as e:
-            # TimeoutError etc. have an empty str(); fall back to the class name.
-            _note_target_error(
-                job_ref, f"failed to send media {media_path}: {str(e) or type(e).__name__}", errors)
-    return errors
 
 
 def _result_field(send_result, key: str, default=None):
@@ -1084,14 +1099,15 @@ def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
 
 def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
     """Persist ``last_delivery_unverified``: list of ``platform:chat_id[:thread_id]`` targets acked with no
-    evidence, or None, alongside queued Bot Chat receipts. Never raises (bookkeeping must not fail a
-    delivery)."""
+    evidence, or None, alongside queued Bot Chat receipts and ``last_delivery_reached_none`` (from the
+    transient ``_delivery_reached_none``: no target received a failed delivery). Never raises."""
     new_value = list(unverified_targets) or None
     queued = {target: receipt for target, receipt in
               job.get("_bot_chat_delivery_receipts", {}).items()
               if receipt["status"] in ("queued", "claimed")} or None
     values = {key: value for key, value in {
         "last_delivery_unverified": new_value, "last_delivery_queued": queued,
+        "last_delivery_reached_none": job.pop("_delivery_reached_none", None) or None,
     }.items() if (job.get(key) or None) != value}
     if not values:
         return
@@ -1129,7 +1145,14 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    force_document: bool = False  # [[as_document]]: images go unrecompressed
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
+    # The adapter's SendResult.retryable verdict for live_error (carried by DeliverySendError on the
+    # exception arm, read off the SendResult on the unconfirmed arm). The string alone is ambiguous —
+    # Telegram's "Not connected" is retryable while the bot client rebuilds, permanent when the fatal
+    # is not — so the queue gate keys on this flag, not on widening a string set.
+    live_retryable: Optional[bool] = None
+    standalone_in_flight: bool = False  # the standalone send may have delivered (timeout, lost answer, partial)
 
     @property
     def is_relay(self) -> bool:
@@ -1300,23 +1323,24 @@ def _live_send_text(
     router = DeliveryRouter(t.config, t.target_adapters)
     route_target = DeliveryTarget(
         platform=t.platform, chat_id=str(t.chat_id), thread_id=route_thread_id, is_explicit=True)
-    # Thread routing goes via the target, not a bare metadata "thread_id": the router only applies
-    # its Telegram DM-topic detection when thread_id/message_thread_id are absent from metadata.
-    # Send through the already-authorized transport: re-resolving from the plain target_adapters
-    # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
-    # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
+    # Thread routing goes via the target (the router's Telegram DM-topic detection needs thread keys
+    # absent from metadata). Send through the already-authorized transport: re-resolving from
+    # target_adapters loses the SharedRouteAdapters satellite grant and drops the send (#115656).
     # cancel() cannot tell "never started" from "in flight": a run_coroutine_threadsafe future stays
     # PENDING until the coroutine finishes, so cancel() returns True mid-send AND kills it. The send
     # records its own start under a lock; a timeout abandons it only if it never began.
     dispatch_lock = threading.Lock()
     dispatch = {"started": False, "abandoned": False}
+    import contextvars as _cv, functools as _ft  # chunk ids tagged at send end, in THIS profile
+    record_ids = _ft.partial(_cv.copy_context().run, record_cron_delivery, t.platform_name, t.chat_id, text_to_send)
 
     async def _send_once():
         with dispatch_lock:
             if dispatch["abandoned"]:
                 return None
             dispatch["started"] = True
-        return await router._deliver_to_platform(route_target, text_to_send, route_metadata, transport=t.transport)
+        return await recording_cron_delivery(router._deliver_to_platform(
+            route_target, text_to_send, route_metadata, transport=t.transport), record_ids)
 
     future = safe_schedule_threadsafe(_send_once(), t.loop)
     if future is None:
@@ -1352,8 +1376,10 @@ def _live_send_text(
         return True, False, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone. The router raises
-        # a failed SendResult's error string, so this is where send_path_degraded arrives.
+        # a failed SendResult's error string, so this is where send_path_degraded arrives. The
+        # adapter's retryable verdict rides DeliverySendError.send_retryable (None if it didn't).
         t.live_error = str(ex)
+        t.live_retryable = getattr(ex, "send_retryable", None)
         target_errors.append(f"live adapter send failed: {ex}")
         raise
 
@@ -1377,6 +1403,10 @@ def _live_send_text(
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
         t.live_error = str(err) if err else None
+        if isinstance(send_result, dict):
+            t.live_retryable = send_result.get("retryable")
+        else:
+            t.live_retryable = getattr(send_result, "retryable", None)
         _warn_live_lane_failure(job, msg, t.is_relay)
         target_errors.append(msg)
         return False, False, None
@@ -1427,7 +1457,7 @@ def _live_send_media(
                 routed_media_metadata["scope_id"] = logical_home.scope_id
     _media_errors = _send_media_via_adapter(
         t.runtime_adapter, t.chat_id, media_files, routed_media_metadata or None, t.loop, t.job,
-        platform=t.platform,
+        platform=t.platform, force_document=t.force_document,
     )
     if (topic_name and len(media_files) == sum("thread not found" in e.lower() for e in _media_errors)
             and _resolve_named_dm_topic(t, topic_name, routed_media_metadata, delivery_errors,
@@ -1435,7 +1465,7 @@ def _live_send_media(
         # The named topic vanished (a media-only job never runs the router's text refresh): recreate once.
         _media_errors = _send_media_via_adapter(
             t.runtime_adapter, t.chat_id, media_files, routed_media_metadata, t.loop, t.job,
-            platform=t.platform)
+            platform=t.platform, force_document=t.force_document)
     if t.job.pop("_media_ack_lost", False) and t.where not in unverified_targets:
         unverified_targets.append(t.where)
     # Surface per-file failures into run status: text delivered but attachment lost is not ok.
@@ -1520,8 +1550,6 @@ def _deliver_via_live_adapter(
                 unverified_targets=unverified_targets,
             )
 
-        # Media rides the same DM-topic-aware routing as text. Skipped after a confirmation
-        # timeout (loop contended, text already assumed delivered) — record the drop instead.
         # Send extracted media files as native attachments via the live adapter, using the same
         # DM-topic-aware routing as the text send (#22773 — media previously used a bare thread_id and
         # landed in the General lane for private DM topics). Skip on an in-flight confirmation timeout: the
@@ -1534,18 +1562,12 @@ def _deliver_via_live_adapter(
         if adapter_ok and not timed_out and media_files:
             _live_send_media(t, media_metadata, media_files, delivery_errors, unverified_targets, topic_name)
         elif timed_out and media_files:
-            _note_target_error(
-                job,
-                f"{len(media_files)} media attachment(s) not delivered to "
-                f"{t.where} (live adapter confirmation timed out)",
-                delivery_errors)
+            _note_target_error(job, f"{len(media_files)} media attachment(s) not delivered to {t.where} "
+                               "(live adapter confirmation timed out)", delivery_errors)
 
         if adapter_ok:
-            # Log WHERE it went: a ghost delivery in the wrong lane is otherwise indistinguishable.
             logger.info(
-                # Log WHERE it went, not just that it went: a ghost delivery that landed in the wrong lane
-                # (General topic instead of the routed thread) is indistinguishable from a real one without
-                # the routing identity (#77763).
+                # Log WHERE it went: a wrong-lane ghost delivery looks like a real one without it (#77763).
                 "Job '%s': delivered to %s:%s via live adapter thread=%s message_id=%s",
                 job["id"], t.platform_name, t.chat_id,
                 route_thread_id if route_thread_id is not None else "-",
@@ -1560,107 +1582,11 @@ def _deliver_via_live_adapter(
     return delivered
 
 
-def _standalone_send(
-    t: _TargetDelivery, content: str, media_files: list) -> tuple[Any, Optional[str]]:
-    """Run the standalone sender for one target: ``(result, None)`` or ``(None, error)`` (already
-    logged — WARNING for a shutdown race, ERROR with traceback otherwise)."""
-    from tools.send_message_tool import _send_to_platform
-    job = t.job
-    shutdown_msg = f"delivery to {t.where} skipped — interpreter is shutting down"
-
-    send_timeout = _get_standalone_send_timeout()
-
-    async def _send():
-        # The bound lives inside the coroutine: the running-loop fallback below closes ``coro``
-        # unstarted, and a wait_for wrapper created out here would be left never awaited.
-        # notify: the live lane's metadata["notify"] (cron.delivery.notify), so a brief rings either way.
-        return await asyncio.wait_for(_send_to_platform(
-            t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files, notify=t.notify_delivery), timeout=send_timeout)
-
-    def _warned(msg: str) -> tuple[None, str]:
-        logger.warning("Job '%s': %s", job["id"], msg)
-        return None, msg
-
-    def _failed(e) -> tuple[None, str]:
-        msg = f"delivery to {t.where} failed: {e}"
-        logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
-        return None, msg
-
-    # Interpreter finalizing (SIGTERM/restart/OOM): asyncio.run and a fresh ThreadPoolExecutor both
-    # raise "cannot schedule new futures after interpreter shutdown" — warn, not ERROR traceback.
-    if _sched._interpreter_shutting_down():
-        return _warned(shutdown_msg)
-    # The live lane failed closed on an empty payload; standalone senders don't (Telegram returns
-    # success=True for empty content WITHOUT an API call) — a phantom delivery would result.
-    if not content.strip() and not media_files:
-        return _warned(f"standalone send skipped (empty text and no media) for {t.where}")
-    coro = _send()
-    try:
-        return asyncio.run(coro), None
-    except TimeoutError:
-        # The send may still complete on the gateway loop (the dispatch shield keeps an in-flight
-        # send un-cancelled); the run is released instead of waiting on it unbounded (#115469).
-        msg = (f"standalone send to {t.where} timed out after {send_timeout}s "
-               "(the send may still be in flight)")
-        logger.error("Job '%s': %s", job["id"], msg)
-        return None, msg
-    except RuntimeError as run_err:
-        # asyncio.run() refuses inside a running loop; close the unstarted coro, retry in a thread.
-        coro.close()
-        if _sched._interpreter_shutting_down(run_err):
-            return _warned(shutdown_msg)
-        # The fallback can itself raise (SMTP, result timeout); catch it or remaining targets skip.
-        try:
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                # A fresh thread does NOT inherit the profile ContextVars (home override + secret
-                # scope); run in the active context or the sender reads the default bot token.
-                return pool.submit(contextvars.copy_context().run, asyncio.run, _send()).result(
-                    timeout=30), None
-            finally:
-                pool.shutdown(wait=False)
-        except Exception as e:
-            if _sched._interpreter_shutting_down(e):
-                return _warned(shutdown_msg)
-            return _failed(e)
-    except Exception as e:
-        return _failed(e)
-
-
-def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: list, delivery_errors: list) -> None:
-    """Hand a payload the live lane rejected as reconnect-only (``send_path_degraded``) and the
-    standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
-    owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
-    reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
-    carries text only; dropped attachments are reported."""
-    try:
-        from gateway.delivery_ledger import (
-            compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
-        if not is_reconnect_only(t.live_error) or not ledger_enabled():
-            return
-        session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
-        record_obligation(
-            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
-            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
-        mark_failed(obligation_id, str(t.live_error))
-    except Exception:
-        logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
-                       t.job.get("id"), t.where, exc_info=True)
-        return
-    note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
-    if media_files:
-        note += f" ({len(media_files)} attachment(s) not queued)"
-    logger.warning("Job '%s': %s", t.job.get("id"), note)
-    delivery_errors.append(note)
-
-
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
-) -> None:
-    """Standalone fallback for a target the live lane did not deliver."""
+) -> Optional[bool]:
+    """Standalone fallback for a target the live lane did not deliver; True once the text was sent,
+    in full or in part (a split send that failed after a chunk landed)."""
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
@@ -1669,17 +1595,37 @@ def _deliver_standalone(
         delivery_errors.extend(target_errors)
         return
     result, err = _standalone_send(t, content, media_files)
+    partial = False
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
         err = f"delivery error: {result['error']} (target {t.where})"
         logger.error("Job '%s': %s", job["id"], err)
+        # A sender's failure dict may follow a delivered (or partly delivered) payload: only the
+        # contract's NONE (``gateway.platforms._shared.delivery_state``) makes a replay safe.
+        from gateway.platforms._shared import NONE, PARTIAL, delivery_state
+        state = delivery_state(result)
+        t.standalone_in_flight = t.standalone_in_flight or state != NONE
+        partial = state == PARTIAL
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        # A satellite profile's worker has no platform token, so standalone cannot stand in for a
-        # live adapter that is only waiting to reconnect: keep the payload for that adapter.
-        _queue_for_live_reconnect(t, content, media_files, delivery_errors)
-        return
+        # A partial split send: replies to the chunks that landed are framed as a past report too.
+        record_cron_delivery(t.platform_name, t.chat_id, content.strip(), result or {})
+        if t.standalone_in_flight:
+            # The payload may be on screen (in full or in part); queueing it would let the
+            # redelivery sweep post it twice. Possible loss over certain duplication: surface the
+            # window loudly instead of queueing.
+            logger.warning(
+                "Job '%s': NOT queueing %s for post-reconnect redelivery — the standalone "
+                "send may have delivered the payload; a replay could duplicate it",
+                job["id"], t.where)
+        else:
+            # A satellite profile's worker has no platform token, so standalone cannot stand in
+            # for a live adapter that is only waiting to reconnect: keep the payload for that adapter.
+            _queue_for_live_reconnect(t, content, media_files, delivery_errors)
+        # A partial send's head is on screen at this target, so the run did reach someone; so may
+        # a send whose answer was lost (explicit ``uncertain``, or no result at all: timeout, raise).
+        return partial or (t.standalone_in_flight and (result is None or result.get("delivery") == "uncertain"))
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1687,11 +1633,13 @@ def _deliver_standalone(
         logger.error("Job '%s': %s", job["id"], msg)
         delivery_errors.append(msg)
     logger.info("Job '%s': delivered to %s:%s", job["id"], t.platform_name, t.chat_id)
+    record_cron_delivery(t.platform_name, t.chat_id, content.strip(), result)  # replies to ANY chunk framed
     # Thread seeding only happens on the live lane, so no thread_seeded gate applies here.
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
+    return True
 
 
 def _prepare_target_delivery(
@@ -1784,7 +1732,11 @@ def _prepare_target_delivery(
         and not in_channel_surface
         and runtime_adapter is not None
         and loop is not None
-        and not thread_id  # never override an explicit origin thread/topic
+        # Never override a target thread/topic unless the platform opted in AND it is the job's own
+        # origin topic (#76548): an origin without a thread matches any thread as a wildcard, so a
+        # topic the user named explicitly must not count as the origin's.
+        and (not thread_id or (
+            origin_target and _origin_thread_is(job, thread_id) and _fresh_thread_overrides_origin_topic(pconfig)))
     ):
         opened_thread_id = _open_continuable_cron_thread(
             job, runtime_adapter, chat_id, loop) or None
@@ -1800,14 +1752,14 @@ def _prepare_target_delivery(
         opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
 
 
-def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
+def _unresolved_delivery_outcome(job: dict, for_failure: bool, skipped: list) -> Optional[str]:
     """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
     origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
-    an error string."""
+    an error string carrying ``skipped`` (saved homes whose platform plugin is not loaded)."""
     deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver_value == "local":
         return None
-    if deliver_value == "origin":
+    if deliver_value == "origin" and not skipped:
         logger.info(
             # deliver=origin with no resolvable origin and no configured home channels: treat as local
             # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
@@ -1818,9 +1770,22 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
             "skipping delivery (output saved in last_output)",
             job.get("name", job.get("id", "?")))
         return None
-    msg = f"no delivery target resolved for deliver={deliver_value}"
+    msg = "; ".join([f"no delivery target resolved for deliver={deliver_value}", *skipped])
     logger.warning("Job '%s': %s", job["id"], msg)
     return msg
+
+
+def _should_wrap_cron_response(job: dict, user_cfg: Any) -> bool:
+    """Whether to wrap delivered output in the cron header/footer. A bool per-job
+    ``wrap_response`` overrides the global ``cron.wrap_response`` (read from the active
+    profile); an unreadable or malformed config falls back to the default (wrap)."""
+    if isinstance(job.get("wrap_response"), bool):
+        return job["wrap_response"]
+    cron_cfg = user_cfg.get("cron") if isinstance(user_cfg, dict) else None
+    if not isinstance(cron_cfg, dict):
+        return True
+    # Truthiness, as the inline check this replaces used; YAML yields real bools here.
+    return bool(cron_cfg.get("wrap_response", True))
 
 
 def _deliver_result(
@@ -1832,10 +1797,13 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    skipped: list = []
+    targets = _resolve_delivery_targets(job, for_failure=for_failure, skipped=skipped)
     if not targets:
+        job["_delivery_reached_none"] = (
+            outcome := _unresolved_delivery_outcome(job, for_failure, skipped)) is not None
         _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
+        return outcome
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
@@ -1861,12 +1829,11 @@ def _deliver_result(
 
     from gateway.config import load_gateway_config
 
-    # Wrap with header/footer unless cron.wrap_response: false.
-    wrap_response = True
+    # user_cfg is loaded either way: the wrap decision and the delivery settings below reuse it.
     user_cfg = None
     with contextlib.suppress(Exception):
         user_cfg = _sched.load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+    wrap_response = _should_wrap_cron_response(job, user_cfg)
     # Mark live sends FINAL so the platform pushes them (Telegram "important" mode mutes otherwise).
     notify_delivery = _cron_delivery_notify_enabled(user_cfg)
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
@@ -1927,7 +1894,10 @@ def _deliver_result(
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
-    delivery_errors = []
+    for error in skipped:
+        logger.warning("Job '%s': %s", job["id"], error)
+    delivery_errors = list(skipped)
+    reached = 0  # targets that received the text (bot chat / room / local count when error-free)
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
     for target in targets:
         # A failure notice for a platform that hides warning notifications is a suppressed
@@ -1941,6 +1911,7 @@ def _deliver_result(
         if target["platform"] == BOT_CHAT_PLATFORM:
             bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
             suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
+            receipt = None
             if bot_chat_error:
                 receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
@@ -1948,11 +1919,13 @@ def _deliver_result(
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            # A queued, claimed or ambiguous send may still arrive; anything else reached nobody.
+            reached += not bot_chat_error or bool(receipt and receipt["status"] in ("queued", "claimed", "ambiguous"))
             continue
         if target["platform"] == ROOM_PLATFORM:
             room_error = deliver_to_room(job, content, target["chat_id"], for_failure=for_failure)
-            if room_error:
-                delivery_errors.append(room_error)
+            delivery_errors.extend([room_error] if room_error else [])
+            reached += not room_error
             continue
         if target["platform"] == "local":
             from gateway.session_cron import deliver_to_local_chat
@@ -1961,6 +1934,7 @@ def _deliver_result(
                                                 cleaned_delivery_content, diagnostic=for_failure)
             if local_error:
                 delivery_errors.append(local_error)
+            reached += not local_error
             continue
 
         t = _prepare_target_delivery(
@@ -1969,15 +1943,14 @@ def _deliver_result(
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
         if t is None:
             continue
+        t.force_document = "[[as_document]]" in content  # the job output, never the wrapped job name
         target_errors: list = []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
-        if not delivered:
-            _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+        reached += bool(delivered or _deliver_standalone(t, cleaned_delivery_content, media_files, target_errors, delivery_errors))
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.
@@ -1985,6 +1958,7 @@ def _deliver_result(
         job["_notification_all_targets_suppressed"] = True
     else:
         delivery_errors.extend(policy_drop_errors)
+    job["_delivery_reached_none"] = bool(delivery_errors) and not reached
     _record_delivery_verification(job, unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
 
@@ -1995,5 +1969,8 @@ from cron import scheduler as _sched
 from cron.scheduler_delivery_room import (
     ROOM_PLATFORM, deliver_to_room, parse_room_deliver_token, resolve_room_target)
 from cron import scheduler_delivery_origin as _origin
+from cron.scheduler_delivery_media import _send_media_via_adapter
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
+from cron.scheduler_delivery_standalone import (
+    _queue_for_live_reconnect, _standalone_send)
