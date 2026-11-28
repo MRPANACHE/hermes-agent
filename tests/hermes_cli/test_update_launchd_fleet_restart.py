@@ -272,6 +272,9 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     )
     monkeypatch.setattr(gw, "_locate_launchd_gateway_service", fake_locate)
     monkeypatch.setattr(gw, "_launchd_service_registered", fake_registered)
+    # Fixture-PIDs hebben geen kernelidentiteit. Een toevallige echte PID op
+    # de runner mag ze niet als nog drainerende gateway laten meetellen.
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda _pid: None)
     monkeypatch.setattr(
         gw,
         "_graceful_restart_via_sigusr1",
